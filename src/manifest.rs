@@ -43,6 +43,17 @@ pub struct Deployment {
     pub id: String,
     pub processes: Vec<Process>,
     pub drivers: Vec<DriverArtifact>,
+    pub supervisor: Option<Supervisor>,
+}
+/// Explicit budget for the privileged manager and its admission verifier.
+/// Workload budgets are separate; neither budget is an emergency-stop promise.
+#[derive(Debug)]
+pub struct Supervisor {
+    pub memory_bytes: u64,
+    pub pids: u32,
+    pub cpu_micros: u32,
+    pub cpus: Option<crate::placement::Set>,
+    pub memory_nodes: Option<crate::placement::Set>,
 }
 pub fn read_xml(p: &Path) -> Result<String> {
     let f = OpenOptions::new()
@@ -135,9 +146,49 @@ pub fn deployment(s: &str) -> Result<Deployment> {
     }
     let mut processes = Vec::new();
     let mut drivers = Vec::new();
+    let mut supervisor = None;
     let mut hardware = BTreeSet::new();
     let mut ids = BTreeSet::new();
     for node in root.children().filter(Node::is_element) {
+        if node.tag_name().name() == "supervisor" {
+            attributes(
+                node,
+                "supervisor",
+                &["memory-bytes", "pids", "cpu-micros", "cpus", "memory-nodes"],
+            )?;
+            if supervisor.is_some() || node.children().any(|n| n.is_element()) {
+                return Err("exactly one leaf supervisor configuration is permitted".into());
+            }
+            let memory_bytes = attr(node, "memory-bytes")?
+                .parse::<u64>()
+                .map_err(|_| "invalid supervisor memory budget")?;
+            let pids = attr(node, "pids")?
+                .parse::<u32>()
+                .map_err(|_| "invalid supervisor task budget")?;
+            let cpu_micros = attr(node, "cpu-micros")?
+                .parse::<u32>()
+                .map_err(|_| "invalid supervisor CPU budget")?;
+            if memory_bytes < 16 * 1024 * 1024
+                || !(8..=65536).contains(&pids)
+                || !(1000..=100_000_000).contains(&cpu_micros)
+            {
+                return Err("invalid supervisor resource bounds".into());
+            }
+            supervisor = Some(Supervisor {
+                memory_bytes,
+                pids,
+                cpu_micros,
+                cpus: node
+                    .attribute("cpus")
+                    .map(crate::placement::Set::parse)
+                    .transpose()?,
+                memory_nodes: node
+                    .attribute("memory-nodes")
+                    .map(crate::placement::Set::parse)
+                    .transpose()?,
+            });
+            continue;
+        }
         if node.tag_name().name() == "driver" {
             attributes(
                 node,
@@ -274,8 +325,14 @@ pub fn deployment(s: &str) -> Result<Deployment> {
             cpu_micros,
             restart_limit,
             restart_delay_ms,
-            cpus: node.attribute("cpus").map(crate::placement::Set::parse).transpose()?,
-            memory_nodes: node.attribute("memory-nodes").map(crate::placement::Set::parse).transpose()?,
+            cpus: node
+                .attribute("cpus")
+                .map(crate::placement::Set::parse)
+                .transpose()?,
+            memory_nodes: node
+                .attribute("memory-nodes")
+                .map(crate::placement::Set::parse)
+                .transpose()?,
         })
     }
     if processes.is_empty() {
@@ -285,6 +342,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
         id: name.into(),
         processes,
         drivers,
+        supervisor,
     })
 }
 pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {

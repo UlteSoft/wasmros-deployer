@@ -3,7 +3,7 @@ use manifest::{deployment, local_file, read_xml, recommendations, sha256, Result
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
-use wros_deployer::{manifest, state, supervisor, verdict::Signature, verification};
+use wros_deployer::{manifest, service, state, supervisor, verdict::Signature, verification};
 
 /// Bind every automatic invocation to the exact reviewed configuration and
 /// executable/trust-policy bytes. Recommendation files are not read on resume:
@@ -32,12 +32,24 @@ fn binding(
     add(sha256(std::fs::File::open("/proc/self/exe").map_err(|e| e.to_string())?)?.as_bytes());
     for name in ["--cgroup-parent", "--policy-root", "--state-directory"] {
         let p = options.get(name).ok_or("missing deployment path")?;
-        let real = p.canonicalize().map_err(|e| e.to_string())?;
-        if !p.is_absolute() || &real != p {
-            return Err("durable deployment paths must be canonical and absolute".into());
+        if name == "--cgroup-parent" && options.contains_key("--supervisor-cgroup") {
+            // The independently managed service does not exist during initial
+            // authorization. Bind its exact future name; resume opens and
+            // validates the actual cgroup and current membership before spawn.
+            service::root_path(p)?;
+        } else {
+            let real = p.canonicalize().map_err(|e| e.to_string())?;
+            if !p.is_absolute() || &real != p {
+                return Err("durable deployment paths must be canonical and absolute".into());
+            }
         }
         add(p.as_os_str().as_encoded_bytes());
     }
+    add(if options.contains_key("--supervisor-cgroup") {
+        b"managed service"
+    } else {
+        b"external workload parent"
+    });
     for vm in &plan.processes {
         for name in std::iter::once(&vm.policy).chain(vm.vm_policy.iter()) {
             let p = verification::policy(&options["--policy-root"], name, root)?;
@@ -108,16 +120,16 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
     Ok(rights)
 }
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer plan|review|verify|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/run] [--runtime EXECUTABLE --cgroup-parent DIRECTORY for run/resume] [--state-directory DIRECTORY for run, required for resume]";
+    let usage = "usage: wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if !matches!(
         action.as_str(),
-        "plan" | "review" | "verify" | "run" | "resume"
+        "plan" | "review" | "verify" | "authorize" | "service" | "run" | "resume"
     ) {
         return Err(usage.into());
     }
-    let _signals = if matches!(action.as_str(), "run" | "resume") {
+    let _signals = if matches!(action.as_str(), "authorize" | "run" | "resume") {
         Some(supervisor::Signals::install()?)
     } else {
         None
@@ -129,12 +141,12 @@ fn run() -> Result<()> {
     let mut accept = false;
     let mut exceptions = BTreeMap::new();
     while let Some(key) = args.next() {
-        if matches!(action.as_str(), "review" | "run")
+        if matches!(action.as_str(), "review" | "authorize" | "run")
             && key == "--accept-recommendations"
             && !accept
         {
             accept = true;
-        } else if matches!(action.as_str(), "verify" | "run")
+        } else if matches!(action.as_str(), "verify" | "authorize" | "run")
             && matches!(
                 key.as_str(),
                 "--allow-unsigned" | "--allow-invalid-signature"
@@ -154,12 +166,14 @@ fn run() -> Result<()> {
                 return Err("duplicate signature exception for one VM".into());
             }
         } else if key == "--policy-root"
-            || matches!(action.as_str(), "verify" | "run" | "resume")
-                && matches!(key.as_str(), "--cosign" | "--scratch-directory")
-            || matches!(action.as_str(), "run" | "resume")
+            || matches!(
+                action.as_str(),
+                "verify" | "authorize" | "service" | "run" | "resume"
+            ) && matches!(key.as_str(), "--cosign" | "--scratch-directory")
+            || matches!(action.as_str(), "authorize" | "service" | "run" | "resume")
                 && matches!(
                     key.as_str(),
-                    "--runtime" | "--cgroup-parent" | "--state-directory"
+                    "--runtime" | "--cgroup-parent" | "--supervisor-cgroup" | "--state-directory"
                 )
         {
             let value = args.next().ok_or(usage)?;
@@ -173,8 +187,20 @@ fn run() -> Result<()> {
             return Err(usage.into());
         }
     }
+    if let Some(root) = options.get("--supervisor-cgroup") {
+        let parent = service::root_path(root)?.join("workloads");
+        if options.insert("--cgroup-parent".into(), parent).is_some() {
+            return Err("--supervisor-cgroup and --cgroup-parent are mutually exclusive".into());
+        }
+        if !options.contains_key("--state-directory") {
+            return Err("managed execution requires durable approval".into());
+        }
+    }
     let policies = options.get("--policy-root").ok_or(usage)?;
-    let verifier = if matches!(action.as_str(), "verify" | "run" | "resume") {
+    let verifier = if matches!(
+        action.as_str(),
+        "verify" | "authorize" | "service" | "run" | "resume"
+    ) {
         Some((
             options.get("--cosign").ok_or(usage)?,
             options.get("--scratch-directory").ok_or(usage)?,
@@ -186,8 +212,27 @@ fn run() -> Result<()> {
     let bundle = std::fs::File::open(root).map_err(|e| e.to_string())?;
     let xml = read_xml(&manifest)?;
     let plan = deployment(&xml)?;
+    if action == "service" {
+        print!(
+            "{}",
+            service::unit(
+                &plan,
+                &manifest,
+                &std::env::current_exe().map_err(|e| e.to_string())?,
+                &options
+            )?
+        );
+        return Ok(());
+    }
     let executing = matches!(action.as_str(), "run" | "resume");
-    let execution = if executing {
+    let authorizing = action == "authorize";
+    let execution = if executing || authorizing {
+        if plan.supervisor.is_some() && !options.contains_key("--supervisor-cgroup") {
+            return Err(
+                "supervisor XML budgets require --supervisor-cgroup; refusing to ignore them"
+                    .into(),
+            );
+        }
         if !plan.drivers.is_empty() {
             return Err(
                 "native provider execution is not yet qualified; run refuses driver declarations"
@@ -208,8 +253,8 @@ fn run() -> Result<()> {
         .get("--state-directory")
         .map(|p| state::Journal::open(p, root))
         .transpose()?;
-    if action == "resume" && journal.is_none() {
-        return Err("resume requires a durable state directory".into());
+    if (action == "resume" || authorizing) && journal.is_none() {
+        return Err("authorize/resume require a durable state directory".into());
     }
     let approved_binding = if let Some(j) = &journal {
         let value = binding(&xml, &manifest, &plan, &options, root)?;
@@ -220,6 +265,19 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    if let Some(path) = options.get("--supervisor-cgroup") {
+        let limits = service::budget(&plan)?;
+        let m = plan.supervisor.as_ref().unwrap();
+        println!("INFO Independent supervisor root {:?}; manager memory {} bytes, tasks {}, CPU {} microseconds per 100000, CPUs {}, NUMA nodes {}; workload memory {} bytes, tasks {}; service cap {} bytes and {} tasks, including 4 MiB and 4 control tasks. These caps do not reserve hardware or guarantee real-time response.", path,
+            m.memory_bytes, m.pids, m.cpu_micros, m.cpus.as_ref().map(ToString::to_string).unwrap_or_else(|| "inherited".into()),
+            m.memory_nodes.as_ref().map(ToString::to_string).unwrap_or_else(|| "inherited".into()),
+            limits.workload_memory, limits.workload_tasks, limits.memory, limits.tasks);
+        if executing {
+            service::prepare(path, &plan)?;
+        } else if authorizing {
+            wros_deployer::cgroup::require_inactive(path)?;
+        }
+    }
     if action == "resume" {
         let j = journal.as_ref().unwrap();
         for vm in &plan.processes {
@@ -278,7 +336,7 @@ fn run() -> Result<()> {
         let mut admitted = None;
         if let Some((exe, scratch)) = verifier {
             let admission = verification::admit(exe, scratch, root, file, &vm.digest, &policy);
-            if executing && supervisor::stopping() {
+            if (executing || authorizing) && supervisor::stopping() {
                 if let Some(j) = &mut journal {
                     if j.existing() {
                         j.stop(false)?;
@@ -316,17 +374,24 @@ fn run() -> Result<()> {
         } else if sha256(file)? != vm.digest {
             return Err(format!("module digest mismatch for {}", vm.id));
         }
-        if matches!(action.as_str(), "review" | "run") && !accept {
+        if matches!(action.as_str(), "review" | "authorize" | "run") && !accept {
             rights = approve(rights)?
         }
         approved.insert(
             vm.id.clone(),
-            state::Entry::reviewed(
-                rights.clone(),
-                exceptions.get(&vm.id).map(|(_, kind)| *kind),
-            ),
+            if authorizing {
+                state::Entry::for_service(
+                    rights.clone(),
+                    exceptions.get(&vm.id).map(|(_, kind)| *kind),
+                )
+            } else {
+                state::Entry::reviewed(
+                    rights.clone(),
+                    exceptions.get(&vm.id).map(|(_, kind)| *kind),
+                )
+            },
         );
-        let policy = if executing && secondary_verification {
+        let policy = if (executing || authorizing) && secondary_verification {
             let secondary = verification::policy(
                 policies,
                 vm.vm_policy.as_ref().ok_or(
@@ -394,6 +459,21 @@ fn run() -> Result<()> {
         }
     }
     if let Some((runtime, parent)) = execution {
+        if authorizing {
+            if !options.contains_key("--supervisor-cgroup") {
+                wros_deployer::cgroup::require_inactive(parent)?;
+            }
+            if supervisor::stopping() {
+                return Err("operator stop cancelled authorization".into());
+            }
+            journal.as_mut().unwrap().approve(
+                approved_binding.unwrap(),
+                state::boot_id()?,
+                approved,
+            )?;
+            println!("INFO Reviewed authority saved. No process was started. The independent supervisor may now invoke resume; changed configuration requires fresh review.");
+            return Ok(());
+        }
         if let Some(j) = &mut journal {
             if j.existing() {
                 let ids = launches

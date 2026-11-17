@@ -44,6 +44,12 @@ int main(int argc,char **argv) {
     int f=open("/proc/self/cgroup",O_RDONLY);if(f<0)return 72;
     ssize_t n=read(f,bytes,sizeof bytes-1);close(f);
     if(n<0 || strcmp(bytes,"0::/\n")) return 73;
+    f=open(argv[argc-1],O_RDONLY);if(f<0)return 93;
+    struct stat image;unsigned char magic[4];
+    if(fstat(f,&image)!=0 || image.st_uid!=getuid() || image.st_gid!=getgid() ||
+       (image.st_mode&0777)!=0400 || read(f,magic,sizeof magic)!=sizeof magic ||
+       memcmp(magic,"\0asm",sizeof magic))return 94;
+    close(f);
     f=open(argv[argc-1],O_WRONLY);
     if(f<0){if(errno!=EROFS)return 74;}
     else{errno=0;n=write(f,"X",1);close(f);if(n!=-1 || errno!=EPERM)return 75;}

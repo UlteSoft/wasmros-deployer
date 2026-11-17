@@ -25,6 +25,7 @@ enum Phase {
     Ended,
     Stopped,
     Blocked,
+    FirstStart,
 }
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -35,6 +36,14 @@ pub struct Entry {
     pub restarts: u32,
 }
 impl Entry {
+    /// An operator's one-use initial activation, distinct from permission to
+    /// recover a crash. Resume consumes it durably before any process starts;
+    /// it cannot be replayed after another manager failure or a kernel reboot.
+    pub fn for_service(rights: BTreeMap<String, bool>, waiver: Option<Signature>) -> Self {
+        let mut entry = Self::reviewed(rights, waiver);
+        entry.phase = Phase::FirstStart;
+        entry
+    }
     pub fn reviewed(rights: BTreeMap<String, bool>, waiver: Option<Signature>) -> Self {
         Self {
             rights,
@@ -118,15 +127,17 @@ impl Record {
         let mut selected = Vec::new();
         for p in processes {
             let e = self.entries.get_mut(&p.id).unwrap();
+            let first = !new_boot && e.phase == Phase::FirstStart;
             let allowed = if new_boot {
                 p.boot_start
             } else {
-                p.crash_restart
-                    && e.restarts < p.restart_limit
-                    && matches!(e.phase, Phase::Ready | Phase::Running | Phase::Faulted)
+                first
+                    || p.crash_restart
+                        && e.restarts < p.restart_limit
+                        && matches!(e.phase, Phase::Ready | Phase::Running | Phase::Faulted)
             };
             if allowed {
-                e.restarts = if new_boot { 0 } else { e.restarts + 1 };
+                e.restarts = if new_boot || first { 0 } else { e.restarts + 1 };
                 e.phase = Phase::Ready;
                 selected.push(p.id.clone());
             } else if new_boot {
@@ -154,6 +165,7 @@ impl Record {
                 Phase::Ended => 3,
                 Phase::Stopped => 4,
                 Phase::Blocked => 5,
+                Phase::FirstStart => 6,
             });
             out.extend(e.generation.to_le_bytes());
             out.extend(e.restarts.to_le_bytes());
@@ -218,6 +230,7 @@ impl Record {
                 3 => Phase::Ended,
                 4 => Phase::Stopped,
                 5 => Phase::Blocked,
+                6 => Phase::FirstStart,
                 _ => return Err("unknown persisted phase".into()),
             };
             let generation = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
@@ -547,6 +560,24 @@ mod tests {
         let original = r.entries["body"].rights.clone();
         r.resume(r.boot.clone(), &[&p]).unwrap();
         assert_eq!(original, r.entries["body"].rights);
+    }
+    #[test]
+    fn initial_service_authorization_is_one_use_and_does_not_grant_recovery() {
+        let mut r = sample();
+        r.entries
+            .insert("body".into(), Entry::for_service(BTreeMap::new(), None));
+        let p = process(false, false, 0);
+        assert_eq!(r.resume(r.boot.clone(), &[&p]).unwrap(), vec!["body"]);
+        assert_eq!(r.entries["body"].restarts, 0);
+        // Crash before begin still cannot reuse the first activation.
+        let mut r = Record::decode(&r.encode().unwrap()).unwrap();
+        assert!(r.resume(r.boot.clone(), &[&p]).unwrap().is_empty());
+        r.entries
+            .insert("body".into(), Entry::for_service(BTreeMap::new(), None));
+        assert!(r
+            .resume("00000000-0000-0000-0000-000000000002".into(), &[&p])
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn bounded_record_rejects_corruption_and_unknown_authority() {

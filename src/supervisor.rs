@@ -201,7 +201,7 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
             let target = libc::open(
                 c"/tmp/wros-admitted.wasm".as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
-                0o444,
+                0o600,
             );
             if target < 0 {
                 return Err(fail());
@@ -242,6 +242,13 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
                     }
                     done += wrote as usize;
                 }
+            }
+            // Service managers normally impose umask 0077. Pin the admitted
+            // image to the final guest identity and exact read-only mode rather
+            // than depending on the caller's mask or world-readable access.
+            // The private mount is made read-only before credentials are dropped.
+            if libc::fchown(target, uid, gid) != 0 || libc::fchmod(target, 0o400) != 0 {
+                return Err(fail());
             }
             if libc::close(target) != 0 {
                 return Err(fail());

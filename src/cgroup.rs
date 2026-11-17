@@ -28,7 +28,7 @@ fn component(name: &str) -> Result<CString> {
     }
     CString::new(name).map_err(|e| e.to_string())
 }
-fn open_at(parent: &File, name: &str, flags: i32) -> Result<File> {
+pub(crate) fn open_at(parent: &File, name: &str, flags: i32) -> Result<File> {
     let name = component(name)?;
     let fd = unsafe {
         libc::openat(
@@ -42,7 +42,7 @@ fn open_at(parent: &File, name: &str, flags: i32) -> Result<File> {
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
-fn read(parent: &File, name: &str) -> Result<String> {
+pub(crate) fn read(parent: &File, name: &str) -> Result<String> {
     let mut value = String::new();
     open_at(parent, name, libc::O_RDONLY)?
         .take(8193)
@@ -53,7 +53,7 @@ fn read(parent: &File, name: &str) -> Result<String> {
     }
     Ok(value)
 }
-fn write(parent: &File, name: &str, value: &str) -> Result<()> {
+pub(crate) fn write(parent: &File, name: &str, value: &str) -> Result<()> {
     let mut file = open_at(parent, name, libc::O_WRONLY)?;
     // A cgroup operation is one write, not a stream of partial commands.
     if file.write(value.as_bytes()).map_err(|e| e.to_string())? != value.len() {
@@ -61,7 +61,7 @@ fn write(parent: &File, name: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn owner(file: &File) -> Result<()> {
+pub(crate) fn owner(file: &File) -> Result<()> {
     let m = file.metadata().map_err(|e| e.to_string())?;
     if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
         return Err("cgroup must be a root-owned, non-writable directory for guests".into());
@@ -174,7 +174,7 @@ impl Drop for Group {
     }
 }
 
-fn delegated_parent(path: &Path) -> Result<File> {
+pub(crate) fn directory(path: &Path) -> Result<File> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("run requires a privileged deployment supervisor; guests use distinct unprivileged identities".into());
     }
@@ -196,12 +196,37 @@ fn delegated_parent(path: &Path) -> Result<File> {
     {
         return Err("expected cgroup v2 filesystem".into());
     }
+    Ok(parent)
+}
+
+pub(crate) fn delegated_parent(path: &Path) -> Result<File> {
+    let parent = directory(path)?;
     if !read(&parent, "cgroup.procs")?.trim().is_empty()
         || read(&parent, "cgroup.type")?.trim() != "domain"
     {
         return Err("delegated parent must be an empty domain cgroup".into());
     }
     Ok(parent)
+}
+
+/// Approval never kills existing work. A missing future service directory is
+/// acceptable, but an existing service must be entirely inactive before review
+/// can replace its authority. The independent supervisor owns that directory.
+pub fn require_inactive(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+        Ok(_) => {
+            let group = directory(path)?;
+            if !read(&group, "cgroup.events")?
+                .lines()
+                .any(|s| s == "populated 0")
+            {
+                return Err("approval requires an inactive supervisor cgroup".into());
+            }
+            Ok(())
+        }
+    }
 }
 
 pub struct Hierarchy {
