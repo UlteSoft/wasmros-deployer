@@ -1,8 +1,52 @@
 //! Local preflight and operator review for one fixed bundle.
 use manifest::{deployment, local_file, read_xml, recommendations, sha256, Result};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
-use wros_deployer::{manifest, supervisor, verdict::Signature, verification};
+use wros_deployer::{manifest, state, supervisor, verdict::Signature, verification};
+
+/// Bind every automatic invocation to the exact reviewed configuration and
+/// executable/trust-policy bytes. Recommendation files are not read on resume:
+/// the independently reviewed permission map is stored in the protected record.
+fn binding(
+    xml: &str,
+    manifest: &std::path::Path,
+    plan: &manifest::Deployment,
+    options: &BTreeMap<String, std::path::PathBuf>,
+    root: &std::path::Path,
+) -> Result<String> {
+    let mut h = Sha256::new();
+    let mut add = |value: &[u8]| {
+        h.update((value.len() as u64).to_le_bytes());
+        h.update(value);
+    };
+    add(b"wros reviewed local cold start");
+    add(xml.as_bytes());
+    add(manifest.as_os_str().as_encoded_bytes());
+    for name in ["--runtime", "--cosign"] {
+        let file =
+            verification::protected(options.get(name).ok_or("missing executable")?, root, false)?;
+        add(file.as_os_str().as_encoded_bytes());
+        add(sha256(std::fs::File::open(file).map_err(|e| e.to_string())?)?.as_bytes());
+    }
+    add(sha256(std::fs::File::open("/proc/self/exe").map_err(|e| e.to_string())?)?.as_bytes());
+    for name in ["--cgroup-parent", "--policy-root", "--state-directory"] {
+        let p = options.get(name).ok_or("missing deployment path")?;
+        let real = p.canonicalize().map_err(|e| e.to_string())?;
+        if !p.is_absolute() || &real != p {
+            return Err("durable deployment paths must be canonical and absolute".into());
+        }
+        add(p.as_os_str().as_encoded_bytes());
+    }
+    for vm in &plan.processes {
+        for name in std::iter::once(&vm.policy).chain(vm.vm_policy.iter()) {
+            let p = verification::policy(&options["--policy-root"], name, root)?;
+            add(p.as_os_str().as_encoded_bytes());
+            add(sha256(std::fs::File::open(p).map_err(|e| e.to_string())?)?.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
 
 fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>> {
     if !io::stdin().is_terminal() {
@@ -64,12 +108,20 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
     Ok(rights)
 }
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer plan|review|verify|run DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/run] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256] [--runtime EXECUTABLE --cgroup-parent DIRECTORY for run]";
+    let usage = "usage: wros-deployer plan|review|verify|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/run] [--runtime EXECUTABLE --cgroup-parent DIRECTORY for run/resume] [--state-directory DIRECTORY for run, required for resume]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
-    if !matches!(action.as_str(), "plan" | "review" | "verify" | "run") {
+    if !matches!(
+        action.as_str(),
+        "plan" | "review" | "verify" | "run" | "resume"
+    ) {
         return Err(usage.into());
     }
+    let _signals = if matches!(action.as_str(), "run" | "resume") {
+        Some(supervisor::Signals::install()?)
+    } else {
+        None
+    };
     let manifest = std::path::PathBuf::from(args.next().ok_or(usage)?)
         .canonicalize()
         .map_err(|e| e.to_string())?;
@@ -102,9 +154,13 @@ fn run() -> Result<()> {
                 return Err("duplicate signature exception for one VM".into());
             }
         } else if key == "--policy-root"
-            || matches!(action.as_str(), "verify" | "run")
+            || matches!(action.as_str(), "verify" | "run" | "resume")
                 && matches!(key.as_str(), "--cosign" | "--scratch-directory")
-            || action == "run" && matches!(key.as_str(), "--runtime" | "--cgroup-parent")
+            || matches!(action.as_str(), "run" | "resume")
+                && matches!(
+                    key.as_str(),
+                    "--runtime" | "--cgroup-parent" | "--state-directory"
+                )
         {
             let value = args.next().ok_or(usage)?;
             if options
@@ -118,7 +174,7 @@ fn run() -> Result<()> {
         }
     }
     let policies = options.get("--policy-root").ok_or(usage)?;
-    let verifier = if matches!(action.as_str(), "verify" | "run") {
+    let verifier = if matches!(action.as_str(), "verify" | "run" | "resume") {
         Some((
             options.get("--cosign").ok_or(usage)?,
             options.get("--scratch-directory").ok_or(usage)?,
@@ -128,8 +184,10 @@ fn run() -> Result<()> {
     };
     let root = manifest.parent().ok_or("deployment directory missing")?;
     let bundle = std::fs::File::open(root).map_err(|e| e.to_string())?;
-    let plan = deployment(&read_xml(&manifest)?)?;
-    let execution = if action == "run" {
+    let xml = read_xml(&manifest)?;
+    let plan = deployment(&xml)?;
+    let executing = matches!(action.as_str(), "run" | "resume");
+    let execution = if executing {
         if !plan.drivers.is_empty() {
             return Err(
                 "native provider execution is not yet qualified; run refuses driver declarations"
@@ -146,6 +204,32 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    let mut journal = options
+        .get("--state-directory")
+        .map(|p| state::Journal::open(p, root))
+        .transpose()?;
+    if action == "resume" && journal.is_none() {
+        return Err("resume requires a durable state directory".into());
+    }
+    let approved_binding = if let Some(j) = &journal {
+        let value = binding(&xml, &manifest, &plan, &options, root)?;
+        if j.existing() || action == "resume" {
+            j.check(&value)?;
+        }
+        Some(value)
+    } else {
+        None
+    };
+    if action == "resume" {
+        let j = journal.as_ref().unwrap();
+        for vm in &plan.processes {
+            if let Some(kind) = j.entry(&vm.id)?.waiver {
+                exceptions.insert(vm.id.clone(), (vm.digest.clone(), kind));
+            }
+        }
+        println!("INFO Resuming only durable XML-authorized cold starts. The stored review is unchanged; no motion authority or running memory is restored.");
+    }
+    let mut approved = BTreeMap::new();
     let mut launches = Vec::new();
     for (id, (digest, _)) in &exceptions {
         if !plan
@@ -176,9 +260,13 @@ fn run() -> Result<()> {
         let module = root.join(&vm.module);
         let file = local_file(&bundle, &vm.module)?;
         let policy = verification::policy(policies, &vm.policy, root)?;
-        let mut rights = match &vm.recommendations {
-            Some(p) => recommendations(&manifest::xml_contents(local_file(&bundle, p)?)?)?,
-            None => BTreeMap::new(),
+        let mut rights = if action == "resume" {
+            journal.as_ref().unwrap().entry(&vm.id)?.rights.clone()
+        } else {
+            match &vm.recommendations {
+                Some(p) => recommendations(&manifest::xml_contents(local_file(&bundle, p)?)?)?,
+                None => BTreeMap::new(),
+            }
         };
         println!("INFO VM {:?}, module {:?}, SHA256 {}, signature policy {:?}, VM policy {:?}, memory limit {} bytes, task limit {}",vm.id,vm.module,vm.digest,vm.policy,vm.vm_policy,vm.memory_bytes,vm.pids);
         println!("INFO Recommendations {:?}, cold start at boot {}, authorized crash restart {}. Motion requires fresh safety confirmation and operator approval.",vm.recommendations,vm.boot_start,vm.crash_restart);
@@ -189,9 +277,18 @@ fn run() -> Result<()> {
         let mut secondary_verification = true;
         let mut admitted = None;
         if let Some((exe, scratch)) = verifier {
-            let admission = verification::admit(exe, scratch, root, file, &vm.digest, &policy)?;
+            let admission = verification::admit(exe, scratch, root, file, &vm.digest, &policy);
+            if executing && supervisor::stopping() {
+                if let Some(j) = &mut journal {
+                    if j.existing() {
+                        j.stop(false)?;
+                    }
+                }
+                return Err("operator stop cancelled verification".into());
+            }
+            let admission = admission?;
             let result = admission.signature;
-            if action == "run" {
+            if executing {
                 admitted = Some(verification::FrozenFile(supervisor::retained(
                     admission.module.0,
                 )?));
@@ -222,7 +319,14 @@ fn run() -> Result<()> {
         if matches!(action.as_str(), "review" | "run") && !accept {
             rights = approve(rights)?
         }
-        let policy = if action == "run" && secondary_verification {
+        approved.insert(
+            vm.id.clone(),
+            state::Entry::reviewed(
+                rights.clone(),
+                exceptions.get(&vm.id).map(|(_, kind)| *kind),
+            ),
+        );
+        let policy = if executing && secondary_verification {
             let secondary = verification::policy(
                 policies,
                 vm.vm_policy.as_ref().ok_or(
@@ -290,8 +394,57 @@ fn run() -> Result<()> {
         }
     }
     if let Some((runtime, parent)) = execution {
+        if let Some(j) = &mut journal {
+            if j.existing() {
+                let ids = launches
+                    .iter()
+                    .map(|l| l.process.id.as_str())
+                    .collect::<Vec<_>>();
+                wros_deployer::cgroup::Hierarchy::reclaim(parent, &plan.id, &ids)?;
+            }
+            if supervisor::stopping() {
+                if j.existing() {
+                    j.stop(false)?;
+                }
+                return Err("operator stop cancelled admission".into());
+            }
+            let boot = state::boot_id()?;
+            if action == "resume" {
+                let active = j.resume(
+                    boot,
+                    &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
+                )?;
+                launches.retain(|l| active.contains(&l.process.id));
+                let delay = launches
+                    .iter()
+                    .map(|l| l.process.restart_delay_ms)
+                    .max()
+                    .unwrap_or(0);
+                println!(
+                    "INFO Automatic cold-start delay {} milliseconds, no motion authority",
+                    delay
+                );
+                let until =
+                    std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay));
+                while std::time::Instant::now() < until {
+                    if supervisor::stopping() {
+                        j.stop(false)?;
+                        return Err("operator stop cancelled automatic restart".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            } else {
+                j.approve(approved_binding.unwrap(), boot, approved)?;
+            }
+            if launches.is_empty() {
+                println!(
+                    "INFO No instance has an automatic cold-start grant for this state and boot."
+                );
+                return Ok(());
+            }
+        }
         println!("INFO Starting reviewed VM deployment with runtime {:?}, delegated cgroup {:?}. Boot registration is not performed by this command.",runtime,parent);
-        supervisor::run(&runtime, parent, &plan.id, &launches)?;
+        supervisor::run_with_state(&runtime, parent, &plan.id, &launches, journal.as_mut())?;
     }
     Ok(())
 }

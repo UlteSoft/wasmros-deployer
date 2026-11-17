@@ -186,7 +186,86 @@ rmdir /sys/fs/cgroup/delegated/wros-cell/vm-parentdeath
 rmdir /sys/fs/cgroup/delegated/wros-cell
 pass manager-death-fences-child-and-stale-tree
 
-for log in /normal.log /placement*.log /crash.log /restart.log /orphan.log /pids.log /memory.log /stop.log /flood.log /backpressure.log /signed.log /multiple.log /sdk-allow.log /sdk-deny.log /death.log /stale.log; do
+# A durable approval is outside the bundle and inaccessible to every guest UID.
+# These are genuine supervisor SIGKILLs and kernel cgroup recoveries, not mocked
+# journal transitions. The hostile child leaves an independent grandchild alive.
+mkdir /state/journal
+chmod 700 /state/journal
+configure stop true 2 134217728 'recommendations="permissions.xml"'
+printf '<recommendations><interface name="abi" expose="deny"/></recommendations>\n' > /bundle/permissions.xml
+cp /bundle/current.xml /bundle/original.xml
+set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/journal
+/bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "stop=$digest" > /durable-first.log 2>&1 & manager=$!
+wait_started /durable-first.log 1
+sleep .1
+if /bin/wros-deployer resume "$@" > /durable-lock.log 2>&1; then fail accepted-duplicate-state-owner; fi
+grep -q 'already owned by another supervisor' /durable-lock.log || { cat /durable-lock.log; fail wrong-lock-denial; }
+pass state-lock-refuses-second-manager
+kill -KILL "$manager"; wait "$manager" || true
+sleep .1
+old=$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)
+test -n "$old" || fail missing-hostile-survivor
+configure stop true 2 67108864 'recommendations="permissions.xml"'
+if /bin/wros-deployer resume "$@" > /durable-binding.log 2>&1; then fail accepted-changed-approval; fi
+grep -q 'no matching durable approval' /durable-binding.log || { cat /durable-binding.log; fail wrong-binding-denial; }
+test -n "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)" || fail killed-before-binding-validation
+cp /bundle/original.xml /bundle/current.xml
+pass state-binding-change-rejected-before-reclaim
+mkdir /sys/fs/cgroup/delegated/wros-cell/unapproved
+if /bin/wros-deployer resume "$@" > /durable-unknown.log 2>&1; then fail reclaimed-unknown-group; fi
+grep -q 'unapproved child cgroup' /durable-unknown.log || { cat /durable-unknown.log; fail wrong-unknown-denial; }
+test -n "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)" || fail killed-before-subtree-validation
+rmdir /sys/fs/cgroup/delegated/wros-cell/unapproved
+pass state-unknown-cgroup-rejected-before-reclaim
+# Editing the recommendation cannot silently change the previously approved map.
+printf '<recommendations><interface name="abi" expose="allow"/></recommendations>\n' > /bundle/permissions.xml
+/bin/wros-deployer resume "$@" > /durable-second.log 2>&1 & manager=$!
+wait_started /durable-second.log 1
+grep -q 'generation 2 started' /durable-second.log || fail lost-persisted-generation
+for process in $old; do not_running "$process"; done
+grep -q '"abi", "deny"' /durable-second.log || { cat /durable-second.log; fail reapplied-recommendation; }
+pass state-recommendations-not-reapplied
+pass state-manager-crash-reclaims-all-descendants
+kill -KILL "$manager"; wait "$manager" || true
+/bin/wros-deployer resume "$@" > /durable-third.log 2>&1 & manager=$!
+wait_started /durable-third.log 1
+grep -q 'generation 3 started' /durable-third.log || fail lost-second-generation
+kill -KILL "$manager"; wait "$manager" || true
+/bin/wros-deployer resume "$@" > /durable-exhausted.log 2>&1 || { cat /durable-exhausted.log; fail exhausted-resume; }
+grep -q 'No instance has an automatic cold-start grant' /durable-exhausted.log || fail reset-crash-budget
+empty; pass state-manager-crashes-preserve-retry-budget
+# A fresh operator-reviewed invocation may reset retries, but an automatic one
+# may not. Operator shutdown is committed before descendant termination.
+/bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "stop=$digest" > /durable-stop.log 2>&1 & manager=$!
+wait_started /durable-stop.log 1
+grep -q 'generation 4 started' /durable-stop.log || fail operator-reset-generation
+kill -TERM "$manager"; wait "$manager" || { cat /durable-stop.log; fail durable-stop; }
+/bin/wros-deployer resume "$@" > /durable-stopped.log 2>&1 || fail stopped-resume
+grep -q 'No instance has an automatic cold-start grant' /durable-stopped.log || fail restarted-after-durable-stop
+empty; pass state-operator-stop-survives-manager-replacement
+cp /state/journal/approval /state/journal/backup
+printf X | dd of=/state/journal/approval bs=1 count=1 conv=notrunc 2>/dev/null
+if /bin/wros-deployer resume "$@" > /durable-tamper.log 2>&1; then fail accepted-corrupt-state; fi
+grep -q 'checksum mismatch' /durable-tamper.log || { cat /durable-tamper.log; fail wrong-tamper-denial; }
+cp /state/journal/backup /state/journal/approval
+empty; pass state-record-tamper-fails-closed
+chmod 755 /state/journal
+if /bin/wros-deployer resume "$@" > /durable-private.log 2>&1; then fail accepted-readable-state-directory; fi
+grep -q 'exclusive owner and private' /durable-private.log || fail wrong-mode-denial
+chmod 700 /state/journal
+empty; pass state-private-storage-required
+rm /state/journal/lock
+ln -s backup /state/journal/lock
+if /bin/wros-deployer resume "$@" > /durable-symlink.log 2>&1; then fail followed-state-lock-symlink; fi
+rm /state/journal/lock
+empty; pass state-symlink-lock-refused
+ln /state/journal/approval /state/journal/alias
+if /bin/wros-deployer resume "$@" > /durable-hardlink.log 2>&1; then fail accepted-aliased-approval; fi
+grep -q 'exclusive owner and private' /durable-hardlink.log || fail wrong-hardlink-denial
+rm /state/journal/alias
+empty; pass state-approval-hardlink-refused
+
+for log in /normal.log /placement*.log /crash.log /restart.log /orphan.log /pids.log /memory.log /stop.log /flood.log /backpressure.log /signed.log /multiple.log /sdk-allow.log /sdk-deny.log /death.log /stale.log /durable*.log; do
     echo "AUDIT_LOG $log"; cat "$log"
 done
 

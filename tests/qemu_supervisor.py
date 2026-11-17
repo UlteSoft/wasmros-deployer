@@ -22,6 +22,31 @@ def digest(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+def pack(root,archive):
+    # newc archive written as a stream; no privileged host mknod or guest tools.
+    with gzip.open(archive,'wb',compresslevel=1) as out:
+        inode=0
+        def entry(name,mode,size,stream=None,link=None,major=0,minor=0):
+            nonlocal inode
+            inode+=1;name=name.encode()+b'\0'
+            fields=[inode,mode,0,0,1,0,size,0,0,major,minor,len(name),0]
+            out.write(b'070701'+b''.join(f'{x:08x}'.encode() for x in fields)+name)
+            out.write(b'\0'*((-110-len(name))%4))
+            if stream:shutil.copyfileobj(stream,out,1024*1024)
+            if link:out.write(link)
+            out.write(b'\0'*((-size)%4))
+        for path in [root,*sorted(root.rglob('*'))]:
+            name='.' if path==root else str(path.relative_to(root))
+            info=path.lstat()
+            if path.is_symlink():
+                link=os.readlink(path).encode();entry(name,info.st_mode,len(link),link=link)
+            elif path.is_dir():entry(name,stat.S_IFDIR|0o755,0)
+            else:
+                with path.open('rb') as f:entry(name,stat.S_IFREG|stat.S_IMODE(info.st_mode),info.st_size,stream=f)
+        entry('dev/console',stat.S_IFCHR|0o600,0,major=5,minor=1)
+        entry('dev/null',stat.S_IFCHR|0o666,0,major=1,minor=3)
+        entry('TRAILER!!!',0,0)
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ("kernel","qemu","deployer","vm","cosign","admission-fixture","sdk-module","output"):
@@ -54,7 +79,7 @@ def main():
     for path,target in ((Path('/bin/busybox'),'/bin/busybox'),(Path('/usr/bin/strace'),'/bin/strace'),(args.deployer,'/bin/wros-deployer'),
                         (args.vm,'/bin/uwvm2-ros'),(args.cosign,'/bin/cosign'),(peer,'/bin/supervisor-peer')):
         binary(path.resolve(),target)
-    for app in ('sh','mount','mkdir','chmod','chown','sha256sum','grep','cat','cut','sleep','poweroff','rmdir','wc','tail','awk'):
+    for app in ('sh','mount','mkdir','chmod','chown','sha256sum','grep','cat','cut','sleep','poweroff','rmdir','wc','tail','awk','cp','dd','ln','rm'):
         (root/'bin'/app).symlink_to('busybox')
     copy(source/'qemu_supervisor_guest.sh','/init')
     for name in ('body.wasm','unsigned.wasm'):
@@ -66,29 +91,7 @@ def main():
     copy(trust,'/trust/root.pem',0o644)
     copy(Path(trust).parent/'signer.pem','/trust/signer.pem',0o644)
     archive=args.output/'initramfs.cpio.gz'
-    # newc archive written as a stream; no privileged host mknod or guest tools.
-    with gzip.open(archive,'wb',compresslevel=1) as out:
-        inode=0
-        def entry(name,mode,size,stream=None,link=None,major=0,minor=0):
-            nonlocal inode
-            inode+=1;name=name.encode()+b'\0'
-            fields=[inode,mode,0,0,1,0,size,0,0,major,minor,len(name),0]
-            out.write(b'070701'+b''.join(f'{x:08x}'.encode() for x in fields)+name)
-            out.write(b'\0'*((-110-len(name))%4))
-            if stream:shutil.copyfileobj(stream,out,1024*1024)
-            if link:out.write(link)
-            out.write(b'\0'*((-size)%4))
-        for path in [root,*sorted(root.rglob('*'))]:
-            name='.' if path==root else str(path.relative_to(root))
-            info=path.lstat()
-            if path.is_symlink():
-                link=os.readlink(path).encode();entry(name,info.st_mode,len(link),link=link)
-            elif path.is_dir():entry(name,stat.S_IFDIR|0o755,0)
-            else:
-                with path.open('rb') as f:entry(name,stat.S_IFREG|stat.S_IMODE(info.st_mode),info.st_size,stream=f)
-        entry('dev/console',stat.S_IFCHR|0o600,0,major=5,minor=1)
-        entry('dev/null',stat.S_IFCHR|0o666,0,major=1,minor=3)
-        entry('TRAILER!!!',0,0)
+    pack(root,archive)
     argv=[str(args.qemu),'-nodefaults','-machine','q35','-accel','tcg,thread=multi','-cpu','max','-smp','2,sockets=2,cores=1,threads=1','-m','4096',
           '-object','memory-backend-ram,id=mem0,size=2G','-object','memory-backend-ram,id=mem1,size=2G',
           '-numa','node,nodeid=0,cpus=0,memdev=mem0','-numa','node,nodeid=1,cpus=1,memdev=mem1',
@@ -103,7 +106,7 @@ def main():
         run=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=240)
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=run.returncode,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==20
+    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==31
     receipt.write_text(json.dumps(result,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('argv','inputs','compile')},indent=2))
     assert result['complete'],text[-10000:]

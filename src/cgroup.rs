@@ -109,11 +109,15 @@ impl Group {
     /// intersect with the parent's allocation. Runtime hotplug may still change
     /// the effective set; hardware safety must not depend on placement alone.
     pub fn verify_placement(&self, process: &Process) -> Result<()> {
-        for (name, requested) in [("cpuset.cpus.effective", &process.cpus),
-                                  ("cpuset.mems.effective", &process.memory_nodes)] {
+        for (name, requested) in [
+            ("cpuset.cpus.effective", &process.cpus),
+            ("cpuset.mems.effective", &process.memory_nodes),
+        ] {
             if let Some(requested) = requested {
                 if &Set::parse(read(&self.directory, name)?.trim())? != requested {
-                    return Err(format!("effective {name} differs from the reviewed placement"));
+                    return Err(format!(
+                        "effective {name} differs from the reviewed placement"
+                    ));
                 }
             }
         }
@@ -170,38 +174,121 @@ impl Drop for Group {
     }
 }
 
+fn delegated_parent(path: &Path) -> Result<File> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("run requires a privileged deployment supervisor; guests use distinct unprivileged identities".into());
+    }
+    if !path.is_absolute()
+        || path.canonicalize().map_err(|e| e.to_string())? != path
+        || path == Path::new("/sys/fs/cgroup")
+    {
+        return Err("supply an explicit delegated cgroup subtree".into());
+    }
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    owner(&parent)?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut stat) } != 0
+        || stat.f_type as u64 != 0x63677270
+    {
+        return Err("expected cgroup v2 filesystem".into());
+    }
+    if !read(&parent, "cgroup.procs")?.trim().is_empty()
+        || read(&parent, "cgroup.type")?.trim() != "domain"
+    {
+        return Err("delegated parent must be an empty domain cgroup".into());
+    }
+    Ok(parent)
+}
+
 pub struct Hierarchy {
     pub children: Vec<Group>,
     root: Group,
 }
 impl Hierarchy {
+    /// Reclaim only the exact instance set bound to a locked durable approval.
+    /// The caller must hold that journal's exclusive lock. Unknown child groups
+    /// stop recovery before any signal; existing known children must all drain
+    /// before their directories are removed and a fresh hierarchy is admitted.
+    pub fn reclaim(path: &Path, deployment: &str, instances: &[&str]) -> Result<()> {
+        let parent = delegated_parent(path)?;
+        let name = format!("wros-{deployment}");
+        let encoded = component(&name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e.to_string())
+            };
+        }
+        let directory = unsafe { File::from_raw_fd(fd) };
+        owner(&directory)?;
+        let expected = instances
+            .iter()
+            .map(|s| format!("vm-{s}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            .map_err(|e| e.to_string())?
+        {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "invalid old cgroup name")?;
+                if !expected.contains(&name) {
+                    return Err("unapproved child cgroup prevents recovery".into());
+                }
+                let child = open_at(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                owner(&child)?;
+                // Guests have no cgroup creation rights. An unexpected subtree
+                // therefore needs an administrator instead of recursive deletion.
+                if std::fs::read_dir(format!("/proc/self/fd/{}", child.as_raw_fd()))
+                    .map_err(|e| e.to_string())?
+                    .any(|e| e.and_then(|e| e.file_type()).map_or(true, |t| t.is_dir()))
+                {
+                    return Err("unexpected nested cgroup prevents recovery".into());
+                }
+                children.push((component(&name)?, child));
+            }
+        }
+        let root = Group {
+            directory,
+            parent,
+            name: encoded,
+        };
+        root.drain(Duration::from_secs(2))?;
+        for (name, _child) in children {
+            if unsafe {
+                libc::unlinkat(
+                    root.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } != 0
+            {
+                return Err(error());
+            }
+        }
+        // Drop removes the empty known root. A failed removal is detected by the
+        // subsequent exclusive create; it can never cause attachment to old work.
+        drop(root);
+        Ok(())
+    }
     pub fn create(path: &Path, deployment: &str, processes: &[&Process]) -> Result<Self> {
-        if unsafe { libc::geteuid() } != 0 {
-            return Err("run requires a privileged deployment supervisor; guests use distinct unprivileged identities".into());
-        }
-        if !path.is_absolute()
-            || path.canonicalize().map_err(|e| e.to_string())? != path
-            || path == Path::new("/sys/fs/cgroup")
-        {
-            return Err("supply an explicit delegated cgroup subtree".into());
-        }
-        let parent = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|e| e.to_string())?;
-        owner(&parent)?;
-        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut stat) } != 0
-            || stat.f_type as u64 != 0x63677270
-        {
-            return Err("expected cgroup v2 filesystem".into());
-        }
-        if !read(&parent, "cgroup.procs")?.trim().is_empty()
-            || read(&parent, "cgroup.type")?.trim() != "domain"
-        {
-            return Err("delegated parent must be an empty domain cgroup".into());
-        }
+        let parent = delegated_parent(path)?;
         let controllers = read(&parent, "cgroup.subtree_control")?;
         for required in ["cpu", "memory", "pids"] {
             if !controllers.split_whitespace().any(|s| s == required) {
@@ -210,7 +297,9 @@ impl Hierarchy {
                 ));
             }
         }
-        let placement = processes.iter().any(|p| p.cpus.is_some() || p.memory_nodes.is_some());
+        let placement = processes
+            .iter()
+            .any(|p| p.cpus.is_some() || p.memory_nodes.is_some());
         if placement {
             if !controllers.split_whitespace().any(|s| s == "cpuset") {
                 return Err("explicit placement requires an enabled cpuset controller".into());
@@ -219,8 +308,14 @@ impl Hierarchy {
             let nodes = Set::parse(read(&parent, "cpuset.mems.effective")?.trim())?;
             for p in processes {
                 if p.cpus.as_ref().is_some_and(|set| !cpus.contains(set))
-                    || p.memory_nodes.as_ref().is_some_and(|set| !nodes.contains(set)) {
-                    return Err(format!("VM {:?} placement exceeds delegated effective CPU/NUMA sets", p.id));
+                    || p.memory_nodes
+                        .as_ref()
+                        .is_some_and(|set| !nodes.contains(set))
+                {
+                    return Err(format!(
+                        "VM {:?} placement exceeds delegated effective CPU/NUMA sets",
+                        p.id
+                    ));
                 }
             }
         }
@@ -254,7 +349,11 @@ impl Hierarchy {
         write(
             &root.directory,
             "cgroup.subtree_control",
-            if placement { "+cpu +memory +pids +cpuset" } else { "+cpu +memory +pids" },
+            if placement {
+                "+cpu +memory +pids +cpuset"
+            } else {
+                "+cpu +memory +pids"
+            },
         )?;
         let mut hierarchy = Self {
             children: Vec::with_capacity(processes.len()),

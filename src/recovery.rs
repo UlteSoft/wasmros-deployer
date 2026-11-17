@@ -17,9 +17,14 @@ pub struct Instance {
 }
 impl Instance {
     pub fn new(restart_authorized: bool) -> Self {
+        Self::after_generation(restart_authorized, 0)
+    }
+    /// Seed a cold state from the administrator-owned durable generation. No
+    /// safety feedback or motion authority survives supervisor replacement.
+    pub fn after_generation(restart_authorized: bool, generation: u64) -> Self {
         Self {
             state: State::Stopped,
-            generation: 0,
+            generation,
             restart_authorized,
             safe_epoch: None,
         }

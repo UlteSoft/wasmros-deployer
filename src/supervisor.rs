@@ -20,17 +20,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static SIGNALS: AtomicBool = AtomicBool::new(false);
 /// A private read-only copy of the sealed image. VM's normal no-follow loader
 /// accepts this regular path without weakening its symlink rejection policy.
 pub const IMAGE_PATH: &str = "/tmp/wros-admitted.wasm";
 extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
-struct Signals(Vec<(i32, libc::sigaction)>);
+pub struct Signals {
+    saved: Vec<(i32, libc::sigaction)>,
+    owns: bool,
+}
 impl Signals {
-    fn install() -> Result<Self> {
+    pub fn install() -> Result<Self> {
+        if SIGNALS.swap(true, Ordering::SeqCst) {
+            return Ok(Self {
+                saved: Vec::new(),
+                owns: false,
+            });
+        }
         STOP.store(false, Ordering::SeqCst);
-        let mut saved = Self(Vec::new());
+        let mut saved = Self {
+            saved: Vec::new(),
+            owns: true,
+        };
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -41,19 +54,25 @@ impl Signals {
             if unsafe { libc::sigaction(signal, &action, &mut old) } != 0 {
                 return Err(std::io::Error::last_os_error().to_string());
             }
-            saved.0.push((signal, old));
+            saved.saved.push((signal, old));
         }
         Ok(saved)
     }
 }
 impl Drop for Signals {
     fn drop(&mut self) {
-        for (signal, old) in &self.0 {
+        for (signal, old) in &self.saved {
             unsafe {
                 libc::sigaction(*signal, old, std::ptr::null_mut());
             }
         }
+        if self.owns {
+            SIGNALS.store(false, Ordering::SeqCst);
+        }
     }
+}
+pub fn stopping() -> bool {
+    STOP.load(Ordering::SeqCst)
 }
 
 pub struct Launch {
@@ -70,12 +89,14 @@ struct Running {
     next: Option<Instant>,
     failed: bool,
     output: usize,
+    started: bool,
 }
 struct Session<'a> {
     hierarchy: Hierarchy,
     launches: &'a [Launch],
     slots: Vec<Running>,
     events: &'a Events,
+    journal: Option<&'a mut crate::state::Journal>,
 }
 impl Drop for Session<'_> {
     fn drop(&mut self) {
@@ -115,7 +136,11 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
     let exe = runtime.as_raw_fd();
     let (uid, gid) = launch.process.identity.ok_or("missing guest identity")?;
     let parent = unsafe { libc::getpid() };
-    let affinity = launch.process.cpus.as_ref().map(crate::placement::Set::affinity);
+    let affinity = launch
+        .process
+        .cpus
+        .as_ref()
+        .map(crate::placement::Set::affinity);
     let mut command = Command::new(format!("/proc/self/fd/{exe}"));
     command
         .args(&launch.arguments)
@@ -133,7 +158,12 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
                 return Err(fail());
             }
             if let Some(mask) = &affinity {
-                if libc::sched_setaffinity(0, std::mem::size_of_val(mask.as_slice()), mask.as_ptr().cast()) != 0 {
+                if libc::sched_setaffinity(
+                    0,
+                    std::mem::size_of_val(mask.as_slice()),
+                    mask.as_ptr().cast(),
+                ) != 0
+                {
                     return Err(fail());
                 }
             }
@@ -344,12 +374,20 @@ impl Session<'_> {
             return Err("operator stop or audit failure before VM start".into());
         }
         let slot = &mut self.slots[index];
-        let generation = if slot.generation == 0 {
+        let generation = if !slot.started {
             slot.state.operator_start()
         } else {
             slot.state.recover(slot.generation)
         }
         .ok_or("restart state denied")?;
+        if let Some(journal) = &mut self.journal {
+            journal.begin(
+                &self.launches[index].process.id,
+                generation,
+                slot.started,
+                self.launches[index].process.restart_limit,
+            )?;
+        }
         self.hierarchy.children[index].drain(Duration::from_secs(2))?;
         self.hierarchy.children[index].verify_placement(&self.launches[index].process)?;
         let (child, pidfd) = spawn(
@@ -366,6 +404,7 @@ impl Session<'_> {
         slot.child = Some(child);
         slot.pidfd = Some(pidfd);
         slot.generation = generation;
+        slot.started = true;
         slot.next = None;
         slot.output = 0;
         Ok(())
@@ -424,11 +463,33 @@ impl Session<'_> {
 }
 
 pub fn run(runtime: &Path, cgroup: &Path, deployment: &str, launches: &[Launch]) -> Result<()> {
+    run_with_state(runtime, cgroup, deployment, launches, None)
+}
+pub fn run_with_state(
+    runtime: &Path,
+    cgroup: &Path,
+    deployment: &str,
+    launches: &[Launch],
+    mut journal: Option<&mut crate::state::Journal>,
+) -> Result<()> {
     let _signals = Signals::install()?;
     let events = Events::new()?;
-    let result = supervise(runtime, cgroup, deployment, launches, &events);
+    let result = supervise(
+        runtime,
+        cgroup,
+        deployment,
+        launches,
+        &events,
+        journal.as_deref_mut(),
+    );
     let logged = events.finish();
-    result.and(logged)
+    let result = result.and(logged);
+    if result.is_err() {
+        if let Some(journal) = journal {
+            journal.stop(true)?;
+        }
+    }
+    result
 }
 fn supervise(
     runtime: &Path,
@@ -436,34 +497,47 @@ fn supervise(
     deployment: &str,
     launches: &[Launch],
     events: &Events,
+    journal: Option<&mut crate::state::Journal>,
 ) -> Result<()> {
     let runtime = retained(File::open(runtime).map_err(|e| e.to_string())?)?;
     let processes = launches.iter().map(|l| &l.process).collect::<Vec<_>>();
     let hierarchy = Hierarchy::create(cgroup, deployment, &processes)?;
     let slots = launches
         .iter()
-        .map(|l| Running {
-            child: None,
-            pidfd: None,
-            state: Instance::new(l.process.crash_restart),
-            generation: 0,
-            restarts: 0,
-            next: None,
-            failed: false,
-            output: 0,
+        .map(|l| {
+            let entry = journal
+                .as_ref()
+                .map(|j| j.entry(&l.process.id))
+                .transpose()?;
+            let previous = entry.map_or(0, |e| e.generation);
+            Ok(Running {
+                child: None,
+                pidfd: None,
+                state: Instance::after_generation(l.process.crash_restart, previous),
+                generation: previous,
+                restarts: entry.map_or(0, |e| e.restarts),
+                next: None,
+                failed: false,
+                output: 0,
+                started: false,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let mut session = Session {
         hierarchy,
         launches,
         slots,
         events,
+        journal,
     };
     for i in 0..launches.len() {
         session.start(i, &runtime)?;
     }
     loop {
         if STOP.load(Ordering::SeqCst) {
+            if let Some(journal) = &mut session.journal {
+                journal.stop(false)?;
+            }
             session.shutdown()?;
             events.send(
                 "INFO Operator stop completed; no automatic restart in this invocation".into(),
@@ -479,6 +553,9 @@ fn supervise(
             if let Some(child) = &mut slot.child {
                 output(child, &launch.process.id, &mut slot.output, events);
                 if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    if let Some(journal) = &mut session.journal {
+                        journal.exited(&launch.process.id, status.success())?;
+                    }
                     output(child, &launch.process.id, &mut slot.output, events);
                     events.send(format!(
                         "INFO VM {:?} generation {} exit {status}",
