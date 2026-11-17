@@ -1,7 +1,10 @@
 //! Local, bounded, closed XML deployment and recommendation formats.
 use roxmltree::{Document, Node, ParsingOptions};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -20,7 +23,11 @@ pub struct DriverArtifact {
 #[derive(Debug)]
 pub struct Deployment {pub id: String, pub processes: Vec<Process>,pub drivers:Vec<DriverArtifact>}
 pub fn read_xml(p: &Path) -> Result<String> {
-    let f = File::open(p).map_err(|e| e.to_string())?;
+    let f = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(p).map_err(|e| e.to_string())?;
+    xml_contents(f)
+}
+pub fn xml_contents(f: File) -> Result<String> {
     if !f.metadata().map_err(|e|e.to_string())?.is_file() { return Err("expected regular XML file".into()); }
     let mut data=String::new();f.take(MAX_XML+1).read_to_string(&mut data).map_err(|e|e.to_string())?;
     if data.len() as u64>MAX_XML{return Err("XML exceeds byte budget".into())} Ok(data)
@@ -90,12 +97,35 @@ pub fn recommendations(s:&str)->Result<BTreeMap<String,bool>>{
         if grants.insert(key.into(),enabled).is_some(){return Err("duplicate interface".into())}
     }Ok(grants)
 }
-pub fn local_file(root:&Path, relative:&Path)->Result<PathBuf>{
-    let p=root.join(relative).canonicalize().map_err(|e|e.to_string())?;
-    if !p.starts_with(root)||!p.is_file(){return Err("file outside bundle or missing".into())} Ok(p)
+/// Resolve each component relative to a pinned directory descriptor. Symlinks
+/// never acquire access outside the submitted bundle, even during replacement.
+pub fn local_file(root: &File, relative: &Path) -> Result<File> {
+    let mut directory = root.try_clone().map_err(|e| e.to_string())?;
+    let mut parts = relative.components().peekable();
+    while let Some(component) = parts.next() {
+        let Component::Normal(part) = component else { return Err("invalid bundle path".into()); };
+        let part = CString::new(part.as_bytes()).map_err(|e| e.to_string())?;
+        let last = parts.peek().is_none();
+        let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_RDONLY;
+        if !last { flags |= libc::O_DIRECTORY; }
+        // The directory remains open during the syscall and the result has one owner.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 { return Err(io::Error::last_os_error().to_string()); }
+        let next = unsafe { File::from_raw_fd(fd) };
+        if last {
+            if !next.metadata().map_err(|e| e.to_string())?.is_file() {
+                return Err("bundle artifact must be a regular file".into());
+            }
+            return Ok(next);
+        }
+        directory = next;
+    }
+    Err("empty bundle path".into())
 }
-pub fn sha256(path:&Path)->Result<String>{
-    use sha2::{Digest,Sha256};
-    let mut f=File::open(path).map_err(|e|e.to_string())?;let mut hash=Sha256::new();
-    io::copy(&mut f,&mut hash).map_err(|e|e.to_string())?;Ok(format!("{:x}",hash.finalize()))
+
+pub fn sha256(mut input: File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    io::copy(&mut input, &mut hash).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", hash.finalize()))
 }
