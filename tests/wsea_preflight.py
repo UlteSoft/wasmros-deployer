@@ -47,7 +47,7 @@ def main():
                                  ca["certificate"], "--module-id", "body", "--algorithms", "Ed25519"], True)
 
     unsigned = bundle / "unsigned.wasm"
-    unsigned.write_bytes(bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b"))
+    unsigned.write_bytes(bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b0005046e6f7465"))
     signed = bundle / "body.wasm"
     now = datetime.datetime.now(datetime.timezone.utc)
     stamp = lambda delta: (now + datetime.timedelta(seconds=delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -71,19 +71,35 @@ def main():
         check("VM-" + file.stem, [args.vm, "--secure", "module", file, policy, "--run", file], allowed)
 
     configure(signed)
+    def checked_preview(label, file, option, allowed, secondary):
+        digest = hashlib.sha256(file.read_bytes()).hexdigest()
+        stdout = check(label, [*verify, option, "body=" + digest], allowed)
+        if allowed:
+            args_line = next(line for line in stdout.splitlines() if line.startswith("VM argv "))
+            argv = json.loads(args_line.removeprefix("VM argv "))
+            assert ("--secure" in argv) == secondary
+            assert "WARNING" in results[-1]["stderr"]
+            check(label + "-actual-vm", [args.vm, *argv], True)
+
     check("deployer-accepts-signed", verify, True)
+    checked_preview("valid-keeps-secondary", signed, "--allow-invalid-signature", True, True)
     run_vm(signed, True)
     configure(unsigned)
     check("deployer-rejects-unsigned", verify, False)
     run_vm(unsigned, False)
+    checked_preview("unsigned-exception", unsigned, "--allow-unsigned", True, False)
+    checked_preview("unsigned-rejects-wrong-exception", unsigned, "--allow-invalid-signature", False, False)
     changed = bundle / "changed.wasm"
-    # Rename the exported guest entry while preserving the embedded original signature.
+    # Change an inert custom-section name, preserving guest instructions and the original signature.
     contents = signed.read_bytes()
-    assert contents.count(b"_start") == 1
-    changed.write_bytes(contents.replace(b"_start", b"_other", 1))
+    assert contents.count(b"note") == 1
+    changed.write_bytes(contents.replace(b"note", b"meta", 1))
     configure(changed)
     check("deployer-rejects-changed-signed-bytes", verify, False)
     run_vm(changed, False)
+    checked_preview("invalid-exception", changed, "--allow-invalid-signature", True, False)
+    checked_preview("changed-rejects-unsigned-exception", changed, "--allow-unsigned", False, False)
+    check("stale-exception-digest", [*verify, "--allow-invalid-signature", "body=" + "0" * 64], False)
     configure(signed, "0" * 64)
     check("deployer-rejects-wrong-upload-hash", verify, False)
     configure(signed)

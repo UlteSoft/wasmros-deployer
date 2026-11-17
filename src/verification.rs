@@ -1,5 +1,7 @@
 //! First-stage offline WSEA admission on the exact reviewed Wasm bytes.
 use crate::manifest::Result;
+use crate::verdict::Signature;
+use std::os::fd::AsRawFd;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -77,8 +79,9 @@ fn create_snapshot(scratch: &Path, mut input: File, digest: &str) -> Result<Snap
 /// Verify the bytes copied into a private directory, with bounded size and time.
 /// Success is an observation during preflight. Execution still requires VM verification.
 pub fn verify(verifier: &Path, scratch: &Path, bundle: &Path, module: File,
-              digest: &str, trust: &Path) -> Result<()> {
+              digest: &str, trust: &Path) -> Result<Signature> {
     let verifier = protected(verifier, bundle, false)?;
+    let trust = protected(trust, bundle, false)?;
     let scratch = protected(scratch, bundle, true)?;
     let info = fs::metadata(&scratch).map_err(|e| e.to_string())?;
     if info.mode() & 0o777 != 0o700 || info.uid() != unsafe { libc::geteuid() } {
@@ -87,14 +90,29 @@ pub fn verify(verifier: &Path, scratch: &Path, bundle: &Path, module: File,
     let snapshot = create_snapshot(&scratch, module, digest)?;
     let mut cmd = Command::new(verifier);
     cmd.args(["wasm", "secure", "verify"]).arg(&snapshot.0).arg("--policy").arg(trust)
-        .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+        .env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     println!("INFO Executing verifier {:?} {:?}", cmd.get_program(), cmd.get_args().collect::<Vec<_>>());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let end = Instant::now() + VERIFY_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(format!("WSEA verification failed ({status})")),
+            Ok(Some(status)) if status.success() => return Ok(Signature::Verified),
+            Ok(Some(status)) => {
+                if status.code() != Some(1) { return Err(format!("verifier failed ({status})")); }
+                // The trusted verifier has exited. Bound the diagnostic and refuse
+                // incomplete output if a descendant still holds the writing end.
+                let pipe = child.stderr.take().ok_or("missing verifier diagnostic")?;
+                let fd = pipe.as_raw_fd();
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                    return Err("could not bound the verifier diagnostic".into());
+                }
+                let mut reason = Vec::with_capacity(4097);
+                pipe.take(4097).read_to_end(&mut reason).map_err(|e| e.to_string())?;
+                if reason.len() > 4096 { return Err("verifier diagnostic exceeds limit".into()); }
+                eprintln!("Verifier rejection: {:?}", String::from_utf8_lossy(&reason));
+                return Signature::rejected(&reason).ok_or_else(|| "unclassified verification, trust or policy failure".into());
+            }
             Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
             other => {
                 let _ = child.kill();

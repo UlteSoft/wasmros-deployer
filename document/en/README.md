@@ -33,4 +33,6 @@ wros-deployer verify deployment.xml --policy-root /protected/policies \
   --cosign /opt/wros/bin/cosign --scratch-directory /protected/staging
 ```
 
-The deployer copies at most 256 MiB per submitted module, hashes the bytes it copied, and invokes the named wasm-cosign executable on that exact snapshot. It waits up to 30 seconds, checks the exit status, and removes the snapshot on return. A rejected signature or digest stops verification. The execution preview retains the VM's independent signature check. This command finishes before guest execution.
+The deployer copies at most 256 MiB per submitted module, hashes the bytes it copied, and invokes the named wasm-cosign executable on that exact snapshot. It waits up to 30 seconds, checks the exit status, and removes the snapshot on return. The default policy requires a valid signature and matching digest. The execution preview retains the VM's independent signature check. This command finishes before guest execution.
+
+For a specific local development image, `verify` accepts `--allow-unsigned ID=SHA256` or `--allow-invalid-signature ID=SHA256`. Each option applies to one VM and the complete uploaded file digest. A recognized rejection of the matching kind emits a warning and the preview omits secondary verification for that image. A valid signature retains both checks. Unknown verifier failures, missing trust, policy or revocation errors, and a changed upload digest still fail verification.

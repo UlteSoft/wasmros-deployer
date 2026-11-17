@@ -1,5 +1,5 @@
 //! Local preflight and operator review for one fixed bundle.
-use wros_deployer::{manifest, verification};
+use wros_deployer::{manifest, verification, verdict::Signature};
 use manifest::{Result, deployment,local_file,read_xml,recommendations,sha256};
 use std::collections::BTreeMap;
 use std::io::{self,IsTerminal,Write};
@@ -30,7 +30,7 @@ fn approve(mut rights:BTreeMap<String,bool>)->Result<BTreeMap<String,bool>>{
     Ok(rights)
 }
 fn run()->Result<()> {
-    let usage = "usage: wros-deployer plan|review|verify DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify]";
+    let usage = "usage: wros-deployer plan|review|verify DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if !matches!(action.as_str(), "plan" | "review" | "verify") { return Err(usage.into()); }
@@ -38,9 +38,17 @@ fn run()->Result<()> {
         .canonicalize().map_err(|e| e.to_string())?;
     let mut options = BTreeMap::new();
     let mut accept = false;
+    let mut exceptions = BTreeMap::new();
     while let Some(key) = args.next() {
         if action == "review" && key == "--accept-recommendations" && !accept {
             accept = true;
+        } else if action == "verify" && matches!(key.as_str(), "--allow-unsigned" | "--allow-invalid-signature") {
+            let value = args.next().ok_or(usage)?;
+            let (id, digest) = value.split_once('=').ok_or(usage)?;
+            let kind = if key == "--allow-unsigned" { Signature::Unsigned } else { Signature::Invalid };
+            if exceptions.insert(id.to_owned(), (digest.to_owned(), kind)).is_some() {
+                return Err("duplicate signature exception for one VM".into());
+            }
         } else if key == "--policy-root" || action == "verify" && matches!(key.as_str(), "--cosign" | "--scratch-directory") {
             let value = args.next().ok_or(usage)?;
             if options.insert(key, std::path::PathBuf::from(value)).is_some() { return Err(usage.into()); }
@@ -53,6 +61,11 @@ fn run()->Result<()> {
     let root=manifest.parent().ok_or("deployment directory missing")?;
     let bundle = std::fs::File::open(root).map_err(|e| e.to_string())?;
     let plan=deployment(&read_xml(&manifest)?)?;
+    for (id, (digest, _)) in &exceptions {
+        if !plan.processes.iter().any(|vm| &vm.id == id && &vm.digest == digest) {
+            return Err(format!("signature exception does not match a submitted VM and digest: {id:?}"));
+        }
+    }
     if accept{eprintln!("WARNING: accepting recommendations without individual review for this invocation")}
     println!("deployment {:?}",plan.id);
     for driver in &plan.drivers {
@@ -67,9 +80,20 @@ fn run()->Result<()> {
         let mut rights=match &vm.recommendations{Some(p)=>recommendations(&manifest::xml_contents(local_file(&bundle,p)?)?)?,None=>BTreeMap::new()};
         println!("INFO VM {:?}, module {:?}, SHA256 {}, signature policy {:?}, memory limit {} bytes, task limit {}",vm.id,vm.module,vm.digest,vm.policy,vm.memory_bytes,vm.pids);
         println!("INFO Recommendations {:?}, cold start at boot {}, authorized crash restart {}. Motion requires fresh safety confirmation and operator approval.",vm.recommendations,vm.boot_start,vm.crash_restart);
+        let mut secondary_verification = true;
         if let Some((exe, scratch)) = verifier {
-            verification::verify(exe, scratch, root, file, &vm.digest, &policy)?;
-            println!("INFO WSEA policy and signature verified for VM {:?}, SHA256 {}", vm.id, vm.digest);
+            let result = verification::verify(exe, scratch, root, file, &vm.digest, &policy)?;
+            if let Some((_, kind)) = exceptions.get(&vm.id) {
+                eprintln!("WARNING: operator requested {:?} signature exception for VM {:?} at SHA256 {}", kind, vm.id, vm.digest);
+            }
+            if result == Signature::Verified {
+                println!("INFO WSEA policy and signature verified for VM {:?}, SHA256 {}", vm.id, vm.digest);
+            } else if exceptions.get(&vm.id).is_some_and(|(_, kind)| *kind == result) {
+                secondary_verification = false;
+                eprintln!("WARNING: {:?} module admitted by explicit exception; VM verification disabled for {:?} at SHA256 {}", result, vm.id, vm.digest);
+            } else {
+                return Err(format!("{:?} signature rejected for {:?}", result, vm.id));
+            }
         } else if sha256(file)? != vm.digest {
             return Err(format!("module digest mismatch for {}",vm.id));
         }
@@ -79,7 +103,10 @@ fn run()->Result<()> {
             argv.extend(["--ros-scene-interface".into(),vm.id.clone(),name,if enabled{"allow"}else{"deny"}.into()]);
         }
         println!("verifier argv {:?}",["wasm","secure","verify",module.to_str().ok_or("non-UTF8 module")?,"--policy",policy.to_str().ok_or("non-UTF8 policy")?]);
-        argv.extend(["--secure".into(),"module".into(),module.display().to_string(),policy.display().to_string(),"--run".into(),module.display().to_string()]);
+        if secondary_verification {
+            argv.extend(["--secure".into(),"module".into(),module.display().to_string(),policy.display().to_string()]);
+        }
+        argv.extend(["--run".into(),module.display().to_string()]);
         println!("VM argv {:?}",argv);
     } Ok(())
 }

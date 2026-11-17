@@ -27,4 +27,6 @@ wros-deployer verify deployment.xml --policy-root /protected/policies \
   --cosign /opt/wros/bin/cosign --scratch-directory /protected/staging
 ```
 
-部署器复制每个模块至私有快照，上限为 256 MiB，核对所复制字节的摘要，然后对该快照执行指定的 wasm-cosign。单次验签限时 30 秒，部署器检查退出状态，并在返回时清理快照。签名或摘要被拒绝时校验失败。生成的执行参数保留 VM 的独立验签步骤。`verify` 在客户程序执行前结束。
+部署器复制每个模块至私有快照，上限为 256 MiB，核对所复制字节的摘要，然后对该快照执行指定的 wasm-cosign。单次验签限时 30 秒，部署器检查退出状态，并在返回时清理快照。默认要求签名和摘要均有效。生成的执行参数保留 VM 的独立验签步骤。`verify` 在客户程序执行前结束。
+
+对本地开发镜像，`verify` 可分别指定 `--allow-unsigned ID=SHA256` 或 `--allow-invalid-signature ID=SHA256`。选项绑定单个 VM 和上传文件的完整摘要。只有验签器返回与选项相符的拒绝原因时才会放行，显示警告，并在该镜像的拟用参数中省略 VM 二次验签。有效签名仍经过两次检查。缺少信任材料、策略或吊销检查错误、未识别的验签器错误和上传摘要变化均会拒绝。
