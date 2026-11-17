@@ -1,0 +1,11 @@
+.tmp/
+target/
+build/
+__pycache__/
+*.py[cod]
+*.profraw
+*.perf
+*.log
+*.pem
+*.key
+*.core
