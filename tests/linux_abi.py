@@ -24,7 +24,15 @@ def main():
     assert (group/'memory.swap.max').read_text().strip()=='0'
     args.output=args.output.resolve();assert '.tmp' in args.output.parts
     args.output.mkdir(parents=True,exist_ok=False)
-    results={'complete':False,'scope':'five Linux userspace ABIs; privileged supervision requires full-kernel qualification','cases':[]}
+    def digest(path):
+        with path.open('rb') as stream:
+            return hashlib.file_digest(stream,'sha256').hexdigest()
+    inputs=[*sorted((root/'src').glob('*.rs')),root/'tests/configuration.rs',
+            root/'Cargo.toml',root/'Cargo.lock',root/'.cargo/config.toml',
+            root/'protocol/ros-interfaces.txt',Path(__file__).resolve()]
+    results={'complete':False,'scope':'five Linux userspace ABIs; privileged supervision requires full-kernel qualification',
+             'inputs':{str(path):digest(path) for path in inputs},
+             'cgroup':str(group),'events_before':(group/'memory.events').read_text(),'cases':[]}
     receipt=args.output/'results.json'
     def execute(label,argv,env=None):
         run=subprocess.run(list(map(str,argv)),cwd=root,env=env,capture_output=True,text=True,timeout=120)
@@ -71,7 +79,10 @@ def main():
             elif emulator:run=[args.qemu_bin/emulator,'-L',sysroot,*run]
             execute(abi+'-tests-'+str(index),run)
             results['cases'][-1]['executable_sha256']=sha
-    results['complete']=True;receipt.write_text(json.dumps(results,indent=2))
+    results['inputs_unchanged']=all(digest(Path(path))==value for path,value in results['inputs'].items())
+    results['events_after']=(group/'memory.events').read_text()
+    results['complete']=results['inputs_unchanged'];receipt.write_text(json.dumps(results,indent=2))
+    assert results['complete'],'source changed during ABI qualification'
 
 
 if __name__=='__main__':main()

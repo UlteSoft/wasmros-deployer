@@ -3,6 +3,7 @@
 //! The operator must supply an empty, bounded, root-owned delegated subtree with
 //! cpu, memory and pids already enabled. This module never changes its ancestors.
 use crate::manifest::{Process, Result};
+use crate::placement::Set;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -103,6 +104,21 @@ impl Group {
     pub fn enrollment(&self) -> Result<File> {
         open_at(&self.directory, "cgroup.procs", libc::O_WRONLY)
     }
+    /// Detect unavailable/offlined resources again immediately before each
+    /// generation starts. A requested set must be effective in full, not just
+    /// intersect with the parent's allocation. Runtime hotplug may still change
+    /// the effective set; hardware safety must not depend on placement alone.
+    pub fn verify_placement(&self, process: &Process) -> Result<()> {
+        for (name, requested) in [("cpuset.cpus.effective", &process.cpus),
+                                  ("cpuset.mems.effective", &process.memory_nodes)] {
+            if let Some(requested) = requested {
+                if &Set::parse(read(&self.directory, name)?.trim())? != requested {
+                    return Err(format!("effective {name} differs from the reviewed placement"));
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn accounting(&self) -> Result<String> {
         Ok(format!(
             "memory: {}; tasks: {}",
@@ -194,6 +210,20 @@ impl Hierarchy {
                 ));
             }
         }
+        let placement = processes.iter().any(|p| p.cpus.is_some() || p.memory_nodes.is_some());
+        if placement {
+            if !controllers.split_whitespace().any(|s| s == "cpuset") {
+                return Err("explicit placement requires an enabled cpuset controller".into());
+            }
+            let cpus = Set::parse(read(&parent, "cpuset.cpus.effective")?.trim())?;
+            let nodes = Set::parse(read(&parent, "cpuset.mems.effective")?.trim())?;
+            for p in processes {
+                if p.cpus.as_ref().is_some_and(|set| !cpus.contains(set))
+                    || p.memory_nodes.as_ref().is_some_and(|set| !nodes.contains(set)) {
+                    return Err(format!("VM {:?} placement exceeds delegated effective CPU/NUMA sets", p.id));
+                }
+            }
+        }
         let parent_memory = read(&parent, "memory.max")?
             .trim()
             .parse::<u64>()
@@ -224,7 +254,7 @@ impl Hierarchy {
         write(
             &root.directory,
             "cgroup.subtree_control",
-            "+cpu +memory +pids",
+            if placement { "+cpu +memory +pids +cpuset" } else { "+cpu +memory +pids" },
         )?;
         let mut hierarchy = Self {
             children: Vec::with_capacity(processes.len()),
@@ -241,6 +271,13 @@ impl Hierarchy {
                 "cpu.max",
                 &format!("{} 100000", p.cpu_micros),
             )?;
+            if let Some(nodes) = &p.memory_nodes {
+                write(&child.directory, "cpuset.mems", &nodes.to_string())?;
+            }
+            if let Some(cpus) = &p.cpus {
+                write(&child.directory, "cpuset.cpus", &cpus.to_string())?;
+            }
+            child.verify_placement(p)?;
             // Verify support before the first child exists.
             child.kill()?;
             hierarchy.children.push(child);

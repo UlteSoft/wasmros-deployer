@@ -26,6 +26,8 @@ pub struct Process {
     pub cpu_micros: u32,
     pub restart_limit: u32,
     pub restart_delay_ms: u32,
+    pub cpus: Option<crate::placement::Set>,
+    pub memory_nodes: Option<crate::placement::Set>,
 }
 #[derive(Debug)]
 pub struct DriverArtifact {
@@ -199,6 +201,8 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 "cpu-micros",
                 "restart-limit",
                 "restart-delay-ms",
+                "cpus",
+                "memory-nodes",
             ],
         )?;
         let name = attr(node, "id")?;
@@ -270,6 +274,8 @@ pub fn deployment(s: &str) -> Result<Deployment> {
             cpu_micros,
             restart_limit,
             restart_delay_ms,
+            cpus: node.attribute("cpus").map(crate::placement::Set::parse).transpose()?,
+            memory_nodes: node.attribute("memory-nodes").map(crate::placement::Set::parse).transpose()?,
         })
     }
     if processes.is_empty() {

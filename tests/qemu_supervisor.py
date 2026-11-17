@@ -89,7 +89,9 @@ def main():
         entry('dev/console',stat.S_IFCHR|0o600,0,major=5,minor=1)
         entry('dev/null',stat.S_IFCHR|0o666,0,major=1,minor=3)
         entry('TRAILER!!!',0,0)
-    argv=[str(args.qemu),'-nodefaults','-machine','q35','-accel','tcg,thread=multi','-cpu','max','-smp','2','-m','4096',
+    argv=[str(args.qemu),'-nodefaults','-machine','q35','-accel','tcg,thread=multi','-cpu','max','-smp','2,sockets=2,cores=1,threads=1','-m','4096',
+          '-object','memory-backend-ram,id=mem0,size=2G','-object','memory-backend-ram,id=mem1,size=2G',
+          '-numa','node,nodeid=0,cpus=0,memdev=mem0','-numa','node,nodeid=1,cpus=1,memdev=mem1',
           '-display','none','-serial','stdio','-monitor','none','-nic','none','-no-reboot','-bios',str(args.bios),'-L',str(args.firmware_directory),
           '-kernel',str(args.kernel),'-initrd',str(archive),'-append',
           'console=ttyS0 quiet panic=-1 rdinit=/init cgroup_no_v1=all']
@@ -101,7 +103,7 @@ def main():
         run=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=240)
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=run.returncode,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==14
+    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==20
     receipt.write_text(json.dumps(result,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('argv','inputs','compile')},indent=2))
     assert result['complete'],text[-10000:]

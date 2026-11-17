@@ -66,3 +66,17 @@ fn vm_instances_cannot_share_host_identity() {
     ))
     .is_err());
 }
+
+#[test]
+fn placement_is_explicit_and_rejects_ambiguous_lists() {
+    let parsed = deployment(&config()).unwrap();
+    assert!(parsed.processes[0].cpus.is_none());
+    assert!(parsed.processes[0].memory_nodes.is_none());
+    let xml = config().replace("pids=", "cpus=\"0,1-3,8\" memory-nodes=\"1\" pids=");
+    let parsed = deployment(&xml).unwrap();
+    assert_eq!(parsed.processes[0].cpus.as_ref().unwrap().to_string(), "0-3,8");
+    assert_eq!(parsed.processes[0].memory_nodes.as_ref().unwrap().to_string(), "1");
+    for attributes in ["cpus=\"\"", "cpus=\"2,1\"", "memory-nodes=\"8192\"", "memory-nodes=\"-1\""] {
+        assert!(deployment(&config().replace("pids=", &format!("{attributes} pids="))).is_err());
+    }
+}

@@ -115,6 +115,7 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
     let exe = runtime.as_raw_fd();
     let (uid, gid) = launch.process.identity.ok_or("missing guest identity")?;
     let parent = unsafe { libc::getpid() };
+    let affinity = launch.process.cpus.as_ref().map(crate::placement::Set::affinity);
     let mut command = Command::new(format!("/proc/self/fd/{exe}"));
     command
         .args(&launch.arguments)
@@ -130,6 +131,11 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
             let fail = || std::io::Error::last_os_error();
             if libc::write(join, b"0".as_ptr().cast(), 1) != 1 {
                 return Err(fail());
+            }
+            if let Some(mask) = &affinity {
+                if libc::sched_setaffinity(0, std::mem::size_of_val(mask.as_slice()), mask.as_ptr().cast()) != 0 {
+                    return Err(fail());
+                }
             }
             if libc::unshare(
                 libc::CLONE_NEWNET
@@ -345,6 +351,7 @@ impl Session<'_> {
         }
         .ok_or("restart state denied")?;
         self.hierarchy.children[index].drain(Duration::from_secs(2))?;
+        self.hierarchy.children[index].verify_placement(&self.launches[index].process)?;
         let (child, pidfd) = spawn(
             runtime,
             &self.launches[index],

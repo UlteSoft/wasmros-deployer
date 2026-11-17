@@ -3,12 +3,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
+#include <linux/mempolicy.h>
 #include <unistd.h>
 
 static int blocked_supervisor(char **argv) {
@@ -46,6 +49,21 @@ int main(int argc,char **argv) {
     else{errno=0;n=write(f,"X",1);close(f);if(n!=-1 || errno!=EPERM)return 75;}
     printf("PEER confined uid=%u gid=%u sealed=1\n",getuid(),getgid());
     const char *mode=argv[2];
+    if(!strcmp(mode,"placement")||!strcmp(mode,"placementcrash")){
+        cpu_set_t set;CPU_ZERO(&set);
+        if(sched_getaffinity(0,sizeof set,&set)<0||CPU_COUNT(&set)!=1||!CPU_ISSET(1,&set))return 88;
+        CPU_ZERO(&set);CPU_SET(0,&set);errno=0;
+        if(sched_setaffinity(0,sizeof set,&set)!=-1||errno!=EINVAL)return 89;
+        unsigned long outside=1;errno=0;
+        if(syscall(SYS_set_mempolicy,MPOL_BIND,&outside,8*sizeof outside)!=-1||errno!=EINVAL)return 90;
+        unsigned char *page=malloc(4096);if(!page)return 91;
+        page[0]=0x5a;__asm__ volatile(""::"r"(page):"memory");
+        int node=-1;
+        if(syscall(SYS_get_mempolicy,&node,NULL,0,page,MPOL_F_NODE|MPOL_F_ADDR)!=0||node!=1)return 92;
+        free(page);puts("PEER placement cpu=1 mems=1 page-node=1");
+        if(!strcmp(mode,"placementcrash"))raise(SIGSEGV);
+        return 0;
+    }
     if(!strcmp(mode,"normal"))return 0;
     if(!strcmp(mode,"crash")) {raise(SIGSEGV);return 76;}
     if(!strcmp(mode,"memory")){

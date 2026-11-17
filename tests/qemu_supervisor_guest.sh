@@ -13,12 +13,12 @@ chmod 700 /scratch /state/admission /state/body
 chmod 644 /trust/body.policy /trust/body-vm.policy
 chown -R 10001:10001 /state/body
 mount -t cgroup2 none /sys/fs/cgroup
-echo '+cpu +memory +pids' > /sys/fs/cgroup/cgroup.subtree_control
+echo '+cpu +memory +pids +cpuset' > /sys/fs/cgroup/cgroup.subtree_control
 mkdir /sys/fs/cgroup/delegated
 echo 1073741824 > /sys/fs/cgroup/delegated/memory.max
 echo 0 > /sys/fs/cgroup/delegated/memory.swap.max
 echo 256 > /sys/fs/cgroup/delegated/pids.max
-echo '+cpu +memory +pids' > /sys/fs/cgroup/delegated/cgroup.subtree_control
+echo '+cpu +memory +pids +cpuset' > /sys/fs/cgroup/delegated/cgroup.subtree_control
 
 fail() { echo "QEMU_SUPERVISOR_FAIL $*"; poweroff -f; exit 1; }
 trap 'fail unexpected-command-failure' EXIT
@@ -31,7 +31,7 @@ base() {
 digest=$(sha256sum /bundle/unsigned.wasm); digest=${digest%% *}
 configure() {
     name=$1; restart=$2; limit=$3; memory=$4
-    printf '<deployment id="cell"><vm id="%s" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="%s" pids="8" uid="10001" gid="10001" restart-on-crash="%s" restart-limit="%s" restart-delay-ms="100"/></deployment>\n' "$name" "$digest" "$memory" "$restart" "$limit" > /bundle/current.xml
+    printf '<deployment id="cell"><vm id="%s" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="%s" pids="8" uid="10001" gid="10001" restart-on-crash="%s" restart-limit="%s" restart-delay-ms="100" %s/></deployment>\n' "$name" "$digest" "$memory" "$restart" "$limit" "${5:-}" > /bundle/current.xml
 }
 fixture() { base --runtime /bin/supervisor-peer --allow-unsigned "$1=$digest"; }
 empty() { test ! -d /sys/fs/cgroup/delegated/wros-cell || fail stale-cgroup; }
@@ -53,6 +53,39 @@ configure normal false 0 134217728
 fixture normal > /normal.log 2>&1 || { cat /normal.log; fail normal; }
 grep -q 'PEER confined uid=10001 gid=10001 sealed=1' /normal.log || fail missing-confinement
 empty; pass privileged-to-unprivileged-sealed-admission
+
+configure placement false 0 134217728 'cpus="1" memory-nodes="1"'
+fixture placement > /placement.log 2>&1 || { cat /placement.log; fail placement; }
+grep -q 'PEER placement cpu=1 mems=1 page-node=1' /placement.log || fail placement-not-effective
+empty; pass cpu-and-numa-placement-with-no-widening
+
+configure placementcrash true 1 134217728 'cpus="1" memory-nodes="1"'
+if fixture placementcrash > /placement-restart.log 2>&1; then fail placement-crash-status; fi
+test "$(grep -c 'PEER placement cpu=1 mems=1 page-node=1' /placement-restart.log)" = 2 || { cat /placement-restart.log; fail placement-restart; }
+empty; pass placement-preserved-across-cold-restart
+
+configure normal false 0 134217728 'cpus="2"'
+if fixture normal > /placement-cpu-deny.log 2>&1; then fail accepted-unavailable-cpu; fi
+grep -q 'exceeds delegated effective CPU/NUMA sets' /placement-cpu-deny.log || fail wrong-cpu-rejection
+empty; pass unavailable-cpu-rejected-before-spawn
+
+configure normal false 0 134217728 'memory-nodes="2"'
+if fixture normal > /placement-node-deny.log 2>&1; then fail accepted-unavailable-node; fi
+grep -q 'exceeds delegated effective CPU/NUMA sets' /placement-node-deny.log || fail wrong-node-rejection
+empty; pass unavailable-numa-node-rejected-before-spawn
+
+echo 0 > /sys/fs/cgroup/delegated/cpuset.cpus
+configure normal false 0 134217728 'cpus="1"'
+if fixture normal > /placement-parent-deny.log 2>&1; then fail expanded-parent-placement; fi
+grep -q 'exceeds delegated effective CPU/NUMA sets' /placement-parent-deny.log || fail wrong-parent-rejection
+echo 0-1 > /sys/fs/cgroup/delegated/cpuset.cpus
+empty; pass delegated-cpu-boundary-cannot-expand
+
+echo -cpuset > /sys/fs/cgroup/delegated/cgroup.subtree_control
+if fixture normal > /placement-controller-deny.log 2>&1; then fail ignored-missing-cpuset; fi
+grep -q 'requires an enabled cpuset controller' /placement-controller-deny.log || fail wrong-controller-rejection
+echo +cpuset > /sys/fs/cgroup/delegated/cgroup.subtree_control
+empty; pass missing-cpuset-controller-fails-closed
 
 configure crash false 3 134217728
 if fixture crash > /crash.log 2>&1; then fail unapproved-restart; fi
@@ -112,7 +145,7 @@ grep -q -- '--secure' /signed.log || fail absent-secondary-verification
 empty; pass actual-vm-double-verification
 
 loopdigest=$(sha256sum /bundle/loop.wasm); loopdigest=${loopdigest%% *}
-printf '<deployment id="cell"><vm id="one" module="loop.wasm" sha256="%s" policy="body.policy" memory-bytes="268435456" pids="16" uid="10001" gid="10001"/><vm id="two" module="loop.wasm" sha256="%s" policy="body.policy" memory-bytes="268435456" pids="16" uid="10002" gid="10002"/></deployment>\n' "$loopdigest" "$loopdigest" > /bundle/current.xml
+printf '<deployment id="cell"><vm id="one" module="loop.wasm" sha256="%s" policy="body.policy" memory-bytes="268435456" pids="16" uid="10001" gid="10001" cpus="0" memory-nodes="0"/><vm id="two" module="loop.wasm" sha256="%s" policy="body.policy" memory-bytes="268435456" pids="16" uid="10002" gid="10002" cpus="1" memory-nodes="1"/></deployment>\n' "$loopdigest" "$loopdigest" > /bundle/current.xml
 base --runtime /bin/uwvm2-ros --allow-unsigned "one=$loopdigest" --allow-unsigned "two=$loopdigest" > /multiple.log 2>&1 & management=$!
 wait_started /multiple.log 2
 test -n "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-one/cgroup.procs)" || fail missing-first-group
@@ -120,6 +153,10 @@ test -n "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-two/cgroup.procs)" || fail 
 first=$(cat /sys/fs/cgroup/delegated/wros-cell/vm-one/cgroup.procs)
 second=$(cat /sys/fs/cgroup/delegated/wros-cell/vm-two/cgroup.procs)
 test "$first" != "$second" || fail shared-pid
+test "$(awk '/Cpus_allowed_list:/{print $2}' /proc/$first/status)" = 0 || fail first-cpu
+test "$(awk '/Mems_allowed_list:/{print $2}' /proc/$first/status)" = 0 || fail first-numa
+test "$(awk '/Cpus_allowed_list:/{print $2}' /proc/$second/status)" = 1 || fail second-cpu
+test "$(awk '/Mems_allowed_list:/{print $2}' /proc/$second/status)" = 1 || fail second-numa
 manager=$(cat /proc/$management/task/$management/children | awk '{print $1}')
 test -n "$manager" || manager=$management
 kill -TERM "$manager"; wait "$management" || { cat /multiple.log; fail multi-stop; }
@@ -149,7 +186,7 @@ rmdir /sys/fs/cgroup/delegated/wros-cell/vm-parentdeath
 rmdir /sys/fs/cgroup/delegated/wros-cell
 pass manager-death-fences-child-and-stale-tree
 
-for log in /normal.log /crash.log /restart.log /orphan.log /pids.log /memory.log /stop.log /flood.log /backpressure.log /signed.log /multiple.log /sdk-allow.log /sdk-deny.log /death.log /stale.log; do
+for log in /normal.log /placement*.log /crash.log /restart.log /orphan.log /pids.log /memory.log /stop.log /flood.log /backpressure.log /signed.log /multiple.log /sdk-allow.log /sdk-deny.log /death.log /stale.log; do
     echo "AUDIT_LOG $log"; cat "$log"
 done
 

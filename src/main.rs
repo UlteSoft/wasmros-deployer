@@ -183,6 +183,9 @@ fn run() -> Result<()> {
         println!("INFO VM {:?}, module {:?}, SHA256 {}, signature policy {:?}, VM policy {:?}, memory limit {} bytes, task limit {}",vm.id,vm.module,vm.digest,vm.policy,vm.vm_policy,vm.memory_bytes,vm.pids);
         println!("INFO Recommendations {:?}, cold start at boot {}, authorized crash restart {}. Motion requires fresh safety confirmation and operator approval.",vm.recommendations,vm.boot_start,vm.crash_restart);
         println!("INFO Guest identity {:?}, CPU budget {} microseconds per 100000 microseconds, at most {} crash restarts, restart delay {} milliseconds. New network, IPC, UTS, mount and cgroup namespaces; private read-only /tmp image; no core files; at most 256 open descriptors.",vm.identity,vm.cpu_micros,vm.restart_limit,vm.restart_delay_ms);
+        println!("INFO Allowed CPUs {}, memory nodes {}. Unspecified sets inherit the delegated parent; placement is not exclusive core reservation or a real-time guarantee. CPU quota can delay execution.",
+                 vm.cpus.as_ref().map(ToString::to_string).unwrap_or_else(|| "inherited".into()),
+                 vm.memory_nodes.as_ref().map(ToString::to_string).unwrap_or_else(|| "inherited".into()));
         let mut secondary_verification = true;
         let mut admitted = None;
         if let Some((exe, scratch)) = verifier {
