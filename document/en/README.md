@@ -1,8 +1,8 @@
-# Local deployment preflight
+# Local deployment and supervision
 
-Build with `cargo build --release --locked --offline`. Rust dependencies are included under `third-parties/cargo`.
+Build with `cargo build --release --locked --offline`. Release builds use optimization level 3, full debug information and checked arithmetic. Rust dependencies and their licenses are included under `third-parties/cargo`.
 
-Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. The explicit `--accept-recommendations` option emits a warning. Output includes the proposed verifier and VM argument vectors. These commands perform local preflight. The supervisor, privileged launch, live update and physical safety receiver still require implementation and qualification.
+Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. The explicit `--accept-recommendations` option emits a warning. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider provisioning, live update, the independent watchdog and physical safety integration remain unfinished.
 
 ```xml
 <deployment id="cell">
@@ -36,3 +36,47 @@ wros-deployer verify deployment.xml --policy-root /protected/policies \
 The deployer copies at most 256 MiB per submitted module, hashes the bytes it copied, and invokes the named wasm-cosign executable on that exact snapshot. It waits up to 30 seconds, checks the exit status, and removes the snapshot on return. The default policy requires a valid signature and matching digest. The execution preview retains the VM's independent signature check. This command finishes before guest execution.
 
 For a specific local development image, `verify` accepts `--allow-unsigned ID=SHA256` or `--allow-invalid-signature ID=SHA256`. Each option applies to one VM and the complete uploaded file digest. A recognized rejection of the matching kind emits a warning and the preview omits secondary verification for that image. A valid signature retains both checks. Unknown verifier failures, missing trust, policy or revocation errors, and a changed upload digest still fail verification.
+
+## Run reviewed VM processes
+
+The `run` command requires a root deployment supervisor and an independently provisioned cgroup v2 subtree. VM instances run as distinct non-root users. The operator must reserve those users and groups exclusively across deployments; an identity is not automatically allocated or made exclusive by this release. Runtime and verifier executables must be protected files outside the submitted bundle. Native driver declarations currently cause `run` to fail before launching any process.
+
+```xml
+<deployment id="cell">
+  <vm id="body" module="body.wasm" sha256="REPLACE_WITH_64_LOWERCASE_HEX"
+      policy="body.policy" vm-policy="body-vm.policy"
+      recommendations="body-permissions.xml"
+      uid="10001" gid="10001" memory-bytes="268435456" pids="16"
+      cpu-micros="100000" restart-on-crash="false"
+      restart-limit="3" restart-delay-ms="1000" start-on-boot="false"/>
+</deployment>
+```
+
+```sh
+wros-deployer run deployment.xml --policy-root /protected/policies \
+  --cosign /opt/wros/bin/cosign --scratch-directory /protected/staging \
+  --runtime /opt/wros/bin/uwvm2-ros \
+  --cgroup-parent /sys/fs/cgroup/wros.service/workloads
+```
+
+The parent cgroup must be an empty domain, owned by root without group/other write access, with finite `memory.max`, zero `memory.swap.max`, and `cpu`, `memory` and `pids` enabled in `cgroup.subtree_control`. It remains owned by the service manager. The deployer creates only its exclusive `wros-DEPLOYMENT/vm-INSTANCE` descendants. A pre-existing deployment directory is rejected, including leftovers from a dead supervisor. The total VM memory reservations must fit the supplied parent. Keep the deployer and ultimate supervisor in separate bounded groups with their own memory headroom. Resource accounting for their images, verification buffers and logs is additional to VM reservations. Linux must support `cgroup.kill`, pidfds, `close_range`, memfd seals and the requested namespaces; unsupported isolation fails before guest execution.
+
+Every child first joins its assigned group, creates network, IPC, UTS, mount and cgroup namespaces, drops supplementary groups and all real/effective/saved IDs, and enables `no_new_privs`. Immutable bytes from the sealed admission image are copied to `/tmp/wros-admitted.wasm` inside a private tmpfs, then the filesystem becomes read-only before guest execution. The tmpfs limit is 257 MiB and its allocated memory is charged to the child's cgroup. The ordinary VM no-follow loader continues to reject symlinks. The underlying executable and admitted source remain pinned. Log pipes are owned by the final guest identity so the VM can reopen its own diagnostics after dropping privileges. Other inherited descriptors close on exec. This isolates resource accounting and selected OS namespaces; it is not a complete filesystem or syscall sandbox.
+
+Normal signed runs use two rollback stores. Initialize `policy` for privileged admission and `vm-policy` for the dedicated VM user, using the official wasm-cosign policy initializer. The policies must have identical trust roots, signer rules, algorithm allowlists, versions and limits; only `state_dir` may differ. Provision the VM state directory and its initialized files with the VM's ownership, directory mode 0700 and file mode 0600. Keep both policy files administrator-owned and readable by the VM. Do not copy a rollback record after changing its policy paths: records bind the policy fingerprint. A fresh deployment needs correctly initialized stores for its actual paths. The VM performs the second verification itself.
+
+The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. `--accept-recommendations` bypasses interactive edits only for this invocation and emits its own warning. It does not change signature requirements. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
+
+## Failure and shutdown semantics
+
+An exit status of zero ends that instance. A failure requests a cold restart only if `restart-on-crash="true"`; at most `restart-limit` restarts occur, separated by `restart-delay-ms`. Defaults are three retries and a one-second delay, but restart remains disabled without the explicit grant. Retry limits range from 0 to 32; delays from 100 to 60000 milliseconds. Each restart has a fresh generation, no motion grant and the same sealed image. All descendants must leave the old cgroup before the new generation starts. CPU quotas use a fixed 100000-microsecond period; `cpu-micros` defaults to 100000 and is an explicitly reported resource constraint.
+
+SIGINT, SIGTERM or SIGHUP stops recovery, requests termination of live instances through pidfds, allows up to two seconds for graceful exit, then kills each remaining descendant cgroup. Diagnostics are drained with bounded per-turn work and capped at 8 KiB per generation. Exit status and memory/task limit events are reported. The control loop polls at five milliseconds; it is not a physical emergency-stop controller. Kernel-uninterruptible tasks still require the ultimate service supervisor to handle incomplete shutdown. A dead deployer triggers a parent-death signal for its direct VM children; an independent systemd or platform service manager must reclaim the entire descendant tree. Durable boot/stop intent and automatic restoration after supervisor death are not implemented yet.
+
+Runtime audit output uses a separate writer and a bounded queue of 32 records, each at most 32 KiB. The supervisor never waits for the log consumer while managing processes. Queue saturation or a writer error stops the deployment. At exit, the writer has at most 500 milliseconds to drain; an incomplete drain produces an unsuccessful invocation after VM shutdown. This prevents a full pipe or a stalled log collector from blocking operator stop. Preflight output occurs before any guest starts.
+
+## Disposable-kernel qualification
+
+`tests/qemu_supervisor.py` creates a fresh RAM-only Linux guest. It attaches no host disks, no shared filesystem, no physical device and no network. The runner requires the existing 64 GiB, zero-swap gate, caps guest RAM at 4 GiB and uses two emulated CPUs. Supply the official kernel and firmware, built deployer and VM, released wasm-cosign and a fresh `tests/wsea_preflight.py` fixture. Inputs and outcomes are hashed under the requested `.tmp` output directory. The native hostile peer is a test substitute; actual VM checks are separately identified in the receipt. This does not qualify five Linux ABIs, vendor hardware, systemd recovery or industrial safety certification.
+
+Pass `--sdk-module` an actual SDK-built program that calls `uwvm_ros_v2.abi`. The fixture exposes that interface and then denies it, exercising the compiled program through the deployer and VM. `tests/linux_abi.py` separately cross-compiles the Rust implementation and runs its contract tests on x86_64, i686, AArch64, ARM hard float and ARM soft float. These userspace ABI checks do not replace privileged kernel tests on each architecture.

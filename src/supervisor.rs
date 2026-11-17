@@ -1,0 +1,532 @@
+//! Bounded local VM supervisor. It receives fully admitted images and reviewed
+//! argument vectors. Enrollment, namespace creation, identity drop and immutable
+//! descriptor inheritance complete before the first VM instruction executes.
+//! Native provider launch, recovery Wasm and live control are separate capabilities;
+//! this entry point refuses manifests requiring those unfinished capabilities.
+use crate::{
+    audit::Events,
+    cgroup::Hierarchy,
+    manifest::{Process, Result},
+    recovery::Instance,
+    verification::FrozenFile,
+};
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+static STOP: AtomicBool = AtomicBool::new(false);
+/// A private read-only copy of the sealed image. VM's normal no-follow loader
+/// accepts this regular path without weakening its symlink rejection policy.
+pub const IMAGE_PATH: &str = "/tmp/wros-admitted.wasm";
+extern "C" fn stop(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+struct Signals(Vec<(i32, libc::sigaction)>);
+impl Signals {
+    fn install() -> Result<Self> {
+        STOP.store(false, Ordering::SeqCst);
+        let mut saved = Self(Vec::new());
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = stop as *const () as usize;
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+            }
+            if unsafe { libc::sigaction(signal, &action, &mut old) } != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            saved.0.push((signal, old));
+        }
+        Ok(saved)
+    }
+}
+impl Drop for Signals {
+    fn drop(&mut self) {
+        for (signal, old) in &self.0 {
+            unsafe {
+                libc::sigaction(*signal, old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+pub struct Launch {
+    pub process: Process,
+    pub module: FrozenFile,
+    pub arguments: Vec<String>,
+}
+struct Running {
+    child: Option<Child>,
+    pidfd: Option<File>,
+    state: Instance,
+    generation: u64,
+    restarts: u32,
+    next: Option<Instant>,
+    failed: bool,
+    output: usize,
+}
+struct Session<'a> {
+    hierarchy: Hierarchy,
+    launches: &'a [Launch],
+    slots: Vec<Running>,
+    events: &'a Events,
+}
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        // Groups are exclusively ours. Kill descendants before waiting for direct
+        // children; PID handles avoid targeting an unrelated reused process ID.
+        for group in &self.hierarchy.children {
+            let _ = group.kill();
+        }
+        for slot in &mut self.slots {
+            if let Some(child) = &mut slot.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+fn nonblocking(fd: i32) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+/// Retain an object above the standard I/O descriptors even when the caller starts
+/// with stdin/stdout/stderr closed. Command's redirection must not replace it.
+pub fn retained(file: File) -> Result<File> {
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, File)> {
+    let enrollment = retained(enrollment)?;
+    let join = enrollment.as_raw_fd();
+    let module = launch.module.0.as_raw_fd();
+    let exe = runtime.as_raw_fd();
+    let (uid, gid) = launch.process.identity.ok_or("missing guest identity")?;
+    let parent = unsafe { libc::getpid() };
+    let mut command = Command::new(format!("/proc/self/fd/{exe}"));
+    command
+        .args(&launch.arguments)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Every syscall below is allocation-free and async-signal-safe after fork.
+    // cgroup enrollment is performed by the child (PID 0) before dropping root.
+    unsafe {
+        command.pre_exec(move || {
+            let fail = || std::io::Error::last_os_error();
+            if libc::write(join, b"0".as_ptr().cast(), 1) != 1 {
+                return Err(fail());
+            }
+            if libc::unshare(
+                libc::CLONE_NEWNET
+                    | libc::CLONE_NEWIPC
+                    | libc::CLONE_NEWUTS
+                    | libc::CLONE_NEWCGROUP
+                    | libc::CLONE_NEWNS,
+            ) != 0
+            {
+                return Err(fail());
+            }
+            if libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ) != 0
+            {
+                return Err(fail());
+            }
+            let mount_flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+            if libc::mount(
+                c"wros-images".as_ptr(),
+                c"/tmp".as_ptr(),
+                c"tmpfs".as_ptr(),
+                mount_flags,
+                c"size=269484032,nr_inodes=32,mode=0755".as_ptr().cast(),
+            ) != 0
+            {
+                return Err(fail());
+            }
+            let target = libc::open(
+                c"/tmp/wros-admitted.wasm".as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o444,
+            );
+            if target < 0 {
+                return Err(fail());
+            }
+            // Anonymous shmem has no bindable user mount on all supported kernels.
+            // Copy immutable admitted bytes inside the already bounded child group.
+            // The allocation-free loop also bounds syscall work if admission is ever
+            // called through another trusted embedding rather than the CLI.
+            let mut offset = 0i64;
+            let mut buffer = [0u8; 32768];
+            loop {
+                let n = libc::pread64(module, buffer.as_mut_ptr().cast(), buffer.len(), offset);
+                if n < 0 {
+                    if fail().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(fail());
+                }
+                if n == 0 {
+                    break;
+                }
+                offset += n as i64;
+                if offset > 268435456 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+                }
+                let mut done = 0usize;
+                while done < n as usize {
+                    let wrote =
+                        libc::write(target, buffer.as_ptr().add(done).cast(), n as usize - done);
+                    if wrote < 0 {
+                        if fail().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        return Err(fail());
+                    }
+                    if wrote == 0 {
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    done += wrote as usize;
+                }
+            }
+            if libc::close(target) != 0 {
+                return Err(fail());
+            }
+            if libc::mount(
+                std::ptr::null(),
+                c"/tmp".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_RDONLY | mount_flags,
+                std::ptr::null(),
+            ) != 0
+            {
+                return Err(fail());
+            }
+            if libc::setsid() < 0 {
+                return Err(fail());
+            }
+            let core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let files = libc::rlimit {
+                rlim_cur: 256,
+                rlim_max: 256,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0
+                || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
+            {
+                return Err(fail());
+            }
+            libc::umask(0o077);
+            // Libraries that reopen an inherited pipe through /proc/self/fd must
+            // see the final guest owner. Both pipe ends remain pinned by descriptors.
+            for fd in [1, 2] {
+                if libc::fchown(fd, uid, gid) != 0 {
+                    return Err(fail());
+                }
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0
+            {
+                return Err(fail());
+            }
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setresgid(gid, gid, gid) != 0
+                || libc::setresuid(uid, uid, uid) != 0
+            {
+                return Err(fail());
+            }
+            // Credential changes clear PDEATHSIG, so arm it afterwards and close the
+            // race by checking the original parent. A dead supervisor cannot authorize exec.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                || libc::getppid() != parent
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                return Err(fail());
+            }
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                return Err(fail());
+            }
+            if libc::fcntl(exe, libc::F_SETFD, 0) != 0 {
+                return Err(fail());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("VM admission before exec failed: {e}"))?;
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+    if pidfd < 0 {
+        let e = std::io::Error::last_os_error().to_string();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    let pidfd = unsafe { File::from_raw_fd(pidfd) };
+    for fd in [
+        child.stdout.as_ref().unwrap().as_raw_fd(),
+        child.stderr.as_ref().unwrap().as_raw_fd(),
+    ] {
+        if let Err(e) = nonblocking(fd) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    }
+    Ok((child, pidfd))
+}
+fn output(child: &mut Child, id: &str, count: &mut usize, events: &Events) {
+    let mut buffer = [0u8; 4096];
+    // Bounded work per VM per turn, even if a compromised VM floods stdout.
+    for pipe in [
+        child.stdout.as_mut().map(|v| v as &mut dyn Read),
+        child.stderr.as_mut().map(|v| v as &mut dyn Read),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for _ in 0..4 {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let keep = n.min(8192usize.saturating_sub(*count));
+                    if keep > 0 {
+                        events.send(format!(
+                            "INFO VM {id:?} diagnostic {:?}",
+                            String::from_utf8_lossy(&buffer[..keep])
+                        ));
+                        *count += keep;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    }
+}
+impl Session<'_> {
+    fn start(&mut self, index: usize, runtime: &File) -> Result<()> {
+        if STOP.load(Ordering::SeqCst) || self.events.failed() {
+            return Err("operator stop or audit failure before VM start".into());
+        }
+        let slot = &mut self.slots[index];
+        let generation = if slot.generation == 0 {
+            slot.state.operator_start()
+        } else {
+            slot.state.recover(slot.generation)
+        }
+        .ok_or("restart state denied")?;
+        self.hierarchy.children[index].drain(Duration::from_secs(2))?;
+        let (child, pidfd) = spawn(
+            runtime,
+            &self.launches[index],
+            self.hierarchy.children[index].enrollment()?,
+        )?;
+        self.events.send(format!(
+            "INFO VM {:?} generation {} started with PID {}, no motion authority",
+            self.launches[index].process.id,
+            generation,
+            child.id()
+        ));
+        slot.child = Some(child);
+        slot.pidfd = Some(pidfd);
+        slot.generation = generation;
+        slot.next = None;
+        slot.output = 0;
+        Ok(())
+    }
+    fn shutdown(&mut self) -> Result<()> {
+        for slot in &mut self.slots {
+            slot.state.operator_stop();
+            slot.next = None;
+            if let Some(fd) = &slot.pidfd {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        libc::SIGTERM,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            let mut pending = false;
+            for (i, slot) in self.slots.iter_mut().enumerate() {
+                if let Some(child) = &mut slot.child {
+                    output(
+                        child,
+                        &self.launches[i].process.id,
+                        &mut slot.output,
+                        self.events,
+                    );
+                    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                        slot.child = None;
+                        slot.pidfd = None;
+                    } else {
+                        pending = true;
+                    }
+                }
+            }
+            if !pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for group in &self.hierarchy.children {
+            group.drain(Duration::from_secs(2))?;
+        }
+        for slot in &mut self.slots {
+            if let Some(mut child) = slot.child.take() {
+                child.wait().map_err(|e| e.to_string())?;
+            }
+            slot.pidfd = None;
+        }
+        Ok(())
+    }
+}
+
+pub fn run(runtime: &Path, cgroup: &Path, deployment: &str, launches: &[Launch]) -> Result<()> {
+    let _signals = Signals::install()?;
+    let events = Events::new()?;
+    let result = supervise(runtime, cgroup, deployment, launches, &events);
+    let logged = events.finish();
+    result.and(logged)
+}
+fn supervise(
+    runtime: &Path,
+    cgroup: &Path,
+    deployment: &str,
+    launches: &[Launch],
+    events: &Events,
+) -> Result<()> {
+    let runtime = retained(File::open(runtime).map_err(|e| e.to_string())?)?;
+    let processes = launches.iter().map(|l| &l.process).collect::<Vec<_>>();
+    let hierarchy = Hierarchy::create(cgroup, deployment, &processes)?;
+    let slots = launches
+        .iter()
+        .map(|l| Running {
+            child: None,
+            pidfd: None,
+            state: Instance::new(l.process.crash_restart),
+            generation: 0,
+            restarts: 0,
+            next: None,
+            failed: false,
+            output: 0,
+        })
+        .collect();
+    let mut session = Session {
+        hierarchy,
+        launches,
+        slots,
+        events,
+    };
+    for i in 0..launches.len() {
+        session.start(i, &runtime)?;
+    }
+    loop {
+        if STOP.load(Ordering::SeqCst) {
+            session.shutdown()?;
+            events.send(
+                "INFO Operator stop completed; no automatic restart in this invocation".into(),
+            );
+            return Ok(());
+        }
+        if events.failed() {
+            session.shutdown()?;
+            return Err("audit saturation or failure stopped the deployment".into());
+        }
+        for (i, launch) in launches.iter().enumerate() {
+            let slot = &mut session.slots[i];
+            if let Some(child) = &mut slot.child {
+                output(child, &launch.process.id, &mut slot.output, events);
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    output(child, &launch.process.id, &mut slot.output, events);
+                    events.send(format!(
+                        "INFO VM {:?} generation {} exit {status}",
+                        launch.process.id, slot.generation
+                    ));
+                    events.send(format!(
+                        "INFO VM {:?} resource events {}",
+                        launch.process.id,
+                        session.hierarchy.children[i].accounting()?
+                    ));
+                    slot.child = None;
+                    slot.pidfd = None;
+                    session.hierarchy.children[i].drain(Duration::from_secs(2))?;
+                    if status.success() {
+                        slot.state.operator_stop();
+                    } else {
+                        slot.state.fault(slot.generation);
+                        if launch.process.crash_restart
+                            && slot.restarts < launch.process.restart_limit
+                        {
+                            slot.restarts += 1;
+                            slot.next = Some(
+                                Instant::now()
+                                    + Duration::from_millis(u64::from(
+                                        launch.process.restart_delay_ms,
+                                    )),
+                            );
+                            events.send(format!(
+                                "INFO XML-authorized cold restart {:?}: attempt {} of {}",
+                                launch.process.id, slot.restarts, launch.process.restart_limit
+                            ));
+                        } else {
+                            slot.failed = true;
+                        }
+                    }
+                }
+            }
+            if session.slots[i]
+                .next
+                .is_some_and(|when| Instant::now() >= when)
+            {
+                session.start(i, &runtime)?;
+            }
+        }
+        if session
+            .slots
+            .iter()
+            .all(|s| s.child.is_none() && s.next.is_none())
+        {
+            return if session.slots.iter().any(|s| s.failed) {
+                Err("deployment ended with failed VM instances".into())
+            } else {
+                Ok(())
+            };
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

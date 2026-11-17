@@ -1,8 +1,8 @@
-# 本地部署预检
+# 本地部署与监管
 
-使用 `cargo build --release --locked --offline` 构建。Rust 依赖源码在 `third-parties/cargo`。
+使用 `cargo build --release --locked --offline` 构建。发布配置启用三级优化、完整调试符号和溢出检查。Rust 依赖源码和许可证在 `third-parties/cargo`。
 
-`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。显式使用 `--accept-recommendations` 会显示警告。这两个命令执行预检；生产进程监管、隔离启动、在线更新和物理安全接收端仍待实现与验证。
+`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。显式使用 `--accept-recommendations` 会显示警告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的部署、在线更新、独立看门狗和物理安全接入尚未完成。
 
 ```xml
 <deployment id="cell">
@@ -30,3 +30,47 @@ wros-deployer verify deployment.xml --policy-root /protected/policies \
 部署器复制每个模块至私有快照，上限为 256 MiB，核对所复制字节的摘要，然后对该快照执行指定的 wasm-cosign。单次验签限时 30 秒，部署器检查退出状态，并在返回时清理快照。默认要求签名和摘要均有效。生成的执行参数保留 VM 的独立验签步骤。`verify` 在客户程序执行前结束。
 
 对本地开发镜像，`verify` 可分别指定 `--allow-unsigned ID=SHA256` 或 `--allow-invalid-signature ID=SHA256`。选项绑定单个 VM 和上传文件的完整摘要。只有验签器返回与选项相符的拒绝原因时才会放行，显示警告，并在该镜像的拟用参数中省略 VM 二次验签。有效签名仍经过两次检查。缺少信任材料、策略或吊销检查错误、未识别的验签器错误和上传摘要变化均会拒绝。
+
+## 运行已审核的 VM
+
+`run` 要求部署监管进程具有 root 身份，并使用外部服务管理器预先交付的 cgroup v2 子树。各 VM 使用互不相同的非 root 用户和组；这些身份必须由操作员在所有部署中独占预留，当前版本不会自动分配或跨部署锁定身份。验签器和 VM 可执行文件必须位于提交包之外的受保护路径。当前 `run` 遇到原生驱动声明会在启动任何进程之前拒绝。
+
+```xml
+<deployment id="cell">
+  <vm id="body" module="body.wasm" sha256="替换为64个小写十六进制字符"
+      policy="body.policy" vm-policy="body-vm.policy"
+      recommendations="body-permissions.xml"
+      uid="10001" gid="10001" memory-bytes="268435456" pids="16"
+      cpu-micros="100000" restart-on-crash="false"
+      restart-limit="3" restart-delay-ms="1000" start-on-boot="false"/>
+</deployment>
+```
+
+```sh
+wros-deployer run deployment.xml --policy-root /protected/policies \
+  --cosign /opt/wros/bin/cosign --scratch-directory /protected/staging \
+  --runtime /opt/wros/bin/uwvm2-ros \
+  --cgroup-parent /sys/fs/cgroup/wros.service/workloads
+```
+
+父 cgroup 必须是无直属进程的 domain，由 root 持有且禁止组及其他用户写入；`memory.max` 必须有限，`memory.swap.max` 必须为零，`cgroup.subtree_control` 已启用 `cpu`、`memory`、`pids`。部署器只创建自己独占的 `wros-部署名/vm-实例名` 子组，不修改祖先组。已有部署目录会被拒绝，包括监管进程崩溃后尚未清理的目录。各 VM 的内存预算总和不得超出父组上限。部署器和最终监督者须使用另外受限的组，并预留各自的映像、验签缓冲和日志内存。内核缺少 `cgroup.kill`、pidfd、`close_range`、memfd 封存或所需 namespace 时，启动失败，不降低隔离要求。
+
+子进程先进入对应 cgroup，再创建 network、IPC、UTS、mount、cgroup namespace，清空附加组，设置非 root 的真实、有效和保存 UID/GID，并启用 `no_new_privs`。部署器从封存的准入映像复制字节到私有 tmpfs 的 `/tmp/wros-admitted.wasm`，在执行 VM 前将文件系统设为只读。tmpfs 上限为 257 MiB，实际分配计入子进程的 cgroup。VM 原有的拒绝符号链接规则继续生效。日志管道归最终 VM 用户所有，使日志库在降权后能重新打开自身管道。其他非指定描述符在执行时关闭。这提供资源和部分操作系统隔离，不等于完整的文件系统或系统调用沙盒。
+
+正常签名部署需要两个反回滚状态库。用官方 wasm-cosign 初始化器分别初始化特权准入的 `policy` 和 VM 用户的 `vm-policy`；两份策略的信任根、签名者、算法、版本和限制必须完全一致，只允许 `state_dir` 不同。VM 状态目录及其中初始化文件属于 VM 用户，目录权限 0700、文件权限 0600；策略文件仍归管理员持有，并允许 VM 读取。不能修改策略路径后直接复制旧的反回滚记录，因为记录绑定策略指纹。VM 自己完成第二次校验。
+
+`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。`--accept-recommendations` 只跳过本次交互审核，不放宽签名要求。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
+
+## 故障和人工停机
+
+退出码为零时该实例结束。只有 `restart-on-crash="true"` 才允许冷重启，次数不得超过 `restart-limit`，两次启动间隔不得小于 `restart-delay-ms`。默认上限为三次、间隔一秒，但默认没有重启授权。次数可设 0 至 32，间隔可设 100 至 60000 毫秒。每次启动使用新的代次、相同的封存映像且没有运动权限。旧 cgroup 的所有后代退出后才允许新代次启动。CPU 配额固定以 100000 微秒为周期，`cpu-micros` 默认 100000；这是会明确报告的资源限制。
+
+SIGINT、SIGTERM 或 SIGHUP 会停止恢复，通过 pidfd 请求退出，最多等待两秒，再终止残留的整个后代 cgroup。诊断输出每代最多记录 8 KiB，读取工作量也有上限；退出状态和内存、任务数限额事件会被报告。控制循环每五毫秒轮询，不承担物理急停。内核不可中断任务仍可能需要最终监督者处理。部署器死亡会触发直属 VM 的父进程死亡信号；systemd 或等价的平台监督者还必须负责回收整棵后代树。持久化停机意图、开机恢复和监督者自身恢复尚未实现。
+
+运行期审计使用独立写入线程和有界队列，最多 32 条记录，每条最多 32 KiB。进程监管循环不会等待日志接收端。队列饱和或写入错误会停止部署；VM 停机后最多等待 500 毫秒排空日志，未能排空时以失败状态退出。这避免已满管道或卡住的日志收集器阻塞人工停机。预检输出发生在任何客户程序启动之前。
+
+## 临时内核测试
+
+`tests/qemu_supervisor.py` 创建仅使用内存的全新 Linux 来宾，不挂载宿主磁盘、共享目录、实体设备或网络。测试必须经过现有 64 GiB、零 swap 的 cgroup；来宾内存上限为 4 GiB，使用两个模拟 CPU。参数指定官方内核及固件、构建后的部署器和 VM、发布版 wasm-cosign，以及新生成的 `tests/wsea_preflight.py` 签名夹具。输入摘要和结果写入指定的 `.tmp` 目录。原生故障程序只是测试替身，真实 VM 用例在结果中单独标明。该测试不代表五个 Linux ABI、原厂硬件、systemd 恢复或工业安全认证已经通过。
+
+`--sdk-module` 接收实际由 SDK 编译、调用 `uwvm_ros_v2.abi` 的程序。测试分别允许和拒绝该接口，验证 SDK 产物经过部署器和 VM 后的授权行为。`tests/linux_abi.py` 另行交叉编译 Rust 实现，并在 x86_64、i686、AArch64、ARM 硬浮点和 ARM 软浮点运行契约测试；用户态 ABI 检查不能替代各架构的特权内核测试。
