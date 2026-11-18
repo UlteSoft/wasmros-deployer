@@ -163,4 +163,4 @@ wasm64 目标使用 SDK 对应的 `wasip1.clock_time_get_wasm64`。读取分辨�
 
 测试另一种 SDK 语言时，使用 `--sdk-abi-application FILE` 指定已编译的 ABI 查询程序，使用 `--approved-build-receipt-sha256 DIGEST` 指定操作员已审核的相邻 `FILE.wros-build.json` 的摘要。该用例仅接受 `uwvm_ros_v2.abi` 导入。它先校验产物与 VM 的匹配关系，再对私有副本签名，随后在 QEMU 来宾中验证部署器和 VM 的两次验签。
 
-完整签名部署测试可指定 `--accelerator tcg`（默认）或 `--accelerator kvm`，还可用 `--guest-timeout-seconds` 设置整个来宾的时限，取值 30 至 1800 秒，默认 240 秒。所选后端需要当前 cgroup 允许。用公开安装的 SDK 将 Lua 解释器编入 Wasm 后，TCG 来宾在 AOT 引擎、fast-compile 策略和 1200 秒时限下通过了全部 42 项检查。来宾会分别启动新的 VM 来验证授权、拒绝和签名，时限包含这些进程的编译和监督时间。
+完整签名部署测试可指定 `--accelerator tcg`（默认）或 `--accelerator kvm`，还可用 `--guest-timeout-seconds` 设置整个来宾的时限，取值 30 至 1800 秒，默认 240 秒。所选后端需要当前 cgroup 允许。两次 TCG 测试均从各自语言公开安装的 SDK 构建应用，使用 AOT 引擎、fast-compile 策略和 1200 秒来宾时限。编入 Wasm 的 Lua 解释器在 499 秒内通过全部 42 项检查，Fortran 应用在 1036 秒内通过相同的 42 项检查。来宾会分别启动新的 VM 来验证授权、拒绝和签名，时限包含这些进程的编译和监督时间。
