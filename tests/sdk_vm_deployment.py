@@ -87,11 +87,18 @@ def main():
                 raise ValueError('SDK input exceeds the test fixture budget')
             target.write_bytes(data)
             state['inputs'][str(source)] = digest(target)
-        checker = args.sdk/'install/qualification.py'
+        if digest(build_receipt) != args.approved_build_receipt_sha256:
+            raise ValueError('SDK receipt differs from the operator-approved digest')
+        approved = json.loads(build_receipt.read_bytes())
+        checker = args.sdk / 'install/qualification.py'
+        verifier_args = []
+        if approved.get('format') == 'wros-d-betterc-build-v1':
+            checker = args.sdk / 'bin/wrd'
+            verifier_args = ['verify']
         state['inputs'][str(checker)] = digest(checker)
-        run('verify-build', checker, ['--vm',args.vm,'--artifact',artifact,'--receipt',build_receipt,
-            '--approved-receipt-sha256',args.approved_build_receipt_sha256], 180)
-        state['language'] = json.loads(build_receipt.read_bytes())['language']
+        run('verify-build', checker, [*verifier_args, '--vm', args.vm, '--artifact', artifact,
+            '--receipt', build_receipt, '--approved-receipt-sha256', args.approved_build_receipt_sha256], 180)
+        state['language'] = approved['language']
         probe_args = []
         required_case = 'signed-sdk-verification-at-deployer-and-vm'
     else:
