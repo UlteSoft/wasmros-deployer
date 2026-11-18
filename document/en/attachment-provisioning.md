@@ -128,8 +128,12 @@ existing deployer contracts on those ABIs.
 
 `tests/qemu_attachment_provisioning.py` repeats real-VM attachment cases with
 different non-root identities, separate network namespaces and separate nested
-cgroups in an offline disposable kernel. The guest has no physical device, host
-disk or shared-folder access. All test work remains inside the host's existing
+cgroups in an offline disposable kernel. The test provisioner installs the fixed
+[device baseline](device-isolation.md) on both empty groups before either peer
+starts. Each scenario uses fresh groups; an existing policy is never replaced.
+This tests encrypted IPC under kernel device restrictions, not vendor hardware
+grants. The guest has no physical device, host disk or shared-folder access.
+All test work remains inside the host's existing
 64 GiB zero-swap cgroup. These tests do not qualify arbitrary vendor binaries,
 physical stop behavior, device exclusivity or industrial safety certification.
 Pass `--receiver-checks` with the native receiver boundary fixture to additionally

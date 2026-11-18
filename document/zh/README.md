@@ -5,6 +5,9 @@
 [本机加密通道交付约定](attachment-provisioning.md)说明了 Rust 密钥和描述符交付组件及其真实 VM 测试。
 这些组件尚未开放正式 CLI 的原生驱动执行入口。
 
+每个部署的 VM 必须启用[内核设备访问控制](device-isolation.md)。该模块同时提供
+确切设备规则和原部署器归属登记；native 驱动生命周期仍需独立联动。
+
 `wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。显式使用 `--accept-recommendations` 会显示警告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的部署、在线更新、独立看门狗和物理安全接入尚未完成。
 
 ```xml
@@ -115,6 +118,6 @@ wros-deployer resume /protected/bundles/cell/deployment.xml \
 
 `--sdk-module` 接收实际由 SDK 编译、调用 `uwvm_ros_v2.abi` 的程序。测试分别允许和拒绝该接口，验证 SDK 产物经过部署器和 VM 后的授权行为。`tests/linux_abi.py` 另行交叉编译 Rust 实现，并在 x86_64、i686、AArch64、ARM 硬浮点和 ARM 软浮点运行契约测试；用户态 ABI 检查不能替代各架构的特权内核测试。
 
-来宾配置两个 NUMA 节点，每个节点一个虚拟 CPU、2 GiB 内存。放置测试检查实际亲和性、已写入页面所在节点、扩大 CPU／内存策略被拒绝、崩溃重启后的约束、不可用资源、收窄的父组和缺失的控制器；两个真实 VM 也分别绑定不同 CPU／节点。内核测试共 37 项，包括跨部署身份冲突和身份独立的并行部署；用户态契约测试每个 ABI 现包含 31 项，包括接入密钥生成、封存记录和描述符注入检查，结果记录绑定源码、构建配置与程序摘要。仿真结果不用于宣称 NUMA 性能或硬实时保证。
+来宾配置两个 NUMA 节点，每个节点一个虚拟 CPU、2 GiB 内存。放置测试检查实际亲和性、已写入页面所在节点、扩大 CPU／内存策略被拒绝、崩溃重启后的约束、不可用资源、收窄的父组和缺失的控制器；两个真实 VM 也分别绑定不同 CPU／节点。内核测试共 37 项，包括跨部署身份冲突和身份独立的并行部署；用户态契约测试每个 ABI 现包含 35 项，包括接入密钥生成、封存记录和描述符注入检查，结果记录绑定源码、构建配置与程序摘要。仿真结果不用于宣称 NUMA 性能或硬实时保证。
 
 `tests/qemu_powerloss.py` 在已完成的内核夹具基础上，于 `.tmp` 新建 64 MiB 的虚拟 ext4 磁盘，使用两个虚拟 CPU 和 2 GiB 内存。输入与内核匹配的 Debian 安装器 kernel-image、ext4 和存储模块包；只将选中的普通模块文件放入来宾，宿主不加载这些内核模块。首次启动两个真实 VM 后直接强杀 QEMU，再进行两次全新内核启动，验证开机授权、递增代次和持久化停机意图。最后写满虚拟磁盘，验证发布状态失败时保留原记录且不启动 VM。结果记录三个不同的内核 boot ID。这覆盖来宾突然消失和文件系统写满，不等于物理存储缓存、硬件停机电路或平台服务管理器恢复已通过验收。

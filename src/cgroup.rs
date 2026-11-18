@@ -402,6 +402,9 @@ impl Hierarchy {
                 write(&child.directory, "cpuset.cpus", &cpus.to_string())?;
             }
             child.verify_placement(p)?;
+            // The attachment remains effective even when this local handle or
+            // the supervisor dies. It ends only with the drained cgroup itself.
+            let _device_policy = crate::devices::Policy::vm().attach_empty(&child.directory)?;
             // Verify support before the first child exists.
             child.kill()?;
             hierarchy.children.push(child);

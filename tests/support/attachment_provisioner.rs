@@ -27,6 +27,13 @@ fn prepare(command: &mut Command, inherited: Vec<i32>, uid: u32, group: &str) {
         .map(|root| {
             assert!(privileged);
             let path = std::path::Path::new(&root).join(group);
+            // Test-deployer authority only. Install before enrollment; closing
+            // this handle leaves the kernel filter active until group removal.
+            let directory = File::open(&path).unwrap();
+            let _devices = wros_deployer::devices::Policy::vm()
+                .attach_empty(&directory)
+                .unwrap();
+            println!("TEST_DEVICE_FILTER_INSTALLED {group}");
             let file = OpenOptions::new()
                 .write(true)
                 .open(path.join("cgroup.procs"))

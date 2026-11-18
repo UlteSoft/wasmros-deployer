@@ -1,4 +1,4 @@
-//! Host-wide reservations for identities used by deployment-owned processes.
+//! Host-wide reservations for identities and exact Linux device numbers.
 //!
 //! Every manager uses the same administrator-owned /run/wros-ownership directory.
 //! A nonblocking per-identity lock excludes concurrent managers, including two
@@ -7,6 +7,11 @@
 //! that identity while old children might still exist. Only the original cgroup
 //! parent and deployment name may reacquire it. Records persist in /run;
 //! they are not credentials, recovery approval or device-access enforcement.
+//! Device aliases share one (type, major, minor) reservation. Device numbers
+//! alone do not identify hardware across hotplug; the trusted platform must
+//! independently validate hardware identity. The device BPF controller is a
+//! separate access boundary, not a replacement for these ownership records.
+use crate::devices::Device;
 use crate::manifest::{Process, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -19,7 +24,7 @@ use std::path::Path;
 
 pub const DIRECTORY: &str = "/run/wros-ownership";
 const MAGIC: &[u8] = b"WROS-host-identity\0";
-const MAX_IDENTITIES: usize = 256;
+const MAX_IDENTITIES: usize = 256 + crate::devices::MAX_RULES;
 
 /// Keep these descriptors in the manager through the complete shutdown path.
 /// CLOEXEC prevents their inheritance into VM or native-provider executables.
@@ -30,6 +35,28 @@ pub struct Reservations {
     process: libc::pid_t,
 }
 impl Reservations {
+    /// A physical device claim may only be used by the original manager process
+    /// and owner. A lock released by a crash never transfers its ownership.
+    /// This check does not grant device opens or prove actuator safe state.
+    pub fn check_devices(
+        &self,
+        parent: &Path,
+        deployment: &str,
+        devices: &[&Device],
+    ) -> Result<()> {
+        if self.process != unsafe { libc::getpid() }
+            || self.owner != owner(parent, deployment)?
+            || devices
+                .iter()
+                .any(|d| !self.identities.contains(&d.key().claim_name()))
+        {
+            return Err("held device reservations do not cover this manager and request".into());
+        }
+        for device in devices {
+            device.revalidate()?;
+        }
+        Ok(())
+    }
     /// A held reservation can cover the subset selected for an approved cold
     /// start, but never another owner, process incarnation or extra identity.
     pub(crate) fn check(
@@ -85,7 +112,8 @@ fn open_at(directory: &File, name: &str, flags: i32) -> std::io::Result<File> {
 fn lock(file: &File) -> Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(
-            "host identity is busy; connect through its original deployment manager".into(),
+            "host identity or device is busy; connect through its original deployment manager"
+                .into(),
         );
     }
     Ok(())
@@ -131,15 +159,18 @@ fn reserve(directory: File, owner: [u8; 32], identities: &[String]) -> Result<Re
     }
     let mut ordered = BTreeSet::new();
     for name in identities {
-        let (kind, number) = name.split_once('-').ok_or("invalid host identity")?;
-        let n = number.parse::<u32>().map_err(|_| "invalid host identity")?;
-        if !matches!(kind, "uid" | "gid")
-            || n == 0
-            || n == u32::MAX
-            || n.to_string() != number
-            || !ordered.insert(name)
-        {
-            return Err("invalid or duplicate host identity".into());
+        let parts: Vec<_> = name.split('-').collect();
+        let valid = match parts.as_slice() {
+            [kind, number] if matches!(*kind, "uid" | "gid") => number
+                .parse::<u32>()
+                .is_ok_and(|n| n != 0 && n != u32::MAX && n.to_string() == *number),
+            ["device", kind, major, minor] if matches!(*kind, "1" | "2") => [major, minor]
+                .iter()
+                .all(|s| s.parse::<u32>().is_ok_and(|n| n.to_string() == **s)),
+            _ => false,
+        };
+        if !valid || !ordered.insert(name) {
+            return Err("invalid or duplicate host identity/device".into());
         }
     }
     let admission =
@@ -207,6 +238,21 @@ fn reserve(directory: File, owner: [u8; 32], identities: &[String]) -> Result<Re
 /// WROS. Private /run mounts or an unmanaged process using the same UID are not
 /// made safe by advisory locks. Root remains the trusted provisioning authority.
 pub fn claim(parent: &Path, deployment: &str, processes: &[&Process]) -> Result<Reservations> {
+    claim_with_devices(parent, deployment, processes, &[])
+}
+
+/// Reserve all guest identities and physical device numbers in one admission
+/// transaction, before launching any process or opening hardware. Only the
+/// original owner can reconnect/recover; never offer cross-manager takeover.
+/// Use the same host registry and mount namespace across all trusted managers.
+/// This API is also useful for an external trusted driver provisioner; the
+/// production CLI still refuses unqualified native-provider launch manifests.
+pub fn claim_with_devices(
+    parent: &Path,
+    deployment: &str,
+    processes: &[&Process],
+    devices: &[&Device],
+) -> Result<Reservations> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("identity reservation requires the privileged deployment supervisor".into());
     }
@@ -237,13 +283,20 @@ pub fn claim(parent: &Path, deployment: &str, processes: &[&Process]) -> Result<
     }
     let directory = open_at(&run, "wros-ownership", libc::O_RDONLY | libc::O_DIRECTORY)
         .map_err(|e| e.to_string())?;
-    let identities = processes
+    if processes.len() > 128 || devices.len() > crate::devices::MAX_RULES {
+        return Err("identity/device reservation budget exceeded".into());
+    }
+    for device in devices {
+        device.revalidate()?;
+    }
+    let mut identities = processes
         .iter()
         .map(|p| p.identity.ok_or("missing guest identity"))
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .flat_map(|(uid, gid)| [format!("uid-{uid}"), format!("gid-{gid}")])
         .collect::<Vec<_>>();
+    identities.extend(devices.iter().map(|d| d.key().claim_name()));
     reserve(directory, owner, &identities)
 }
 
@@ -281,6 +334,28 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    #[test]
+    fn device_numbers_do_not_transfer_after_unlock() {
+        let f = Fixture::new();
+        let held = f
+            .claim(1, &["device-2-188-1", "uid-20001", "gid-20001"])
+            .unwrap();
+        assert!(f.claim(2, &["device-2-188-1"]).is_err());
+        drop(held);
+        assert!(f.claim(2, &["device-2-188-1"]).is_err());
+        assert!(f.claim(1, &["device-2-188-1"]).is_ok());
+        // The kernel distinguishes block and character device number spaces.
+        assert!(f.claim(2, &["device-1-188-1"]).is_ok());
+        for name in [
+            "device-3-188-1",
+            "device-2-0188-1",
+            "device-2-188-01",
+            "device-2-188",
+            "device-2-4294967296-0",
+        ] {
+            assert!(f.claim(3, &[name]).is_err(), "{name}");
         }
     }
     #[test]

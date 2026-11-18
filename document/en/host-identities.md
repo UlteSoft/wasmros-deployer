@@ -48,6 +48,10 @@ administrator from using the same credentials. It is not a device-access filter,
 physical hardware lease, cross-host ownership service or motion authorization.
 Native driver provisioning remains disabled pending those separate controls.
 
+The same registry now supports an additional 128 exact device keys in the
+combined admission API. See [device ownership and enforcement](device-isolation.md)
+for alias handling, retained original ownership and the independent BPF layer.
+
 The registry is consulted during admission, not during ROS/DDS or driver calls.
 Its filesystem latency must not be included as a per-message transport cost.
 Tests cover concurrent conflicts on UID and GID independently, disjoint managers,

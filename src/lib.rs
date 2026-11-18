@@ -2,6 +2,7 @@ pub mod attachment;
 pub mod audit;
 pub mod cgroup;
 pub mod containment;
+pub mod devices;
 pub mod manifest;
 pub mod ownership;
 pub mod placement;

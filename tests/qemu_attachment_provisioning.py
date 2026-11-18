@@ -37,7 +37,7 @@ def main():
             dst=root/lib.lstrip('/');dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(lib,dst);dst.chmod(0o755);inputs[lib]=digest(Path(lib))
     for src,dst in [(Path('/bin/busybox'),'/bin/busybox'),(a.provisioner,'/bin/provisioner'),(a.peer,'/bin/provider'),(a.vm,'/bin/uwvm2-ros')]:binary(src,dst)
     if a.receiver_checks:binary(a.receiver_checks,'/bin/receiver-checks')
-    for name in ('sh','mount','mkdir','poweroff','cat','sleep'):(root/'bin'/name).symlink_to('busybox')
+    for name in ('sh','mount','mkdir','poweroff','cat','sleep','rmdir'):(root/'bin'/name).symlink_to('busybox')
     shutil.copyfile(a.module,root/'body.wasm');(root/'body.wasm').chmod(0o444);inputs[str(a.module.resolve())]=digest(a.module)
     modes=['success','wrong-key','wrong-binding','wrong-descriptor','bad-profile','bad-ready','peer-exit','unexpected-rights','bad-origin']
     init='''#!/bin/sh
@@ -57,22 +57,28 @@ echo 2147483648 > /sys/fs/cgroup/attachments/memory.max || fail
 echo 0 > /sys/fs/cgroup/attachments/memory.swap.max || fail
 echo 64 > /sys/fs/cgroup/attachments/pids.max || fail
 echo '+cpu +memory +pids' > /sys/fs/cgroup/attachments/cgroup.subtree_control || fail
-for name in vm provider; do
+export WROS_TEST_CHILD_CGROUP_ROOT=/sys/fs/cgroup/attachments
+'''
+    create='''for name in vm provider; do
  mkdir /sys/fs/cgroup/attachments/$name || fail
  echo 1073741824 > /sys/fs/cgroup/attachments/$name/memory.max || fail
  echo 0 > /sys/fs/cgroup/attachments/$name/memory.swap.max || fail
  echo 16 > /sys/fs/cgroup/attachments/$name/pids.max || fail
  echo '100000 100000' > /sys/fs/cgroup/attachments/$name/cpu.max || fail
 done
-export WROS_TEST_CHILD_CGROUP_ROOT=/sys/fs/cgroup/attachments
 '''
-    if a.receiver_checks:init+='/bin/receiver-checks || fail\n'
-    for mode in modes:init+=f'/bin/provisioner /bin/uwvm2-ros /bin/provider /body.wasm {mode} || fail\n'
-    init+='''for name in vm provider; do
+    cleanup='''for name in vm provider; do
  test -z "$(cat /sys/fs/cgroup/attachments/$name/cgroup.procs)" || fail
  cat /sys/fs/cgroup/attachments/$name/memory.events
+ rmdir /sys/fs/cgroup/attachments/$name || fail
 done
-echo QEMU_ATTACHMENT_PASS
+'''
+    if a.receiver_checks:init+='/bin/receiver-checks || fail\n'
+    # Each mode gets fresh groups: immutable device BPF rules persist after a
+    # provisioner exits and must never be replaced on an existing group.
+    for mode in modes:
+        init+=create+f'/bin/provisioner /bin/uwvm2-ros /bin/provider /body.wasm {mode} || fail\n'+cleanup
+    init+='''echo QEMU_ATTACHMENT_PASS
 poweroff -f
 '''
     (root/'init').write_text(init);(root/'init').chmod(0o755)
@@ -86,7 +92,8 @@ poweroff -f
     text=(a.output/'serial.log').read_text(errors='replace')
     result.update(exit=run.returncode,seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text),events_after=(group/'memory.events').read_text(),inputs_unchanged=all(digest(Path(k))==v for k,v in inputs.items()))
     result['receiver_boundary_checks']=bool(a.receiver_checks)
-    result['complete']=run.returncode==0 and 'QEMU_ATTACHMENT_PASS' in text and 'QEMU_ATTACHMENT_FAIL' not in text and len(result['cases'])==len(modes)+(19 if a.receiver_checks else 0) and result['inputs_unchanged'] and not re.search(r'oom(?:_kill|_group_kill)? [1-9]',text)
+    result['kernel_device_filter_for_both_peers']=all(text.splitlines().count('TEST_DEVICE_FILTER_INSTALLED '+peer)==len(modes) for peer in ('vm','provider'))
+    result['complete']=run.returncode==0 and 'QEMU_ATTACHMENT_PASS' in text and 'QEMU_ATTACHMENT_FAIL' not in text and len(result['cases'])==len(modes)+(19 if a.receiver_checks else 0) and result['inputs_unchanged'] and result['kernel_device_filter_for_both_peers'] and not re.search(r'oom(?:_kill|_group_kill)? [1-9]',text)
     receipt.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps({k:v for k,v in result.items() if k not in ('inputs','argv','init')},indent=2));assert result['complete'],text[-5000:]
 
 

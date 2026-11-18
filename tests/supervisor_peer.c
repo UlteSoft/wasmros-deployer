@@ -46,6 +46,10 @@ int main(int argc,char **argv) {
     errno=0;int ownership=open("/run/wros-ownership",O_RDONLY|O_DIRECTORY);
     if(ownership>=0||errno!=EACCES)return 102;
     if(prctl(PR_GET_SECCOMP,0,0,0,0)!=2)return 95;
+    int device=open("/dev/null",O_RDWR|O_CLOEXEC);if(device<0)return 103;close(device);
+    device=open("/dev/zero",O_RDONLY|O_CLOEXEC);if(device<0)return 104;close(device);
+    errno=0;device=open("/dev/zero",O_WRONLY|O_CLOEXEC);if(device>=0||errno!=EPERM)return 105;
+    errno=0;device=open("/dev/full",O_RDONLY|O_CLOEXEC);if(device>=0||errno!=EPERM)return 106;
     errno=0;if(unshare(0)!=-1||errno!=EPERM)return 96;
     errno=0;if(setns(-1,0)!=-1||errno!=EPERM)return 97;
     errno=0;if(syscall(SYS_clone3,NULL,0)!=-1||errno!=ENOSYS)return 98;
@@ -67,7 +71,7 @@ int main(int argc,char **argv) {
     f=open(argv[argc-1],O_WRONLY);
     if(f<0){if(errno!=EROFS)return 74;}
     else{errno=0;n=write(f,"X",1);close(f);if(n!=-1 || errno!=EPERM)return 75;}
-    printf("PEER confined uid=%u gid=%u sealed=1 namespace-pinned=1 pthread=1\n",getuid(),getgid());
+    printf("PEER confined uid=%u gid=%u sealed=1 namespace-pinned=1 pthread=1 device-filter=1\n",getuid(),getgid());
     const char *mode=argv[2];
     if(!strcmp(mode,"placement")||!strcmp(mode,"placementcrash")){
         cpu_set_t set;CPU_ZERO(&set);

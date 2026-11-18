@@ -16,6 +16,10 @@ zeroize = { version = "=1.8.2", default-features = false }
 name = "attachment-provisioner"
 path = "tests/support/attachment_provisioner.rs"
 
+[[example]]
+name = "device-kernel-checks"
+path = "tests/support/device_kernel_checks.rs"
+
 [profile.release]
 opt-level = 3
 debug = 2

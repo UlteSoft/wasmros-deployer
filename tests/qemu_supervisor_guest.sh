@@ -165,12 +165,12 @@ competitor() {
     /bin/wros-deployer run /bundle/other.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --accept-recommendations --allow-unsigned "normal=$digest"
 }
 if competitor 10001 11001 > /uid-conflict.log 2>&1; then fail uid-collision-accepted; fi
-grep -q 'host identity is busy' /uid-conflict.log || { cat /uid-conflict.log; fail wrong-uid-conflict; }
+grep -q 'host identity or device is busy' /uid-conflict.log || { cat /uid-conflict.log; fail wrong-uid-conflict; }
 test ! -d /sys/fs/cgroup/delegated/wros-other || fail competing-cgroup-created
 test "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-one/cgroup.procs)" = "$first" || fail original-vm-disturbed
 pass cross-deployer-uid-collision-preserves-original
 if competitor 11002 10001 > /gid-conflict.log 2>&1; then fail gid-collision-accepted; fi
-grep -q 'host identity is busy' /gid-conflict.log || { cat /gid-conflict.log; fail wrong-gid-conflict; }
+grep -q 'host identity or device is busy' /gid-conflict.log || { cat /gid-conflict.log; fail wrong-gid-conflict; }
 pass cross-deployer-gid-collision-denied
 competitor 11003 11003 > /uid-distinct.log 2>&1 || { cat /uid-distinct.log; fail separate-deployment-denied; }
 grep -q 'PEER confined uid=11003 gid=11003' /uid-distinct.log || fail distinct-deployment-not-executed
@@ -234,12 +234,12 @@ sleep .1
 before_pids=$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)
 before_approval=$(sha256sum /state/second-journal/approval)
 if /bin/wros-deployer resume /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/second-journal > /second-resume.log 2>&1; then fail second-manager-resumed; fi
-grep -q 'host identity is busy' /second-resume.log || { cat /second-resume.log; fail wrong-second-manager-rejection; }
+grep -q 'host identity or device is busy' /second-resume.log || { cat /second-resume.log; fail wrong-second-manager-rejection; }
 test "$before_pids" = "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)" || fail competing-resume-killed-original
 test "$before_approval" = "$(sha256sum /state/second-journal/approval)" || fail competing-resume-consumed-approval
 before_approval=$(sha256sum /state/changed-journal/approval)
 if /bin/wros-deployer resume /bundle/changed-identity.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/changed-journal > /changed-resume.log 2>&1; then fail changed-manager-resumed; fi
-grep -q 'host identity is busy' /changed-resume.log || { cat /changed-resume.log; fail wrong-changed-manager-rejection; }
+grep -q 'host identity or device is busy' /changed-resume.log || { cat /changed-resume.log; fail wrong-changed-manager-rejection; }
 test "$before_pids" = "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)" || fail changed-identities-bypassed-deployment-lock
 test "$before_approval" = "$(sha256sum /state/changed-journal/approval)" || fail changed-resume-consumed-approval
 pass identity-reservation-precedes-recovery-and-approval-consumption

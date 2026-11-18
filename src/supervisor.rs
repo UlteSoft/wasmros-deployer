@@ -506,6 +506,7 @@ pub fn run_reserved(
     let _signals = Signals::install()?;
     let events = Events::new()?;
     events.send(format!("INFO Host UID/GID reservations held in {} for deployment {:?}; no cross-deployment takeover after manager exit", crate::ownership::DIRECTORY, deployment));
+    events.send("INFO Every VM requires kernel device filtering: /dev/null read/write; /dev/zero, /dev/random and /dev/urandom read only; all other device opens and all mknod denied".into());
     let result = supervise(
         runtime,
         cgroup,
