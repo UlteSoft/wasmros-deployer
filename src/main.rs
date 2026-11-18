@@ -474,6 +474,14 @@ fn run() -> Result<()> {
             println!("INFO Reviewed authority saved. No process was started. The independent supervisor may now invoke resume; changed configuration requires fresh review.");
             return Ok(());
         }
+        // Exclude every competing manager before reclaim can signal a prior
+        // tree or resume can consume its approval. Keep the full reviewed set
+        // reserved even when only a subset has an automatic cold-start grant.
+        let identities = wros_deployer::ownership::claim(
+            parent,
+            &plan.id,
+            &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
+        )?;
         if let Some(j) = &mut journal {
             if j.existing() {
                 let ids = launches
@@ -524,7 +532,14 @@ fn run() -> Result<()> {
             }
         }
         println!("INFO Starting reviewed VM deployment with runtime {:?}, delegated cgroup {:?}. Boot registration is not performed by this command.",runtime,parent);
-        supervisor::run_with_state(&runtime, parent, &plan.id, &launches, journal.as_mut())?;
+        supervisor::run_reserved(
+            &runtime,
+            parent,
+            &plan.id,
+            &launches,
+            journal.as_mut(),
+            &identities,
+        )?;
     }
     Ok(())
 }

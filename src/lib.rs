@@ -2,6 +2,7 @@ pub mod audit;
 pub mod cgroup;
 pub mod containment;
 pub mod manifest;
+pub mod ownership;
 pub mod placement;
 pub mod recovery;
 pub mod service;

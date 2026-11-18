@@ -1,5 +1,10 @@
 # Independent service supervision
 
+Managers sharing a host must also share the [host identity registry](host-identities.md).
+It excludes conflicting UID/GID use and competing managers of the same deployment
+before old-group cleanup. Namespace or cgroup separation alone does not establish
+exclusive host identity ownership.
+
 `wros-deployer service` renders a systemd unit. It does not install, enable or start a host service. `authorize` performs signature admission and operator permission review, then saves a one-use initial activation in a private durable state directory. `resume` consumes that activation before creating a VM. Later automatic starts require the separate XML crash or boot grants.
 
 This implementation requires Linux cgroup v2. The generated unit requires systemd 254 or later because it uses `DelegateSubgroup=manager`. It has been exercised with systemd 257 under a disposable x86_64 Linux kernel. The Rust interfaces also execute on the five supported userspace ABIs; this does not qualify the service manager and kernel of every target platform.

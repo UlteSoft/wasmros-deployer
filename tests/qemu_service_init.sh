@@ -5,7 +5,7 @@ export PATH=/bin:/usr/bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-mount -t tmpfs tmpfs /run
+mount -t tmpfs -o mode=0755 tmpfs /run
 mkdir -p /sys/fs/cgroup /scratch /state/admission /state/body /dev/pts
 mount -t devpts devpts /dev/pts
 mount -t cgroup2 none /sys/fs/cgroup

@@ -24,6 +24,7 @@ def main():
     assert (group/'memory.swap.max').read_text().strip()=='0'
     args.output=args.output.resolve();assert '.tmp' in args.output.parts
     args.output.mkdir(parents=True,exist_ok=False)
+    (args.output/'test-data').mkdir()
     def digest(path):
         with path.open('rb') as stream:
             return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -51,7 +52,7 @@ def main():
            ('armhf','armv7-unknown-linux-gnueabihf','arm-linux-gnueabihf','qemu-arm'),
            ('arm','arm-unknown-linux-gnueabi','arm-linux-gnueabi','qemu-arm')]
     for abi,target,gnu,emulator in cases:
-        env=dict(os.environ,PATH=str(args.rust/'bin')+':/usr/bin:/bin',CARGO_HOME=str(root/'.tmp/cargo'),CARGO_TARGET_DIR=str(args.output/'target'))
+        env=dict(os.environ,PATH=str(args.rust/'bin')+':/usr/bin:/bin',CARGO_HOME=str(root/'.tmp/cargo'),CARGO_TARGET_DIR=str(args.output/'target'),WROS_TEST_DIRECTORY=str(args.output/'test-data'))
         flags=[]
         if emulator:
             component=(args.components/f'rust-std-{release}-{target}'/f'rust-std-{target}').resolve()
@@ -77,7 +78,7 @@ def main():
             if emulator=='native-i686':
                 run=[sysroot/'lib/ld-linux.so.2','--library-path',str(sysroot/'lib/i386-linux-gnu')+':'+str(sysroot/'usr/lib/i386-linux-gnu'),*run]
             elif emulator:run=[args.qemu_bin/emulator,'-L',sysroot,*run]
-            execute(abi+'-tests-'+str(index),run)
+            execute(abi+'-tests-'+str(index),run,env)
             results['cases'][-1]['executable_sha256']=sha
     results['inputs_unchanged']=all(digest(Path(path))==value for path,value in results['inputs'].items())
     results['events_after']=(group/'memory.events').read_text()

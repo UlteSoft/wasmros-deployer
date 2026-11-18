@@ -62,7 +62,7 @@ def main():
     assert '.tmp' in args.output.parts
     args.output.mkdir(parents=True,exist_ok=False)
     root=args.output/'root';root.mkdir()
-    for name in ('bin','proc','sys','dev','tmp','bundle','trust','state','scratch'):(root/name).mkdir()
+    for name in ('bin','proc','sys','dev','tmp','run','bundle','trust','state','scratch'):(root/name).mkdir()
     def copy(source,target,mode=0o755):
         target=root/target.lstrip('/');target.parent.mkdir(parents=True,exist_ok=True)
         shutil.copyfile(source,target);target.chmod(mode)
@@ -106,7 +106,7 @@ def main():
         run=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=240)
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=run.returncode,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==31
+    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==37
     receipt.write_text(json.dumps(result,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('argv','inputs','compile')},indent=2))
     assert result['complete'],text[-10000:]

@@ -478,10 +478,34 @@ pub fn run_with_state(
     cgroup: &Path,
     deployment: &str,
     launches: &[Launch],
-    mut journal: Option<&mut crate::state::Journal>,
+    journal: Option<&mut crate::state::Journal>,
 ) -> Result<()> {
+    let identities = crate::ownership::claim(
+        cgroup,
+        deployment,
+        &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
+    )?;
+    run_reserved(runtime, cgroup, deployment, launches, journal, &identities)
+}
+/// The CLI acquires identities before reclaiming old groups or consuming a
+/// durable start authorization. Retain that same proof through final shutdown;
+/// reacquiring here would either race recovery or conflict with our own locks.
+pub fn run_reserved(
+    runtime: &Path,
+    cgroup: &Path,
+    deployment: &str,
+    launches: &[Launch],
+    mut journal: Option<&mut crate::state::Journal>,
+    identities: &crate::ownership::Reservations,
+) -> Result<()> {
+    identities.check(
+        cgroup,
+        deployment,
+        &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
+    )?;
     let _signals = Signals::install()?;
     let events = Events::new()?;
+    events.send(format!("INFO Host UID/GID reservations held in {} for deployment {:?}; no cross-deployment takeover after manager exit", crate::ownership::DIRECTORY, deployment));
     let result = supervise(
         runtime,
         cgroup,

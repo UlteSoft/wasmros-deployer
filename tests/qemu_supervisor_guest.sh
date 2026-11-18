@@ -157,10 +157,32 @@ test "$(awk '/Cpus_allowed_list:/{print $2}' /proc/$first/status)" = 0 || fail f
 test "$(awk '/Mems_allowed_list:/{print $2}' /proc/$first/status)" = 0 || fail first-numa
 test "$(awk '/Cpus_allowed_list:/{print $2}' /proc/$second/status)" = 1 || fail second-cpu
 test "$(awk '/Mems_allowed_list:/{print $2}' /proc/$second/status)" = 1 || fail second-numa
+# Another manager must not acquire either identity independently, and its
+# rejection must leave the two existing VMs running. Resource names are host
+# identities; matching only a GID is also an isolation failure.
+competitor() {
+    printf '<deployment id="other"><vm id="normal" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="%s" gid="%s"/></deployment>\n' "$digest" "$1" "$2" > /bundle/other.xml
+    /bin/wros-deployer run /bundle/other.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --accept-recommendations --allow-unsigned "normal=$digest"
+}
+if competitor 10001 11001 > /uid-conflict.log 2>&1; then fail uid-collision-accepted; fi
+grep -q 'host identity is busy' /uid-conflict.log || { cat /uid-conflict.log; fail wrong-uid-conflict; }
+test ! -d /sys/fs/cgroup/delegated/wros-other || fail competing-cgroup-created
+test "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-one/cgroup.procs)" = "$first" || fail original-vm-disturbed
+pass cross-deployer-uid-collision-preserves-original
+if competitor 11002 10001 > /gid-conflict.log 2>&1; then fail gid-collision-accepted; fi
+grep -q 'host identity is busy' /gid-conflict.log || { cat /gid-conflict.log; fail wrong-gid-conflict; }
+pass cross-deployer-gid-collision-denied
+competitor 11003 11003 > /uid-distinct.log 2>&1 || { cat /uid-distinct.log; fail separate-deployment-denied; }
+grep -q 'PEER confined uid=11003 gid=11003' /uid-distinct.log || fail distinct-deployment-not-executed
+test "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-one/cgroup.procs)" = "$first" || fail disjoint-deployment-disturbed-original
+pass disjoint-deployer-identities-can-execute-concurrently
 manager=$(cat /proc/$management/task/$management/children | awk '{print $1}')
 test -n "$manager" || manager=$management
 kill -TERM "$manager"; wait "$management" || { cat /multiple.log; fail multi-stop; }
 not_running "$first"; not_running "$second"; empty; pass actual-two-vm-independent-cgroups
+if competitor 10001 11001 > /uid-stale.log 2>&1; then fail implicit-identity-handoff; fi
+grep -q 'belongs to another deployment or has an invalid record' /uid-stale.log || { cat /uid-stale.log; fail lost-owner-record; }
+pass exited-deployer-does-not-transfer-identity
 
 sdkdigest=$(sha256sum /bundle/sdk.wasm); sdkdigest=${sdkdigest%% *}
 printf '<deployment id="cell"><vm id="sdk" module="sdk.wasm" sha256="%s" policy="body.policy" recommendations="permissions.xml" memory-bytes="268435456" pids="16" uid="10001" gid="10001"/></deployment>\n' "$sdkdigest" > /bundle/current.xml
@@ -179,6 +201,9 @@ manager=$(cat /proc/$management/task/$management/children | awk '{print $1}')
 test -n "$manager" || manager=$management
 kill -KILL "$manager"; wait "$management" || true
 sleep .1; not_running "$worker"
+if competitor 10001 11001 > /uid-dead-manager.log 2>&1; then fail dead-manager-identity-takeover; fi
+grep -q 'belongs to another deployment or has an invalid record' /uid-dead-manager.log || { cat /uid-dead-manager.log; fail dead-manager-owner-lost; }
+pass manager-crash-keeps-identity-with-original-deployer
 if fixture parentdeath > /stale.log 2>&1; then fail reused-stale-deployment; fi
 # Simulate the ultimate service supervisor reclaiming the dead manager's tree.
 echo 1 > /sys/fs/cgroup/delegated/wros-cell/cgroup.kill
@@ -195,9 +220,29 @@ configure stop true 2 134217728 'recommendations="permissions.xml"'
 printf '<recommendations><interface name="abi" expose="deny"/></recommendations>\n' > /bundle/permissions.xml
 cp /bundle/current.xml /bundle/original.xml
 set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/journal
+# Independently approved stale state must not reclaim a live manager's tree.
+# Both approvals are created while the deployment is inactive; their state
+# directories differ. This checks admission order, not just competing spawn.
+mkdir /state/second-journal; chmod 700 /state/second-journal
+/bin/wros-deployer authorize /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/second-journal --accept-recommendations --allow-unsigned "stop=$digest" > /second-approval.log 2>&1 || { cat /second-approval.log; fail second-approval; }
+mkdir /state/changed-journal; chmod 700 /state/changed-journal
+/bin/busybox sed 's/uid="10001" gid="10001"/uid="12001" gid="12001"/' /bundle/current.xml > /bundle/changed-identity.xml
+/bin/wros-deployer authorize /bundle/changed-identity.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/changed-journal --accept-recommendations --allow-unsigned "stop=$digest" > /changed-approval.log 2>&1 || { cat /changed-approval.log; fail changed-approval; }
 /bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "stop=$digest" > /durable-first.log 2>&1 & manager=$!
 wait_started /durable-first.log 1
 sleep .1
+before_pids=$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)
+before_approval=$(sha256sum /state/second-journal/approval)
+if /bin/wros-deployer resume /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/second-journal > /second-resume.log 2>&1; then fail second-manager-resumed; fi
+grep -q 'host identity is busy' /second-resume.log || { cat /second-resume.log; fail wrong-second-manager-rejection; }
+test "$before_pids" = "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)" || fail competing-resume-killed-original
+test "$before_approval" = "$(sha256sum /state/second-journal/approval)" || fail competing-resume-consumed-approval
+before_approval=$(sha256sum /state/changed-journal/approval)
+if /bin/wros-deployer resume /bundle/changed-identity.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/changed-journal > /changed-resume.log 2>&1; then fail changed-manager-resumed; fi
+grep -q 'host identity is busy' /changed-resume.log || { cat /changed-resume.log; fail wrong-changed-manager-rejection; }
+test "$before_pids" = "$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)" || fail changed-identities-bypassed-deployment-lock
+test "$before_approval" = "$(sha256sum /state/changed-journal/approval)" || fail changed-resume-consumed-approval
+pass identity-reservation-precedes-recovery-and-approval-consumption
 if /bin/wros-deployer resume "$@" > /durable-lock.log 2>&1; then fail accepted-duplicate-state-owner; fi
 grep -q 'already owned by another supervisor' /durable-lock.log || { cat /durable-lock.log; fail wrong-lock-denial; }
 pass state-lock-refuses-second-manager

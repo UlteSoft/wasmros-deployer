@@ -1,5 +1,9 @@
 # 独立服务监督
 
+共享宿主的部署器也必须共享[宿主身份登记](host-identities.md)。登记在清理旧组前
+排除 UID/GID 冲突及同一部署的并发管理者。仅有 namespace 或 cgroup 隔离并不能
+证明宿主身份独占。
+
 `wros-deployer service` 生成 systemd 服务文件，不安装或启动宿主服务。`authorize` 先完成验签和逐项人工审核，将一次首次启动授权保存到独立的私有状态目录。服务随后执行 `resume`，在创建 VM 前持久消耗这次授权。首次启动授权不会自动授予崩溃重启权。
 
 需要 Linux cgroup v2。生成的服务使用 `DelegateSubgroup=manager`，要求 systemd 254 或更高版本。目前已在 QEMU 的 x86_64 Linux 来宾中运行真实 systemd 257。五个 Linux 用户态 ABI 的测试不能代替每个平台的内核与服务监督测试。

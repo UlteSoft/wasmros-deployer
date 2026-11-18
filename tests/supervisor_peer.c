@@ -43,6 +43,8 @@ int main(int argc,char **argv) {
     if(argc>2&&!strcmp(argv[1],"--blocked-supervisor"))return blocked_supervisor(argv+2);
     setvbuf(stdout,NULL,_IONBF,0);
     if(argc<3 || getuid()==0 || getgid()==0 || prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)!=1) return 71;
+    errno=0;int ownership=open("/run/wros-ownership",O_RDONLY|O_DIRECTORY);
+    if(ownership>=0||errno!=EACCES)return 102;
     if(prctl(PR_GET_SECCOMP,0,0,0,0)!=2)return 95;
     errno=0;if(unshare(0)!=-1||errno!=EPERM)return 96;
     errno=0;if(setns(-1,0)!=-1||errno!=EPERM)return 97;

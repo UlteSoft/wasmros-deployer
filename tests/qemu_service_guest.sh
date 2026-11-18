@@ -6,14 +6,16 @@ fail() { echo "QEMU_SERVICE_FAIL $*"; journalctl --no-pager -n 80 -o cat || true
 trap 'fail unexpected-command-failure' EXIT
 pass() { echo "CASE $1 PASS"; }
 echo "SERVICE_SYSTEMD $(systemctl --version | head -1)"
+case_uid=20000
 
 configure() {
     caseid=$1; vmid=$2; crash=$3; limit=$4; image=${5:-unsigned.wasm}; runtime=${6:-/bin/supervisor-peer}
+    case_uid=$((case_uid+1))
     digest=$(sha256sum /bundle/$image); digest=${digest%% *}
     unit=wros-$caseid.service; cg=/sys/fs/cgroup/system.slice/$unit
     manifest=/bundle/$caseid.xml; state=/state/$caseid; program=/bin/wros-deployer
     mkdir -p /state/$caseid; chmod 700 /state/$caseid
-    printf '<deployment id="%s"><supervisor memory-bytes="268435456" pids="64" cpu-micros="50000" cpus="0" memory-nodes="0"/><vm id="%s" module="%s" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="10001" gid="10001" restart-on-crash="%s" restart-limit="%s" restart-delay-ms="100" cpus="1" memory-nodes="1"/></deployment>\n' "$caseid" "$vmid" "$image" "$digest" "$crash" "$limit" > /bundle/$caseid.xml
+    printf '<deployment id="%s"><supervisor memory-bytes="268435456" pids="64" cpu-micros="50000" cpus="0" memory-nodes="0"/><vm id="%s" module="%s" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="%s" gid="%s" restart-on-crash="%s" restart-limit="%s" restart-delay-ms="100" cpus="1" memory-nodes="1"/></deployment>\n' "$caseid" "$vmid" "$image" "$digest" "$case_uid" "$case_uid" "$crash" "$limit" > /bundle/$caseid.xml
 }
 command() {
     "$program" "$1" "$manifest" --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --runtime "$runtime" --state-directory "$state" --supervisor-cgroup "$cg" ${2:+"$2"} ${3:+"$3"} ${4:+"$4"}
