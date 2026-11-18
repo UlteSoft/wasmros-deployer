@@ -10,9 +10,25 @@ use std::path::{Component, Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_XML: u64 = 256 * 1024;
+/// Execution strategy for a reviewed application VM. Both engines enforce
+/// the same guest permissions. This setting grants no compiler threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Aot,
+    Interpreter,
+}
+impl Engine {
+    pub fn argument(self) -> &'static str {
+        match self {
+            Self::Aot => "--runtime-aot",
+            Self::Interpreter => "--runtime-int",
+        }
+    }
+}
 #[derive(Debug)]
 pub struct Process {
     pub id: String,
+    pub engine: Engine,
     pub module: PathBuf,
     pub digest: String,
     pub policy: PathBuf,
@@ -242,6 +258,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 "sha256",
                 "policy",
                 "vm-policy",
+                "engine",
                 "recommendations",
                 "memory-bytes",
                 "pids",
@@ -312,6 +329,11 @@ pub fn deployment(s: &str) -> Result<Deployment> {
         }
         processes.push(Process {
             id: name.into(),
+            engine: match node.attribute("engine").unwrap_or("aot") {
+                "aot" => Engine::Aot,
+                "interpreter" => Engine::Interpreter,
+                _ => return Err("VM engine must be aot or interpreter".into()),
+            },
             module: path(attr(node, "module")?)?,
             digest: digest.into(),
             policy: path(attr(node, "policy")?)?,

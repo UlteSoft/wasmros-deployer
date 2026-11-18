@@ -11,6 +11,21 @@ fn zero_implicit_grants() {
     assert!(p.processes[0].recommendations.is_none())
 }
 #[test]
+fn reviewed_engine_uses_one_fixed_vm_argument() {
+    for (field, expected) in [
+        ("", "--runtime-aot"),
+        ("engine=\"aot\"", "--runtime-aot"),
+        ("engine=\"interpreter\"", "--runtime-int"),
+    ] {
+        let xml = config().replace("pids=", &format!("{field} pids="));
+        assert_eq!(deployment(&xml).unwrap().processes[0].engine.argument(), expected);
+    }
+    for invalid in ["", "auto", "--runtime-int", "aot --runtime-disable-memtag"] {
+        let xml = config().replace("pids=", &format!("engine=\"{invalid}\" pids="));
+        assert!(deployment(&xml).is_err());
+    }
+}
+#[test]
 fn reject_nested_or_unknown_and_escaping_paths() {
     for bad in [
         config().replace("main.wasm", "../other"),

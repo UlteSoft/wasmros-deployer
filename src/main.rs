@@ -327,6 +327,7 @@ fn run() -> Result<()> {
             }
         };
         println!("INFO VM {:?}, module {:?}, SHA256 {}, signature policy {:?}, VM policy {:?}, memory limit {} bytes, task limit {}",vm.id,vm.module,vm.digest,vm.policy,vm.vm_policy,vm.memory_bytes,vm.pids);
+        println!("INFO VM {:?} execution engine {:?}", vm.id, vm.engine);
         println!("INFO VM kernel device policy: null read/write; zero/random/urandom read only; other device opens and all mknod denied. This grants no guest imports or paths.");
         println!("INFO Recommendations {:?}, cold start at boot {}, authorized crash restart {}. Motion requires fresh safety confirmation and operator approval.",vm.recommendations,vm.boot_start,vm.crash_restart);
         println!("INFO Guest identity {:?}, CPU budget {} microseconds per 100000 microseconds, at most {} crash restarts, restart delay {} milliseconds. New network, IPC, UTS, mount and cgroup namespaces; private read-only /tmp image; no core files; at most 256 open descriptors.",vm.identity,vm.cpu_micros,vm.restart_limit,vm.restart_delay_ms);
@@ -414,6 +415,7 @@ fn run() -> Result<()> {
         let mut argv = vec![
             "--wasm-set-main-module-name".into(),
             vm.id.clone(),
+            vm.engine.argument().into(),
             "--ros-scene-create".into(),
             vm.id.clone(),
             "--ros-scene-bind".into(),

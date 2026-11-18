@@ -53,7 +53,15 @@ def main():
         p.add_argument("--"+name,type=Path,required=True)
     p.add_argument('--bios',type=Path,required=True)
     p.add_argument('--firmware-directory',type=Path,required=True)
+    p.add_argument('--sdk-engine', choices=('aot', 'interpreter'), default='aot')
+    p.add_argument('--signed-sdk-module', type=Path,
+                   help='SDK application signed with the fixture authority and module ID sdk')
+    p.add_argument('--wat2wasm', type=Path, default=Path('/usr/bin/wat2wasm'))
+    p.add_argument('--sdk-memory-bytes', type=int, default=256 << 20,
+                   help='Guest cgroup limit for the SDK application under test (default 256 MiB)')
     args=p.parse_args()
+    if not (1 << 20) <= args.sdk_memory_bytes <= (2 << 30):
+        p.error('choose an SDK memory budget between 1 MiB and 2 GiB for this 4 GiB test guest')
     group=Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
     assert Path('/proc/self/cgroup').read_text().strip()=='0::/'+str(group.relative_to('/sys/fs/cgroup'))
     assert (group/'memory.max').read_text().strip()=='68719476736'
@@ -85,6 +93,17 @@ def main():
     for name in ('body.wasm','unsigned.wasm'):
         copy(args.admission_fixture/'bundle'/name,'/bundle/'+name,0o644)
     copy(args.sdk_module,'/bundle/sdk.wasm',0o644)
+    if args.signed_sdk_module:
+        copy(args.signed_sdk_module,'/bundle/sdk.signed.wasm',0o644)
+        binding=json.loads((args.admission_fixture/'sdk-input.json').read_bytes())
+        if (digest(root/'bundle/sdk.wasm') != binding['sha256'] or
+                digest(root/'bundle/sdk.signed.wasm') != binding['signed_sha256']):
+            raise ValueError('guest inputs differ from the signed SDK fixture')
+    denial_source=source/'support/abi_denied.wat'
+    denial_compile=[str(args.wat2wasm.resolve()),str(denial_source),'-o',str(root/'bundle/abi-denied.wasm')]
+    subprocess.run(denial_compile,check=True,timeout=15)
+    (root/'bundle/sdk-memory-bytes').write_text(str(args.sdk_memory_bytes)+'\n')
+    (root/'bundle/sdk-engine').write_text(args.sdk_engine+'\n')
     (root/'bundle/loop.wasm').write_bytes(bytes.fromhex('0061736d0100000001040160000003020100070a01065f737461727400000a0901070003400c000b0b'))
     policy=(args.admission_fixture/'policies/body.policy').read_text()
     trust=next(line.split('=',1)[1] for line in policy.splitlines() if line.startswith('trust_root='))
@@ -99,14 +118,30 @@ def main():
           '-kernel',str(args.kernel),'-initrd',str(archive),'-append',
           'console=ttyS0 quiet panic=-1 rdinit=/init cgroup_no_v1=all']
     result={'complete':False,'scope':'x86_64 disposable kernel, no physical robot or systemd recovery qualification',
-            'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',Path(__file__)]}}
-    receipt=args.output/'results.json';receipt.write_text(json.dumps(result,indent=2))
+            'sdk_memory_bytes':args.sdk_memory_bytes,'sdk_engine':args.sdk_engine,'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',Path(__file__)]}}
+    receipt=args.output/'results.json'
+    result['denial_compile']=denial_compile
+    for path in (denial_source,args.wat2wasm.resolve()):
+        result['inputs'][str(path)]=digest(path)
+    if args.signed_sdk_module:
+        path=args.signed_sdk_module.resolve()
+        result['inputs'][str(path)]=digest(path)
+    result['signed_sdk_requested']=args.signed_sdk_module is not None
+    receipt.write_text(json.dumps(result,indent=2))
     start=time.monotonic()
     with (args.output/'serial.log').open('wb') as log:
-        run=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=240)
+        try:
+            code=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=240).returncode
+        except subprocess.TimeoutExpired:
+            code=None
+            result['timeout_seconds']=240
     text=(args.output/'serial.log').read_text(errors='replace')
-    result.update(exit=run.returncode,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    result['complete']=run.returncode==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text and len(result['cases'])==37
+    result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
+    expected=39+int(result['signed_sdk_requested'])
+    signed_case='signed-sdk-verification-at-deployer-and-vm' in result['cases']
+    result['complete']=(code==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text
+                        and len(set(result['cases']))==expected and len(result['cases'])==expected
+                        and signed_case==result['signed_sdk_requested'])
     receipt.write_text(json.dumps(result,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('argv','inputs','compile')},indent=2))
     assert result['complete'],text[-10000:]

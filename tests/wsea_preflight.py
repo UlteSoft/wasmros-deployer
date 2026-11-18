@@ -14,7 +14,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for option in ("deployer", "cosign", "vm", "vm-source", "output"):
         parser.add_argument("--" + option, type=Path, required=True)
+    parser.add_argument("--sdk-module", type=Path,
+                        help="Sign a compiled SDK application with the disposable test authority for a full-kernel run.")
+    parser.add_argument("--sdk-source", type=Path, help="Trusted SDK checkout for the core Wasm import reader.")
     args = parser.parse_args()
+    if bool(args.sdk_module) != bool(args.sdk_source):
+        parser.error("--sdk-module and --sdk-source must be supplied together")
     os.umask(0o077)
     args.output = args.output.resolve()
     args.output.mkdir(mode=0o700, exist_ok=False)
@@ -55,6 +60,37 @@ def main():
                    "--certificate", ca["certificate"], "--crl", ca["crl"], "--module-id", "body",
                    "--module-version", "1", "--algorithm", "Ed25519", "--not-before", stamp(-60),
                    "--not-after", stamp(3600), "--output", signed], True)
+    if args.sdk_module is not None:
+        reader_path = args.sdk_source.resolve() / "install/imports.py"
+        spec = importlib.util.spec_from_file_location("wros_sdk_imports", reader_path)
+        reader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reader)
+        snapshot = out / "sdk-input.wasm"
+        with args.sdk_module.open("rb") as f:
+            data = f.read((128 << 20) + 1)
+        expected = [{"module": "uwvm_ros_v2", "name": "abi", "kind": 0, "params": [], "results": ["i32"]}]
+        if len(data) > 128 << 20 or reader.inspect(data) != expected:
+            raise ValueError("SDK test authority requires exactly uwvm_ros_v2.abi () -> i32")
+        snapshot.write_bytes(data)
+        sdk_input = {
+            "sha256": hashlib.sha256(data).hexdigest(), "imports": expected,
+            "reader_sha256": hashlib.sha256(reader_path.read_bytes()).hexdigest(),
+            "wsea_capabilities": 32,
+        }
+        sdk_policy = policies / "sdk.policy"
+        sdk_signed = bundle / "sdk.signed.wasm"
+        check("sdk-policy", [args.cosign, "wasm", "secure", "policy-init", "--output", sdk_policy,
+                             "--state-dir", out / "sdk-state", "--trust-root", ca["root"],
+                             "--certificate", ca["certificate"], "--module-id", "sdk", "--algorithms", "Ed25519",
+                             "--capabilities", "32"], True)
+        check("sdk-sign", [args.cosign, "wasm", "secure", "sign", snapshot, "--policy", sdk_policy,
+                           "--key", ca["key"], "--certificate", ca["certificate"], "--crl", ca["crl"],
+                           "--module-id", "sdk", "--module-version", "1", "--algorithm", "Ed25519",
+                           "--capabilities", "32", "--not-before", stamp(-60), "--not-after", stamp(3600),
+                           "--output", sdk_signed], True)
+        check("sdk-verify", [args.cosign, "wasm", "secure", "verify", sdk_signed, "--policy", sdk_policy], True)
+        sdk_input["signed_sha256"] = hashlib.sha256(sdk_signed.read_bytes()).hexdigest()
+        (out / "sdk-input.json").write_text(json.dumps(sdk_input, indent=2))
     deployment = bundle / "deployment.xml"
 
     def configure(file, digest=None):

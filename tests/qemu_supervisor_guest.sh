@@ -185,13 +185,58 @@ grep -q 'belongs to another deployment or has an invalid record' /uid-stale.log 
 pass exited-deployer-does-not-transfer-identity
 
 sdkdigest=$(sha256sum /bundle/sdk.wasm); sdkdigest=${sdkdigest%% *}
-printf '<deployment id="cell"><vm id="sdk" module="sdk.wasm" sha256="%s" policy="body.policy" recommendations="permissions.xml" memory-bytes="268435456" pids="16" uid="10001" gid="10001"/></deployment>\n' "$sdkdigest" > /bundle/current.xml
+sdk_memory=$(cat /bundle/sdk-memory-bytes)
+sdk_engine=$(cat /bundle/sdk-engine)
+parent_limit=$(cat /sys/fs/cgroup/delegated/memory.max)
+if [ "$sdk_memory" -gt "$parent_limit" ]; then
+    echo "$sdk_memory" > /sys/fs/cgroup/delegated/memory.max || fail sdk-parent-budget
+fi
+select_sdk() {
+    printf '<deployment id="cell"><vm id="sdk" module="%s" sha256="%s" policy="body.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$1" "$2" "$sdk_memory" "$sdk_engine" > /bundle/current.xml
+}
+select_sdk sdk.wasm "$sdkdigest"
 printf '<recommendations><interface name="abi" expose="allow"/></recommendations>\n' > /bundle/permissions.xml
 base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-allow.log 2>&1 || { cat /sdk-allow.log; fail sdk-allowed; }
 empty; pass sdk-compiled-ros-interface-allowed
 printf '<recommendations><interface name="abi" expose="deny"/></recommendations>\n' > /bundle/permissions.xml
 if base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-deny.log 2>&1; then fail sdk-denied; fi
+grep -q 'INFO VM "sdk" resource events memory: .*oom_kill 0' /sdk-deny.log || { cat /sdk-deny.log; fail sdk-denial-resource-failure; }
 empty; pass sdk-compiled-ros-interface-denied
+
+probedigest=$(sha256sum /bundle/abi-denied.wasm); probedigest=${probedigest%% *}
+select_sdk abi-denied.wasm "$probedigest"
+base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$probedigest" > /sdk-status.log 2>&1 || { cat /sdk-status.log; fail wrong-denied-abi-status; }
+empty; pass explicit-abi-denial-returns-permission-code
+
+select_sdk sdk.wasm "$sdkdigest"
+printf '<recommendations/>\n' > /bundle/permissions.xml
+if base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-hidden.log 2>&1; then fail sdk-hidden; fi
+grep -Fq 'ROS scene interface is hidden' /sdk-hidden.log || { cat /sdk-hidden.log; fail wrong-sdk-hidden-diagnostic; }
+empty; pass sdk-hidden-import-rejected-before-entry
+
+if test -f /bundle/sdk.signed.wasm; then
+    mkdir /state/sdk-admission /state/sdk-vm
+    chmod 700 /state/sdk-admission /state/sdk-vm
+    for role in admission vm; do
+        /bin/cosign wasm secure policy-init --output "/trust/sdk-$role.policy" --state-dir "/state/sdk-$role" --trust-root /trust/root.pem --certificate /trust/signer.pem --module-id sdk --algorithms Ed25519 --capabilities 32
+        chmod 644 "/trust/sdk-$role.policy"
+        if grep -Fq 'sdk|1|' "/state/sdk-$role/state"; then fail preexisting-sdk-verification; fi
+    done
+    admission_state_before=$(sha256sum /state/sdk-admission/state)
+    chown -R 10001:10001 /state/sdk-vm
+    signed_sdk=$(sha256sum /bundle/sdk.signed.wasm); signed_sdk=${signed_sdk%% *}
+    printf '<deployment id="cell"><vm id="sdk" module="sdk.signed.wasm" sha256="%s" policy="sdk-admission.policy" vm-policy="sdk-vm.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$signed_sdk" "$sdk_memory" "$sdk_engine" > /bundle/current.xml
+    printf '<recommendations><interface name="abi" expose="allow"/></recommendations>\n' > /bundle/permissions.xml
+    base --runtime /bin/uwvm2-ros > /sdk-signatures.log 2>&1 || { cat /sdk-signatures.log; fail signed-sdk; }
+    grep -Fq 'WSEA policy and signature verified for VM "sdk"' /sdk-signatures.log || fail missing-deployer-sdk-verification
+    grep -Fq '"--secure", "module", "/tmp/wros-admitted.wasm", "/trust/sdk-vm.policy"' /sdk-signatures.log || fail missing-vm-sdk-verification
+    test "$(sha256sum /state/sdk-admission/state)" = "$admission_state_before" || fail sdk-verifier-mutated-admission-state
+    grep -Fq 'sdk|1|' /state/sdk-vm/state || fail missing-vm-sdk-rollback-record
+    cat /sdk-signatures.log
+    empty; pass signed-sdk-verification-at-deployer-and-vm
+fi
+
+echo "$parent_limit" > /sys/fs/cgroup/delegated/memory.max || fail sdk-restore-parent-budget
 
 configure parentdeath true 2 134217728
 fixture parentdeath > /death.log 2>&1 & management=$!
@@ -310,7 +355,7 @@ grep -q 'exclusive owner and private' /durable-hardlink.log || fail wrong-hardli
 rm /state/journal/alias
 empty; pass state-approval-hardlink-refused
 
-for log in /normal.log /placement*.log /crash.log /restart.log /orphan.log /pids.log /memory.log /stop.log /flood.log /backpressure.log /signed.log /multiple.log /sdk-allow.log /sdk-deny.log /death.log /stale.log /durable*.log; do
+for log in /normal.log /placement*.log /crash.log /restart.log /orphan.log /pids.log /memory.log /stop.log /flood.log /backpressure.log /signed.log /multiple.log /sdk-allow.log /sdk-deny.log /sdk-status.log /sdk-hidden.log /death.log /stale.log /durable*.log; do
     echo "AUDIT_LOG $log"; cat "$log"
 done
 
