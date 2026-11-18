@@ -308,6 +308,7 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
             if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
                 return Err(fail());
             }
+            crate::containment::pin_namespaces()?;
             if libc::syscall(
                 libc::SYS_close_range,
                 3u32,

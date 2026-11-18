@@ -12,7 +12,10 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <linux/mempolicy.h>
+#include <pthread.h>
 #include <unistd.h>
+
+static void *thread_probe(void *value) { return value; }
 
 static int blocked_supervisor(char **argv) {
     int channel[2];if(pipe2(channel,O_CLOEXEC)<0||fcntl(channel[1],F_SETPIPE_SZ,4096)<0)return 82;
@@ -40,6 +43,15 @@ int main(int argc,char **argv) {
     if(argc>2&&!strcmp(argv[1],"--blocked-supervisor"))return blocked_supervisor(argv+2);
     setvbuf(stdout,NULL,_IONBF,0);
     if(argc<3 || getuid()==0 || getgid()==0 || prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)!=1) return 71;
+    if(prctl(PR_GET_SECCOMP,0,0,0,0)!=2)return 95;
+    errno=0;if(unshare(0)!=-1||errno!=EPERM)return 96;
+    errno=0;if(setns(-1,0)!=-1||errno!=EPERM)return 97;
+    errno=0;if(syscall(SYS_clone3,NULL,0)!=-1||errno!=ENOSYS)return 98;
+    errno=0;long cloned=syscall(SYS_clone,CLONE_NEWUSER|SIGCHLD,NULL,NULL,NULL,0);
+    if(cloned==0)_exit(99);
+    if(cloned!=-1||errno!=EPERM)return 100;
+    pthread_t thread;void *result=NULL;
+    if(pthread_create(&thread,NULL,thread_probe,&result)!=0||pthread_join(thread,&result)!=0||result!=&result)return 101;
     char bytes[512]={0};
     int f=open("/proc/self/cgroup",O_RDONLY);if(f<0)return 72;
     ssize_t n=read(f,bytes,sizeof bytes-1);close(f);
@@ -53,7 +65,7 @@ int main(int argc,char **argv) {
     f=open(argv[argc-1],O_WRONLY);
     if(f<0){if(errno!=EROFS)return 74;}
     else{errno=0;n=write(f,"X",1);close(f);if(n!=-1 || errno!=EPERM)return 75;}
-    printf("PEER confined uid=%u gid=%u sealed=1\n",getuid(),getgid());
+    printf("PEER confined uid=%u gid=%u sealed=1 namespace-pinned=1 pthread=1\n",getuid(),getgid());
     const char *mode=argv[2];
     if(!strcmp(mode,"placement")||!strcmp(mode,"placementcrash")){
         cpu_set_t set;CPU_ZERO(&set);

@@ -19,6 +19,25 @@ The independent service manager owns the root and all descendant processes:
 
 The deployer checks its current kernel membership before any verifier or VM starts. It refuses an unrelated cgroup, a missing controller, a populated root, an unexpected child, insufficient outer limits or a different existing workload budget. It only configures children of the exact delegated root. It never moves itself to another cgroup, changes an ancestor or delegates cgroup handles to a guest.
 
+After creating the reviewed namespaces and dropping credentials, the deployer
+installs an irreversible seccomp filter before executing the VM. `setns`,
+`unshare` and namespace-creating legacy `clone` calls return `EPERM`.
+`clone3` returns `ENOSYS` so libraries can use ordinary legacy thread creation;
+a library that requires `clone3` without a fallback is incompatible with this
+policy. Ordinary threads and child processes remain subject to the task budget.
+Unexpected syscall ABIs are killed. There is no switch that silently disables
+this policy when seccomp is missing. The policy pins established namespace
+membership; it is not a complete syscall or filesystem sandbox.
+
+This boundary is necessary when a provisioner attests the clock domain of a
+local encrypted attachment. A cgroup does not prevent time-namespace changes.
+The VM accepts only kernel namespace evidence plus the existing exact peer
+credentials, process-lifetime pin and mutual TLS binding. The test-only
+`tests/qemu_driver_identity.py` exercises these checks under different non-root
+identities. Native driver orchestration is still refused by the production
+deployment command until its remaining lifecycle and ownership requirements
+are implemented and qualified.
+
 The XML must explicitly budget the manager:
 
 ```xml
