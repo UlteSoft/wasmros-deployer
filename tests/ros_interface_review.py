@@ -16,9 +16,13 @@ def digest(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('sdk', 'toolchain', 'sysroots', 'runtime', 'output'):
+    for name in ('sdk', 'runtime', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--toolchain', type=Path, help='Override the installed site toolchain together with --sysroots')
+    parser.add_argument('--sysroots', type=Path)
     args = parser.parse_args()
+    if bool(args.toolchain) != bool(args.sysroots):
+        parser.error('supply both --toolchain and --sysroots for an explicit qualified build')
     group = Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
     if (Path('/proc/self/cgroup').read_text().strip() != '0::/'+str(group.relative_to('/sys/fs/cgroup'))
             or (group/'memory.max').read_text().strip() != '68719476736'
@@ -53,9 +57,10 @@ def main():
     source.write_text('\n'.join(lines)+'\n')
     ET.indent(xml, space='  ')
     policy.write_bytes(ET.tostring(xml, encoding='utf-8')+b'\n')
-    command = [str(sdk/'bin/wrc'), '--target','wasm32','--toolchain',str(args.toolchain.resolve()),
-               '--sysroots',str(args.sysroots.resolve()),'-O3','-g','--reactor','--export','_start',
-               '--build-receipt',str(source),'-o',str(wasm)]
+    selection = [] if args.toolchain is None else [
+        '--toolchain', str(args.toolchain.resolve()), '--sysroots', str(args.sysroots.resolve())]
+    command = [str(sdk/'bin/wrc'), *selection, '--target', 'wasm32', '-O3', '-g', '--reactor',
+               '--export', '_start', '--build-receipt', str(source), '-o', str(wasm)]
     subprocess.run(command, cwd=out, check=True, timeout=180)
     receipt = Path(str(wasm)+'.wros-build.json')
     build = json.loads(receipt.read_bytes())

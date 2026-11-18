@@ -154,3 +154,15 @@ A Preview 1 clock read requires two independent approvals in that VM's recommend
 ```
 
 For target wasm64, use the SDK ABI spelling `wasip1.clock_time_get_wasm64`. Clock resolutions use `wasip1.clock_res_get` or `wasip1.clock_res_get_wasm64`. Read grants are `realtime-clock`, `monotonic-clock`, `process-clock`, `thread-clock` and the corresponding four `-resolution` names. The review editor uses keys such as `wasip1.clock.monotonic-clock`. An omitted interface is hidden. An explicitly denied interface links and returns a capability error. Each allowed interface still requires a grant for the selected source and operation. The deployer emits only per-VM options. Existing ROS interface recommendations retain their original names. A protected approval persists the exact decisions for cold restart. Clock approval does not grant timers, files or network access.
+
+## Run the SDK, VM and deployer together
+
+Use a C development installation with its site profile. This fixture compiles a guest against the installed headers, compares the SDK signatures with the deployment catalog, signs the guest using a disposable authority, and boots the selected engine inside a private x86_64 Linux guest. The serial log contains an individual decision for every ROS interface. Supply a fresh output directory and a separate private directory for the test authority. Signer keys stay on the host. Invoke the test inside the qualification cgroup.
+
+```sh
+/usr/bin/python3 tests/sdk_vm_deployment.py \
+  --sdk "$INSTALLED_SDK" --vm "$VM" --vm-source "$VM_SOURCE" \
+  --deployer "$DEPLOYER" --cosign "$COSIGN" --engine aot \
+  --kernel "$KERNEL" --qemu "$QEMU" --bios "$BIOS" --firmware-directory "$FIRMWARE" \
+  --output "$DEPLOYER_SOURCE/.tmp/site-aot" --authority-directory "$VM_SOURCE/.tmp/site-test-keys"
+```

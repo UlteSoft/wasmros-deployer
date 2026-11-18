@@ -146,3 +146,15 @@ Preview 1 时钟读取需要分别批准导入函数及允许读取的时钟来�
 ```
 
 wasm64 目标使用 SDK 对应的 `wasip1.clock_time_get_wasm64`。读取分辨率使用 `wasip1.clock_res_get` 或 `wasip1.clock_res_get_wasm64`。时间读取权限包括 `realtime-clock`、`monotonic-clock`、`process-clock`、`thread-clock`，另有四个以 `-resolution` 结尾的分辨率读取权限。交互式审核使用 `wasip1.clock.monotonic-clock` 这样的键。省略接口时 VM 默认隐藏它。显式拒绝的接口可完成链接，调用返回权限错误。允许接口后仍需授予所选时钟来源和操作的权限。部署器只为该 VM 生成配置，原有 ROS 接口的推荐名称继续有效。受保护的审批记录保存每项决定，以便冷启动。时钟批准不会授予定时器、文件或网络访问权。
+
+## 联合测试 SDK、VM 与部署器
+
+使用已导入站点配置的 C 开发安装。测试先用安装的头文件编译程序，核对 SDK 与部署器的接口清单，再使用临时测试证书签名，并在独立的 x86_64 Linux 来宾中运行所选 VM 引擎。串口日志逐项列出 ROS 接口授权决定。为每次运行指定新的输出目录和独立的私有测试证书目录。签名私钥保留在宿主，测试在验收 cgroup 内执行。
+
+```sh
+/usr/bin/python3 tests/sdk_vm_deployment.py \
+  --sdk "$INSTALLED_SDK" --vm "$VM" --vm-source "$VM_SOURCE" \
+  --deployer "$DEPLOYER" --cosign "$COSIGN" --engine aot \
+  --kernel "$KERNEL" --qemu "$QEMU" --bios "$BIOS" --firmware-directory "$FIRMWARE" \
+  --output "$DEPLOYER_SOURCE/.tmp/site-aot" --authority-directory "$VM_SOURCE/.tmp/site-test-keys"
+```
