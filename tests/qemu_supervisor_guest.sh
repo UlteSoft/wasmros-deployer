@@ -125,6 +125,7 @@ empty; pass operator-stop-overrides-recovery
 configure flood false 0 134217728
 fixture flood > /flood.log 2>&1 || { tail -10 /flood.log; fail output-flood; }
 test "$(wc -c < /flood.log)" -lt 20000 || fail unbounded-diagnostic
+test "$(grep -c 'WARNING VM "flood" generation 1 diagnostic byte limit reached' /flood.log)" = 1 || fail diagnostic-loss-marker
 empty; pass bounded-diagnostic-flood
 
 configure floodstop false 0 134217728

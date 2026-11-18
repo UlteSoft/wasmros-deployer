@@ -88,7 +88,7 @@ struct Running {
     restarts: u32,
     next: Option<Instant>,
     failed: bool,
-    output: usize,
+    output: DiagnosticBudget,
     started: bool,
 }
 struct Session<'a> {
@@ -347,27 +347,47 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
     }
     Ok((child, pidfd))
 }
-fn output(child: &mut Child, id: &str, count: &mut usize, events: &Events) {
+/// Combined stdout and stderr disclosure limit for one admitted VM generation.
+#[derive(Default)]
+struct DiagnosticBudget {
+    retained: usize,
+    reported_loss: bool,
+}
+
+impl DiagnosticBudget {
+    fn admit(&mut self, read: usize) -> (usize, bool) {
+        const LIMIT: usize = 8192;
+        let keep = read.min(LIMIT - self.retained);
+        self.retained += keep;
+        let first_loss = keep < read && !self.reported_loss;
+        self.reported_loss |= first_loss;
+        (keep, first_loss)
+    }
+}
+
+fn output(child: &mut Child, id: &str, generation: u64, budget: &mut DiagnosticBudget, events: &Events) {
     let mut buffer = [0u8; 4096];
-    // Bounded work per VM per turn, even if a compromised VM floods stdout.
-    for pipe in [
-        child.stdout.as_mut().map(|v| v as &mut dyn Read),
-        child.stderr.as_mut().map(|v| v as &mut dyn Read),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    // Bound work per stream even while the other stream or another VM is busy.
+    for (stream, pipe) in [
+        ("stdout", child.stdout.as_mut().map(|v| v as &mut dyn Read)),
+        ("stderr", child.stderr.as_mut().map(|v| v as &mut dyn Read)),
+    ] {
+        let Some(pipe) = pipe else { continue };
         for _ in 0..4 {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let keep = n.min(8192usize.saturating_sub(*count));
+                    let (keep, first_loss) = budget.admit(n);
                     if keep > 0 {
                         events.send(format!(
-                            "INFO VM {id:?} diagnostic {:?}",
+                            "INFO VM {id:?} diagnostic generation {generation} {stream} {:?}",
                             String::from_utf8_lossy(&buffer[..keep])
                         ));
-                        *count += keep;
+                    }
+                    if first_loss {
+                        events.send(format!(
+                            "WARNING VM {id:?} generation {generation} diagnostic byte limit reached on {stream}; subsequent output omitted"
+                        ));
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -414,7 +434,7 @@ impl Session<'_> {
         slot.generation = generation;
         slot.started = true;
         slot.next = None;
-        slot.output = 0;
+        slot.output = DiagnosticBudget::default();
         Ok(())
     }
     fn shutdown(&mut self) -> Result<()> {
@@ -441,6 +461,7 @@ impl Session<'_> {
                     output(
                         child,
                         &self.launches[i].process.id,
+                        slot.generation,
                         &mut slot.output,
                         self.events,
                     );
@@ -551,7 +572,7 @@ fn supervise(
                 restarts: entry.map_or(0, |e| e.restarts),
                 next: None,
                 failed: false,
-                output: 0,
+                output: DiagnosticBudget::default(),
                 started: false,
             })
         })
@@ -584,12 +605,12 @@ fn supervise(
         for (i, launch) in launches.iter().enumerate() {
             let slot = &mut session.slots[i];
             if let Some(child) = &mut slot.child {
-                output(child, &launch.process.id, &mut slot.output, events);
+                output(child, &launch.process.id, slot.generation, &mut slot.output, events);
                 if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                     if let Some(journal) = &mut session.journal {
                         journal.exited(&launch.process.id, status.success())?;
                     }
-                    output(child, &launch.process.id, &mut slot.output, events);
+                    output(child, &launch.process.id, slot.generation, &mut slot.output, events);
                     events.send(format!(
                         "INFO VM {:?} generation {} exit {status}",
                         launch.process.id, slot.generation
@@ -645,5 +666,24 @@ fn supervise(
             };
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::DiagnosticBudget;
+
+    #[test]
+    fn loss_is_reported_once_on_the_first_omitted_byte() {
+        let mut budget = DiagnosticBudget::default();
+        assert_eq!(budget.admit(8191), (8191, false));
+        assert_eq!(budget.admit(1), (1, false));
+        assert_eq!(budget.admit(0), (0, false));
+        assert_eq!(budget.admit(1), (0, true));
+        assert_eq!(budget.admit(usize::MAX), (0, false));
+
+        let mut restarted = DiagnosticBudget::default();
+        assert_eq!(restarted.admit(8193), (8192, true));
+        assert_eq!(restarted.admit(23), (0, false));
     }
 }

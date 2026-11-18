@@ -110,3 +110,5 @@ A test shell supervisor exercises the same boundary in QEMU. It is not a shipped
 This service integration does not implement the strict-MVP recovery watchdog, native provider provisioning, live updates or complete device safety supervision. Physical safe-state confirmation and fresh operator confirmation remain necessary before motion. Fault injection and cross-ABI execution provide bounded evidence, not industrial safety certification.
 
 The service semantics follow the official [resource delegation](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html), [process termination](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html) and [restart configuration](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html) documentation.
+
+The supervisor keeps up to 8,192 bytes of combined stdout and stderr per VM generation. Each diagnostic includes the VM identity, generation and stream. When a read first exceeds that budget, the supervisor emits one warning and continues draining both pipes. Completeness of a VM audit cannot be inferred from a truncated diagnostic stream.
