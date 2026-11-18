@@ -9,3 +9,7 @@ __pycache__/
 *.pem
 *.key
 *.core
+# Public upstream PKCS#8 test vectors are part of the pinned crate checksum.
+!third-parties/cargo/ed25519/tests/examples/pkcs8-v1.pem
+!third-parties/cargo/ed25519/tests/examples/pkcs8-v2.pem
+!third-parties/cargo/ed25519/tests/examples/pubkey.pem

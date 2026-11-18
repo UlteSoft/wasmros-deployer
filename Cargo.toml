@@ -9,6 +9,13 @@ roxmltree = "=0.20.0"
 sha2 = "=0.10.9"
 libc = "=0.2.191"
 
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "zeroize"] }
+zeroize = { version = "=1.8.2", default-features = false }
+
+[[example]]
+name = "attachment-provisioner"
+path = "tests/support/attachment_provisioner.rs"
+
 [profile.release]
 opt-level = 3
 debug = 2
