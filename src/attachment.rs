@@ -434,7 +434,11 @@ pub fn deliver(
         }
         if !ready {
             let mut bytes = [0u8; 16];
-            let mut control = [0usize; 32];
+            // Admit the complete Linux SCM_MAX_FD set into bounded temporary
+            // storage, then close and reject it. This avoids depending on an
+            // emulator to close descriptors omitted by ancillary translation.
+            // The protocol never accepts even one descriptor in READY.
+            let mut control = [0usize; 1152 / std::mem::size_of::<usize>()];
             let mut iov = libc::iovec {
                 iov_base: bytes.as_mut_ptr().cast(),
                 iov_len: bytes.len(),
@@ -569,6 +573,108 @@ pub fn deliver(
 mod tests {
     use super::*;
     use std::os::unix::fs::FileExt;
+    #[test]
+    fn maximum_descriptor_injection_is_closed_and_denied() {
+        let [sender, receiver] = carrier().unwrap();
+        let [wake, wait] = carrier().unwrap();
+        let [endpoint, _other] = endpoints().unwrap();
+        // Prepare everything the child needs before fork; its branch only uses
+        // libc syscalls and stack storage, with no Rust allocator or test output.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let mut control = [0usize; 1152 / std::mem::size_of::<usize>()];
+            let files = [receiver.as_raw_fd(); 253];
+            unsafe {
+                libc::close(sender.as_raw_fd());
+                libc::close(wake.as_raw_fd());
+                let mut vector = libc::iovec {
+                    iov_base: READY.as_ptr().cast_mut().cast(),
+                    iov_len: READY.len(),
+                };
+                let mut message: libc::msghdr = std::mem::zeroed();
+                message.msg_iov = &mut vector;
+                message.msg_iovlen = 1;
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen =
+                    libc::CMSG_SPACE(std::mem::size_of_val(&files) as u32) as usize;
+                let c = libc::CMSG_FIRSTHDR(&message);
+                (*c).cmsg_level = libc::SOL_SOCKET;
+                (*c).cmsg_type = libc::SCM_RIGHTS;
+                (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&files) as u32) as usize;
+                std::ptr::copy_nonoverlapping(
+                    files.as_ptr().cast::<u8>(),
+                    libc::CMSG_DATA(c),
+                    std::mem::size_of_val(&files),
+                );
+                let n = libc::sendmsg(receiver.as_raw_fd(), &message, libc::MSG_NOSIGNAL);
+                let mut event = libc::pollfd {
+                    fd: wait.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                libc::poll(&mut event, 1, 5000);
+                libc::_exit(if n == READY.len() as isize { 0 } else { 1 });
+            }
+        }
+        drop(receiver);
+        drop(wait);
+        struct Reap(libc::pid_t);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    unsafe {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+        let mut reap = Reap(child);
+        let credentials = |pid| Credentials {
+            pid,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        };
+        // Isolate delivery's ancillary-data rejection and lifetime checks. The
+        // real Peer::pin namespace ioctl is exercised by the full-kernel VM
+        // harness; QEMU user emulation does not implement NS_GET_NSTYPE. Do not
+        // weaken that production check to make this component test pass.
+        let evidence = |pid| Peer {
+            credentials: credentials(pid),
+            lifetime: owned(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32).unwrap(),
+            clock: File::open(format!("/proc/{pid}/ns/time")).unwrap(),
+        };
+        let local = evidence(child as u32);
+        let remote = evidence(std::process::id());
+        let binding = Binding::fresh([1; 16], [2; 16], [3; 16], [4; 16], [5; 32]).unwrap();
+        let limits = Limits {
+            request_bytes: 32,
+            response_bytes: 32,
+            request_ns: 1000,
+            session_until_ns: monotonic_ns().unwrap() + 1_000_000_000,
+        };
+        let record = endpoint
+            .bootstrap(binding, limits, &local, &remote)
+            .unwrap();
+        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = count();
+        assert!(deliver(
+            &sender,
+            endpoint,
+            record,
+            &local,
+            &remote,
+            Duration::from_secs(1)
+        )
+        .is_err());
+        assert_eq!(count() + 3, before); // consumed endpoint, identity and record
+        drop(wake);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        reap.0 = 0;
+        assert_eq!(status, 0);
+    }
     #[test]
     fn reciprocal_keys_are_fresh_sealed_and_close_on_exec() {
         let pairs = [endpoints().unwrap(), endpoints().unwrap()];

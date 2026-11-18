@@ -19,6 +19,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('kernel','qemu','bios','firmware-directory','provisioner','peer','vm','module','output'):
         p.add_argument('--'+name,type=Path,required=True)
+    p.add_argument('--receiver-checks',type=Path,help='Also run the 19 native receiver boundary cases in the guest')
     a=p.parse_args()
     group=Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
     assert Path('/proc/self/cgroup').read_text().strip()=='0::/'+str(group.relative_to('/sys/fs/cgroup'))
@@ -35,6 +36,7 @@ def main():
         for lib in re.findall(r'(?:=>\s*)?(/[^\s]+)\s+\(',run.stdout):
             dst=root/lib.lstrip('/');dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(lib,dst);dst.chmod(0o755);inputs[lib]=digest(Path(lib))
     for src,dst in [(Path('/bin/busybox'),'/bin/busybox'),(a.provisioner,'/bin/provisioner'),(a.peer,'/bin/provider'),(a.vm,'/bin/uwvm2-ros')]:binary(src,dst)
+    if a.receiver_checks:binary(a.receiver_checks,'/bin/receiver-checks')
     for name in ('sh','mount','mkdir','poweroff','cat','sleep'):(root/'bin'/name).symlink_to('busybox')
     shutil.copyfile(a.module,root/'body.wasm');(root/'body.wasm').chmod(0o444);inputs[str(a.module.resolve())]=digest(a.module)
     modes=['success','wrong-key','wrong-binding','wrong-descriptor','bad-profile','bad-ready','peer-exit','unexpected-rights','bad-origin']
@@ -64,6 +66,7 @@ for name in vm provider; do
 done
 export WROS_TEST_CHILD_CGROUP_ROOT=/sys/fs/cgroup/attachments
 '''
+    if a.receiver_checks:init+='/bin/receiver-checks || fail\n'
     for mode in modes:init+=f'/bin/provisioner /bin/uwvm2-ros /bin/provider /body.wasm {mode} || fail\n'
     init+='''for name in vm provider; do
  test -z "$(cat /sys/fs/cgroup/attachments/$name/cgroup.procs)" || fail
@@ -82,7 +85,8 @@ poweroff -f
     with (a.output/'serial.log').open('wb') as log:run=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=180)
     text=(a.output/'serial.log').read_text(errors='replace')
     result.update(exit=run.returncode,seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text),events_after=(group/'memory.events').read_text(),inputs_unchanged=all(digest(Path(k))==v for k,v in inputs.items()))
-    result['complete']=run.returncode==0 and 'QEMU_ATTACHMENT_PASS' in text and 'QEMU_ATTACHMENT_FAIL' not in text and len(result['cases'])==len(modes) and result['inputs_unchanged'] and not re.search(r'oom(?:_kill|_group_kill)? [1-9]',text)
+    result['receiver_boundary_checks']=bool(a.receiver_checks)
+    result['complete']=run.returncode==0 and 'QEMU_ATTACHMENT_PASS' in text and 'QEMU_ATTACHMENT_FAIL' not in text and len(result['cases'])==len(modes)+(19 if a.receiver_checks else 0) and result['inputs_unchanged'] and not re.search(r'oom(?:_kill|_group_kill)? [1-9]',text)
     receipt.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps({k:v for k,v in result.items() if k not in ('inputs','argv','init')},indent=2));assert result['complete'],text[-5000:]
 
 

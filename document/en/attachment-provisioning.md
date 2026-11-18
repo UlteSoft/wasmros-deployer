@@ -46,13 +46,30 @@ ownership and lifecycle recovery are integrated. The executable under
    bootstrap record. There is a finite deadline, at most five seconds, and no
    retry with weaker authentication. This kernel-confined descriptor handoff is
    trust initialization, not an application plaintext service.
-8. The adapter checks the provisioner's credentials, exact descriptor count and
-   the VM repository's `provider_bootstrap::load` result, closes the courier, and
-   starts the existing bound mutual-TLS handshake. The record is not a grant.
+8. The adapter uses the VM repository's host-only
+   `provider_bootstrap_receiver.h`. Its `receive` operation sends readiness,
+   pins the provisioner with a pidfd, checks the kernel credentials and exact
+   descriptor count, and calls `provider_bootstrap::load`. It publishes the
+   descriptor bundle and record only after complete validation. The adapter
+   closes the courier and starts the existing bound mutual-TLS handshake. The record is not a grant.
    Readiness and successful TLS do not authorize any operation or prove a safe
    physical state. Both VM permissions and independent receiver admission remain
    mandatory. Close the original descriptors once their validated state has
    been consumed; the channel owns its required private duplicates.
+
+The receiver borrows its courier, preserves the descriptor's flags and options,
+and accepts a local timeout of 1–5,000,000,000 nanoseconds. It rejects an output
+bundle that already owns descriptors. Failed or truncated handoffs close every
+received descriptor, including excess SCM_RIGHTS entries. Both bootstrap ends
+use bounded ancillary storage covering the complete Linux maximum of 253
+descriptors, then explicitly close and reject all unrequested handles. They do
+not depend on a userspace emulator discarding truncated ancillary handles.
+The noncopyable
+`descriptors` bundle owns the four admitted objects; its accessors borrow them,
+and `reset()` closes them after channel initialization. The expected provisioner
+PID/UID/GID must come from trusted launch state. Reading that identity from the
+delivery itself would defeat authentication. This receiver performs no heap
+allocation and is used only in the separate adapter, not compiled into the VM.
 
 The current cryptographic profile is TLS 1.3 with exact Ed25519 raw-public-key
 pins, ephemeral X25519 and AES-128-GCM. The deployment/VM/scope/provider/session
@@ -102,7 +119,11 @@ successful delivery, wrong key, wrong session binding, descriptor substitution,
 unknown profile, malformed readiness, peer death, unexpected descriptor transfer
 and readiness from another process. It also checks parent descriptor counts.
 `tests/attachment_protocol_abis.py` executes the fixed decoder on five Linux ABIs
-and under ASan/UBSan. `tests/linux_abi.py` exercises the Rust key generation and
+and under ASan/UBSan. Its `--suite receiver` selects 19 kernel handoff cases,
+including credential impersonation, maximum-size descriptor injection, object substitution,
+missing seals, expired records, invalid courier configuration and bounded timeout.
+Those cases check actual descriptor counts and unchanged output after refusal.
+`tests/linux_abi.py` exercises the Rust key generation and
 existing deployer contracts on those ABIs.
 
 `tests/qemu_attachment_provisioning.py` repeats real-VM attachment cases with
@@ -111,6 +132,13 @@ cgroups in an offline disposable kernel. The guest has no physical device, host
 disk or shared-folder access. All test work remains inside the host's existing
 64 GiB zero-swap cgroup. These tests do not qualify arbitrary vendor binaries,
 physical stop behavior, device exclusivity or industrial safety certification.
+Pass `--receiver-checks` with the native receiver boundary fixture to additionally
+run its 19 cases inside that kernel. The Rust contract suite separately verifies
+that all 253 injected descriptors in a readiness packet are closed on rejection.
+That component test supplies controlled clock evidence while exercising real
+pidfds and descriptor transfer. Namespace-type admission remains a separate
+full-kernel test: the user-mode emulator's missing namespace ioctl is rejected
+by production code, never treated as permission to skip validation.
 
 Provisioning runs once per admitted session. Key generation, memfd sealing and
 bootstrap parsing are not inserted into the per-message call path. Do not add
