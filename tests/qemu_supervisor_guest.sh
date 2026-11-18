@@ -195,11 +195,22 @@ fi
 select_sdk() {
     printf '<deployment id="cell"><vm id="sdk" module="%s" sha256="%s" policy="body.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$1" "$2" "$sdk_memory" "$sdk_engine" > /bundle/current.xml
 }
+sdk_rights() {
+    if test -f /bundle/reviewed-interfaces.xml; then
+        cp /bundle/reviewed-interfaces.xml /bundle/permissions.xml
+    else
+        printf '<recommendations><interface name="abi" expose="allow"/></recommendations>\n' > /bundle/permissions.xml
+    fi
+}
 select_sdk sdk.wasm "$sdkdigest"
-printf '<recommendations><interface name="abi" expose="allow"/></recommendations>\n' > /bundle/permissions.xml
+sdk_rights
 base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-allow.log 2>&1 || { cat /sdk-allow.log; fail sdk-allowed; }
 empty; pass sdk-compiled-ros-interface-allowed
-printf '<recommendations><interface name="abi" expose="deny"/></recommendations>\n' > /bundle/permissions.xml
+if test -f /bundle/reviewed-interfaces.xml; then
+    awk '{gsub(/expose="allow"/, "expose=\"deny\""); print}' /bundle/reviewed-interfaces.xml > /bundle/permissions.xml
+else
+    printf '<recommendations><interface name="abi" expose="deny"/></recommendations>\n' > /bundle/permissions.xml
+fi
 if base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-deny.log 2>&1; then fail sdk-denied; fi
 grep -q 'INFO VM "sdk" resource events memory: .*oom_kill 0' /sdk-deny.log || { cat /sdk-deny.log; fail sdk-denial-resource-failure; }
 empty; pass sdk-compiled-ros-interface-denied
@@ -227,7 +238,7 @@ if test -f /bundle/sdk.signed.wasm; then
     chown -R 10001:10001 /state/sdk-vm
     signed_sdk=$(sha256sum /bundle/sdk.signed.wasm); signed_sdk=${signed_sdk%% *}
     printf '<deployment id="cell"><vm id="sdk" module="sdk.signed.wasm" sha256="%s" policy="sdk-admission.policy" vm-policy="sdk-vm.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$signed_sdk" "$sdk_memory" "$sdk_engine" > /bundle/current.xml
-    printf '<recommendations><interface name="abi" expose="allow"/></recommendations>\n' > /bundle/permissions.xml
+    sdk_rights
     base --runtime /bin/uwvm2-ros > /sdk-signatures.log 2>&1 || { cat /sdk-signatures.log; fail signed-sdk; }
     grep -Fq 'WSEA policy and signature verified for VM "sdk"' /sdk-signatures.log || fail missing-deployer-sdk-verification
     grep -Fq '"--secure", "module", "/tmp/wros-admitted.wasm", "/trust/sdk-vm.policy"' /sdk-signatures.log || fail missing-vm-sdk-verification
@@ -235,6 +246,14 @@ if test -f /bundle/sdk.signed.wasm; then
     grep -Fq 'sdk|1|' /state/sdk-vm/state || fail missing-vm-sdk-rollback-record
     cat /sdk-signatures.log
     empty; pass signed-sdk-verification-at-deployer-and-vm
+    if test -f /bundle/ros-interfaces.txt; then
+        while read -r name; do
+            decision=deny
+            test "$name" != abi || decision=allow
+            grep -Fxq "INFO VM \"sdk\" ROSv2 interface $name: $decision" /sdk-signatures.log || fail missing-interface-review
+        done < /bundle/ros-interfaces.txt
+        pass signed-sdk-reviewed-every-ros-interface
+    fi
 fi
 
 if test -f /bundle/clock.signed.wasm; then

@@ -422,6 +422,9 @@ fn run() -> Result<()> {
             vm.id.clone(),
             vm.id.clone(),
         ];
+        if rights.is_empty() {
+            println!("INFO VM {:?} has no reviewed interface or resource permissions.", vm.id);
+        }
         let mut clock_policy = false;
         for (name, enabled) in rights {
             use manifest::Permission;
@@ -433,9 +436,12 @@ fn run() -> Result<()> {
             }
             let decision = if enabled { "allow" } else { "deny" };
             match permission {
-                Permission::RosInterface(name) => argv.extend([
-                    "--ros-scene-interface".into(), vm.id.clone(), name.into(), decision.into(),
-                ]),
+                Permission::RosInterface(name) => {
+                    println!("INFO VM {:?} ROSv2 interface {}: {}", vm.id, name, decision);
+                    argv.extend([
+                        "--ros-scene-interface".into(), vm.id.clone(), name.into(), decision.into(),
+                    ]);
+                }
                 Permission::ClockInterface(name) => {
                     println!("INFO VM {:?} WASIp1 clock interface {}: {}", vm.id, name, decision);
                     argv.extend(["--wasip1-single-interface".into(), vm.id.clone(), name.into(), decision.into()]);

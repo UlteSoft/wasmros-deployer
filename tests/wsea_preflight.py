@@ -17,7 +17,10 @@ def main():
     parser.add_argument("--sdk-module", type=Path,
                         help="Sign a compiled SDK application with the disposable test authority for a full-kernel run.")
     parser.add_argument("--sdk-source", type=Path, help="Trusted SDK checkout for the core Wasm import reader.")
+    parser.add_argument("--sdk-interface-probe", type=Path, help="Completed strict all-interface fixture for this test authority")
     args = parser.parse_args()
+    if args.sdk_interface_probe and not args.sdk_module:
+        parser.error("--sdk-interface-probe requires --sdk-module and --sdk-source")
     if bool(args.sdk_module) != bool(args.sdk_source):
         parser.error("--sdk-module and --sdk-source must be supplied together")
     os.umask(0o077)
@@ -69,8 +72,26 @@ def main():
         with args.sdk_module.open("rb") as f:
             data = f.read((128 << 20) + 1)
         expected = [{"module": "uwvm_ros_v2", "name": "abi", "kind": 0, "params": [], "results": ["i32"]}]
-        if len(data) > 128 << 20 or reader.inspect(data) != expected:
-            raise ValueError("SDK test authority requires exactly uwvm_ros_v2.abi () -> i32")
+        if args.sdk_interface_probe:
+            proof = json.loads((args.sdk_interface_probe/"results.json").read_bytes())
+            catalog = Path(__file__).resolve().parents[1]/"protocol/ros-interfaces.txt"
+            abi = (args.sdk_source.resolve()/"share/abi/ros.json").read_bytes()
+            schemas = json.loads(abi)
+            with args.vm.open("rb") as runtime:
+                vm_digest = hashlib.file_digest(runtime, "sha256").hexdigest()
+            if (not proof.get("complete") or proof["wasm"] != hashlib.sha256(data).hexdigest()
+                    or proof["vm"] != vm_digest
+                    or proof["catalog"] != hashlib.sha256(catalog.read_bytes()).hexdigest()
+                    or proof["sdk_abi"] != hashlib.sha256(abi).hexdigest()
+                    or schemas["module"] != "uwvm_ros_v2"):
+                raise ValueError("the reviewed ROSv2 probe inputs differ")
+            expected = [{"module":"uwvm_ros_v2","name":op["name"],"kind":0,
+                         "params":op["wasm_signature"]["parameters"],"results":op["wasm_signature"]["results"]}
+                        for op in schemas["operations"]]
+            if sorted(row["name"] for row in expected) != catalog.read_text().splitlines():
+                raise ValueError("the reviewed SDK and deployer interfaces differ")
+        if len(data) > 128 << 20 or sorted(reader.inspect(data), key=lambda r:r["name"]) != sorted(expected,key=lambda r:r["name"]):
+            raise ValueError("SDK test module differs from its required ROSv2 imports")
         snapshot.write_bytes(data)
         sdk_input = {
             "sha256": hashlib.sha256(data).hexdigest(), "imports": expected,

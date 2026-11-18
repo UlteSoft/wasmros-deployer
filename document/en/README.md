@@ -45,6 +45,8 @@ The deployer copies at most 256 MiB per submitted module, hashes the bytes it co
 
 For a specific local development image, `verify` accepts `--allow-unsigned ID=SHA256` or `--allow-invalid-signature ID=SHA256`. Each option applies to one VM and the complete uploaded file digest. A recognized rejection of the matching kind emits a warning and the preview omits secondary verification for that image. A valid signature retains both checks. Unknown verifier failures, missing trust, policy or revocation errors, and a changed upload digest still fail verification.
 
+The CLI prints one INFO line for each reviewed ROSv2 interface and its allow or deny decision. An empty review is shown explicitly. Interface exposure and permission to use a particular resource are separate decisions.
+
 ## Run reviewed VM processes
 
 The `run` command requires a root deployment supervisor and an independently provisioned cgroup v2 subtree. VM instances run as distinct non-root users. The operator reserves those OS users for WROS; the deployer additionally enforces [host-wide identity ownership](host-identities.md) across managers sharing the host registry. It does not allocate OS accounts or restrict unrelated privileged software. Runtime and verifier executables must be protected files outside the submitted bundle. Native driver declarations currently cause `run` to fail before launching any process.

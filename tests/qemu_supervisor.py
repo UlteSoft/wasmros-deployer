@@ -56,6 +56,7 @@ def main():
     p.add_argument('--sdk-engine', choices=('aot', 'interpreter'), default='aot')
     p.add_argument('--signed-sdk-module', type=Path,
                    help='SDK application signed with the fixture authority and module ID sdk')
+    p.add_argument('--sdk-interface-probe', type=Path, help='Strict SDK-built guest and individual ROSv2 decisions from ros_interface_review.py')
     p.add_argument('--clock-fixture', type=Path,
                    help='completed signed guest fixture from tests/clock_permissions.py')
     p.add_argument('--wat2wasm', type=Path, default=Path('/usr/bin/wat2wasm'))
@@ -113,6 +114,18 @@ def main():
                                   ('test-authority/pki/clock/signer.pem', '/trust/clock-signer.pem')]:
             copy(clock/name, destination, 0o644)
             clock_inputs[str(clock/name)] = digest(root/destination.lstrip('/'))
+    probe_inputs = {}
+    if args.sdk_interface_probe:
+        probe = args.sdk_interface_probe.resolve()
+        checked = json.loads((probe/'results.json').read_bytes())
+        catalog = source.parent/'protocol/ros-interfaces.txt'
+        if (not args.signed_sdk_module or not checked['complete'] or checked['vm'] != digest(args.vm)
+                or checked['wasm'] != digest(args.sdk_module) or checked['catalog'] != digest(catalog)
+                or checked['permissions'] != digest(probe/'permissions.xml')):
+            raise ValueError('the interface probe must match this signed guest, VM and deployer catalog')
+        copy(probe/'permissions.xml','/bundle/reviewed-interfaces.xml',0o644)
+        copy(catalog,'/bundle/ros-interfaces.txt',0o644)
+        probe_inputs = {str(path):digest(path) for path in (probe/'results.json',probe/'permissions.xml',catalog)}
     denial_source=source/'support/abi_denied.wat'
     denial_compile=[str(args.wat2wasm.resolve()),str(denial_source),'-o',str(root/'bundle/abi-denied.wasm')]
     subprocess.run(denial_compile,check=True,timeout=15)
@@ -134,6 +147,8 @@ def main():
     result={'complete':False,'scope':'x86_64 disposable kernel, no physical robot or systemd recovery qualification',
             'sdk_memory_bytes':args.sdk_memory_bytes,'sdk_engine':args.sdk_engine,'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',Path(__file__)]}}
     receipt=args.output/'results.json'
+    result['interface_probe_requested'] = bool(args.sdk_interface_probe)
+    result['inputs'].update(probe_inputs)
     result['clock_fixture_requested'] = bool(args.clock_fixture)
     result['inputs'].update(clock_inputs)
     result['denial_compile']=denial_compile
@@ -154,10 +169,12 @@ def main():
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
     expected=39+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
+    expected += int(result['interface_probe_requested'])
     signed_case='signed-sdk-verification-at-deployer-and-vm' in result['cases']
     result['complete']=(code==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text
                         and len(set(result['cases']))==expected and len(result['cases'])==expected
                         and signed_case==result['signed_sdk_requested']
+                        and ('signed-sdk-reviewed-every-ros-interface' in result['cases'])==result['interface_probe_requested']
                         and ('clock-cold-start-preserves-reviewed-reads' in result['cases'])==result['clock_fixture_requested']
                         and ('clock-empty-recommendations-start-hidden' in result['cases'])==result['clock_fixture_requested'])
     receipt.write_text(json.dumps(result,indent=2))
