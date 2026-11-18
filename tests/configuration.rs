@@ -139,3 +139,28 @@ fn manager_budget_is_separate_and_cannot_overflow() {
     )
     .is_err());
 }
+
+#[test]
+fn clock_import_and_read_authority_are_independent() {
+    let rights = recommendations(r#"<recommendations>
+        <interface name="abi" expose="allow"/>
+        <interface name="wasip1.clock_time_get_wasm64" expose="deny"/>
+        <wasip1-clock name="monotonic-clock" access="allow"/>
+        <wasip1-clock name="process-resolution" access="deny"/>
+        </recommendations>"#).unwrap();
+    assert_eq!(rights.len(), 4);
+    assert!(rights["abi"]);
+    assert!(!rights["wasip1.clock_time_get_wasm64"]);
+    assert!(rights["wasip1.clock.monotonic-clock"]);
+    assert!(!rights["wasip1.clock.process-resolution"]);
+    for bad in [
+        r#"<interface name="wasip1.clock.monotonic-clock" expose="allow"/>"#,
+        r#"<interface name="wasip1.sock_open" expose="allow"/>"#,
+        r#"<wasip1-clock name="clock_time_get" access="allow"/>"#,
+        r#"<wasip1-clock name="monotonic-timer" access="allow"/>"#,
+        r#"<wasip1-clock name="realtime-clock" expose="allow"/>"#,
+        r#"<wasip1-clock name="realtime-clock" access="allow"/><wasip1-clock name="realtime-clock" access="deny"/>"#,
+    ] {
+        assert!(recommendations(&format!("<recommendations>{bad}</recommendations>")).is_err(), "{bad}");
+    }
+}

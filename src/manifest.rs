@@ -133,6 +133,35 @@ pub fn known_interface(key: &str) -> bool {
         .lines()
         .any(|name| name == key)
 }
+/// The durable key includes the authority namespace. ROS names keep their
+/// existing spelling. Only clock imports and their independent read rights
+/// can select a Preview 1 policy; no path, descriptor or socket names qualify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Permission<'a> {
+    RosInterface(&'a str),
+    ClockInterface(&'a str),
+    ClockGrant(&'a str),
+}
+impl<'a> Permission<'a> {
+    pub fn from_key(key: &'a str) -> Option<Self> {
+        if let Some(grant) = key.strip_prefix("wasip1.clock.") {
+            return match grant {
+                "realtime-clock" | "monotonic-clock" | "process-clock" | "thread-clock"
+                | "realtime-resolution" | "monotonic-resolution" | "process-resolution"
+                | "thread-resolution" => Some(Self::ClockGrant(grant)),
+                _ => None,
+            };
+        }
+        if let Some(name) = key.strip_prefix("wasip1.") {
+            return match name {
+                "clock_res_get" | "clock_time_get" | "clock_res_get_wasm64"
+                | "clock_time_get_wasm64" => Some(Self::ClockInterface(name)),
+                _ => None,
+            };
+        }
+        known_interface(key).then_some(Self::RosInterface(key))
+    }
+}
 fn id(s: &str) -> bool {
     s.len() <= 128
         && !s.is_empty()
@@ -373,22 +402,34 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
     attributes(root, "recommendations", &[])?;
     let mut grants = BTreeMap::new();
     for n in root.children().filter(Node::is_element) {
-        attributes(n, "interface", &["name", "expose"])?;
-        let key = attr(n, "name")?;
-        if !known_interface(key)
-            || grants.len() >= 512
-            || key.len() > 128
-            || !key.split('.').all(|x| id(x))
-            || n.children().any(|n| n.is_element())
-        {
-            return Err("invalid interface".into());
+        let (key, decision) = match n.tag_name().name() {
+            "interface" => {
+                attributes(n, "interface", &["name", "expose"])?;
+                let key = attr(n, "name")?;
+                if !matches!(Permission::from_key(key), Some(Permission::RosInterface(_) | Permission::ClockInterface(_))) {
+                    return Err("invalid interface".into());
+                }
+                (key.to_owned(), attr(n, "expose")?)
+            }
+            "wasip1-clock" => {
+                attributes(n, "wasip1-clock", &["name", "access"])?;
+                let key = format!("wasip1.clock.{}", attr(n, "name")?);
+                if !matches!(Permission::from_key(&key), Some(Permission::ClockGrant(_))) {
+                    return Err("invalid WASIp1 clock read permission".into());
+                }
+                (key, attr(n, "access")?)
+            }
+            _ => return Err("unexpected recommendation element".into()),
+        };
+        if grants.len() >= 256 || n.children().any(|x| x.is_element()) {
+            return Err("invalid permission count or nested recommendation".into());
         }
-        let enabled = match attr(n, "expose")? {
+        let enabled = match decision {
             "allow" => true,
             "deny" => false,
-            _ => return Err("invalid exposure".into()),
+            _ => return Err("permission must be allow or deny".into()),
         };
-        if grants.insert(key.into(), enabled).is_some() {
+        if grants.insert(key, enabled).is_some() {
             return Err("duplicate interface".into());
         }
     }

@@ -256,7 +256,7 @@ impl Record {
                     1 => true,
                     _ => return Err("invalid approved permission".into()),
                 };
-                if !crate::manifest::known_interface(&name) || rights.insert(name, allow).is_some()
+                if crate::manifest::Permission::from_key(&name).is_none() || rights.insert(name, allow).is_some()
                 {
                     return Err("unknown or duplicate approved permission".into());
                 }
@@ -578,6 +578,19 @@ mod tests {
             .resume("00000000-0000-0000-0000-000000000002".into(), &[&p])
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn exact_clock_authority_survives_durable_review() {
+        let mut record = sample();
+        let entry = record.entries.get_mut("body").unwrap();
+        entry.rights.insert("wasip1.clock_time_get".into(), true);
+        entry.rights.insert("wasip1.clock.monotonic-clock".into(), true);
+        entry.rights.insert("wasip1.clock.realtime-clock".into(), false);
+        let approved = entry.rights.clone();
+        let restored = Record::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(restored.entries["body"].rights, approved);
+        record.entries.get_mut("body").unwrap().rights.insert("wasip1.clock.monotonic-timer".into(), true);
+        assert!(record.encode().is_err());
     }
     #[test]
     fn bounded_record_rejects_corruption_and_unknown_authority() {

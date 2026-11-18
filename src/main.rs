@@ -105,7 +105,7 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
         }
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["confirm"] => break,
-            [action, name] if manifest::known_interface(name) => match *action {
+            [action, name] if manifest::Permission::from_key(name).is_some() => match *action {
                 "allow" | "deny" => {
                     rights.insert(name.to_string(), *action == "allow");
                 }
@@ -114,7 +114,7 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
                 }
                 _ => eprintln!("unknown action"),
             },
-            _ => eprintln!("enter a registered interface or confirm"),
+            _ => eprintln!("enter a registered interface or clock read permission, or confirm"),
         }
     }
     Ok(rights)
@@ -422,13 +422,30 @@ fn run() -> Result<()> {
             vm.id.clone(),
             vm.id.clone(),
         ];
+        let mut clock_policy = false;
         for (name, enabled) in rights {
-            argv.extend([
-                "--ros-scene-interface".into(),
-                vm.id.clone(),
-                name,
-                if enabled { "allow" } else { "deny" }.into(),
-            ]);
+            use manifest::Permission;
+            let permission = Permission::from_key(&name).ok_or("unknown reviewed permission")?;
+            if !matches!(permission, Permission::RosInterface(_)) && !clock_policy {
+                argv.extend(["--wasip1-single-create".into(), vm.id.clone(),
+                             "--wasip1-single-enable".into(), vm.id.clone()]);
+                clock_policy = true;
+            }
+            let decision = if enabled { "allow" } else { "deny" };
+            match permission {
+                Permission::RosInterface(name) => argv.extend([
+                    "--ros-scene-interface".into(), vm.id.clone(), name.into(), decision.into(),
+                ]),
+                Permission::ClockInterface(name) => {
+                    println!("INFO VM {:?} WASIp1 clock interface {}: {}", vm.id, name, decision);
+                    argv.extend(["--wasip1-single-interface".into(), vm.id.clone(), name.into(), decision.into()]);
+                }
+                Permission::ClockGrant(name) => {
+                    println!("INFO VM {:?} WASIp1 clock read permission {}: {}", vm.id, name, decision);
+                    let option = if enabled { "--wasip1-single-grant" } else { "--wasip1-single-deny" };
+                    argv.extend([option.into(), vm.id.clone(), name.into()]);
+                }
+            }
         }
         if verifier.is_none() {
             println!(

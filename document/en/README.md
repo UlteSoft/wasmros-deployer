@@ -139,3 +139,16 @@ The full-kernel test checks three permission outcomes. The SDK guest runs with t
 To include the signed application itself, pass its unsigned core Wasm to the test authority using `tests/wsea_preflight.py --sdk-module FILE --sdk-source TRUSTED_SDK_CHECKOUT`. Pass the resulting `bundle/sdk.signed.wasm` to `tests/qemu_supervisor.py --signed-sdk-module` in addition to the unsigned test input. The deployer verifies the signature and checks its protected rollback state read-only. The VM verifies the signature independently and commits the accepted module version in its own rollback store. The test compares the admission store before and after launch and reads the VM version record. Signing keys stay outside the guest.
 
 The current VM places ROSv2 imports in WSEA’s other-native-import category (mask 32). The test signer inspects the exact bytes before signing and accepts just `uwvm_ros_v2.abi () -> i32`. Deployment separately permits that one import. Application and VM signing policy files are independent of XML permission recommendations.
+
+### Per-VM read-only clocks
+
+A Preview 1 clock read requires two independent approvals in that VM's recommendation file. Expose the precise function imported by the binary and approve the required clock source. For example, a wasm32 program that reads monotonic time can request the following.
+
+```xml
+<recommendations>
+  <interface name="wasip1.clock_time_get" expose="allow"/>
+  <wasip1-clock name="monotonic-clock" access="allow"/>
+</recommendations>
+```
+
+For target wasm64, use the SDK ABI spelling `wasip1.clock_time_get_wasm64`. Clock resolutions use `wasip1.clock_res_get` or `wasip1.clock_res_get_wasm64`. Read grants are `realtime-clock`, `monotonic-clock`, `process-clock`, `thread-clock` and the corresponding four `-resolution` names. The review editor uses keys such as `wasip1.clock.monotonic-clock`. An omitted interface is hidden. An explicitly denied interface links and returns a capability error. Each allowed interface still requires a grant for the selected source and operation. The deployer emits only per-VM options. Existing ROS interface recommendations retain their original names. A protected approval persists the exact decisions for cold restart. Clock approval does not grant timers, files or network access.

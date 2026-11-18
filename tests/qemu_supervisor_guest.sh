@@ -236,6 +236,28 @@ if test -f /bundle/sdk.signed.wasm; then
     empty; pass signed-sdk-verification-at-deployer-and-vm
 fi
 
+if test -f /bundle/clock.signed.wasm; then
+    mkdir /state/clock-admission /state/clock-vm /state/clock-review
+    chmod 700 /state/clock-admission /state/clock-vm /state/clock-review
+    for role in admission vm; do
+        /bin/cosign wasm secure policy-init --output "/trust/clock-$role.policy" --state-dir "/state/clock-$role" --trust-root /trust/clock-root.pem --certificate /trust/clock-signer.pem --module-id split32 --algorithms Ed25519 --capabilities 1
+        chmod 644 "/trust/clock-$role.policy"
+    done
+    chown -R 10001:10001 /state/clock-vm
+    clockdigest=$(sha256sum /bundle/clock.signed.wasm); clockdigest=${clockdigest%% *}
+    printf '<deployment id="cell"><vm id="clock" module="clock.signed.wasm" sha256="%s" policy="clock-admission.policy" vm-policy="clock-vm.policy" recommendations="clock-rights.xml" memory-bytes="%s" engine="interpreter" pids="16" uid="10001" gid="10001"/></deployment>\n' "$clockdigest" "$sdk_memory" > /bundle/current.xml
+    set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --runtime /bin/uwvm2-ros --cgroup-parent /sys/fs/cgroup/delegated --state-directory /state/clock-review
+    /bin/wros-deployer authorize "$@" --accept-recommendations > /clock-authorize.log 2>&1 || { cat /clock-authorize.log; fail clock-approval; }
+    printf '<recommendations/>\n' > /bundle/clock-rights.xml
+    /bin/wros-deployer resume "$@" > /clock-resume.log 2>&1 || { cat /clock-resume.log; fail clock-resume; }
+    grep -Fq 'split32|1|' /state/clock-vm/state || fail clock-secondary-signature-check
+    empty; pass clock-cold-start-preserves-reviewed-reads
+    if base --runtime /bin/uwvm2-ros > /clock-empty.log 2>&1; then fail unexpected-clock-read; fi
+    grep -Fq 'clock_time_get' /clock-empty.log || { cat /clock-empty.log; fail clock-hidden-diagnostic; }
+    grep -Fq 'namespace permission is disabled' /clock-empty.log || { cat /clock-empty.log; fail clock-hidden-reason; }
+    empty; pass clock-empty-recommendations-start-hidden
+fi
+
 echo "$parent_limit" > /sys/fs/cgroup/delegated/memory.max || fail sdk-restore-parent-budget
 
 configure parentdeath true 2 134217728

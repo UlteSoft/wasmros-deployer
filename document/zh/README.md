@@ -131,3 +131,16 @@ wros-deployer resume /protected/bundles/cell/deployment.xml \
 要验证 SDK 应用自身的双重验签，先向测试签发工具 `tests/wsea_preflight.py` 传入 `--sdk-module FILE --sdk-source TRUSTED_SDK_CHECKOUT`，再把生成的 `bundle/sdk.signed.wasm` 作为 `tests/qemu_supervisor.py` 的 `--signed-sdk-module`，并提供原始未签名测试输入。部署器验签并只读核对其防回滚状态，VM 独立验签并在自己的防回滚存储中记录接受的模块版本。测试比较部署器状态在执行前后的摘要，并读取 VM 的版本记录。签名私钥保留在来宾之外。
 
 当前 VM 将 ROSv2 导入归入 WSEA 的其他原生导入类别（掩码 32）。测试签发器先检查待签的同一份字节，只接受唯一的 `uwvm_ros_v2.abi () -> i32` 导入。部署时还需要单独开放该接口。应用签名、VM 验签策略与 XML 权限推荐文件分别管理。
+
+### 按 VM 审阅只读时钟
+
+Preview 1 时钟读取需要分别批准导入函数及允许读取的时钟来源。例如，wasm32 程序读取单调时间时，可以在该 VM 的独立推荐文件中写入以下内容。
+
+```xml
+<recommendations>
+  <interface name="wasip1.clock_time_get" expose="allow"/>
+  <wasip1-clock name="monotonic-clock" access="allow"/>
+</recommendations>
+```
+
+wasm64 目标使用 SDK 对应的 `wasip1.clock_time_get_wasm64`。读取分辨率使用 `wasip1.clock_res_get` 或 `wasip1.clock_res_get_wasm64`。时间读取权限包括 `realtime-clock`、`monotonic-clock`、`process-clock`、`thread-clock`，另有四个以 `-resolution` 结尾的分辨率读取权限。交互式审核使用 `wasip1.clock.monotonic-clock` 这样的键。省略接口时 VM 默认隐藏它。显式拒绝的接口可完成链接，调用返回权限错误。允许接口后仍需授予所选时钟来源和操作的权限。部署器只为该 VM 生成配置，原有 ROS 接口的推荐名称继续有效。受保护的审批记录保存每项决定，以便冷启动。时钟批准不会授予定时器、文件或网络访问权。

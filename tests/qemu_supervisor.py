@@ -56,6 +56,8 @@ def main():
     p.add_argument('--sdk-engine', choices=('aot', 'interpreter'), default='aot')
     p.add_argument('--signed-sdk-module', type=Path,
                    help='SDK application signed with the fixture authority and module ID sdk')
+    p.add_argument('--clock-fixture', type=Path,
+                   help='completed signed guest fixture from tests/clock_permissions.py')
     p.add_argument('--wat2wasm', type=Path, default=Path('/usr/bin/wat2wasm'))
     p.add_argument('--sdk-memory-bytes', type=int, default=256 << 20,
                    help='Guest cgroup limit for the SDK application under test (default 256 MiB)')
@@ -99,6 +101,18 @@ def main():
         if (digest(root/'bundle/sdk.wasm') != binding['sha256'] or
                 digest(root/'bundle/sdk.signed.wasm') != binding['signed_sha256']):
             raise ValueError('guest inputs differ from the signed SDK fixture')
+    clock_inputs = {}
+    if args.clock_fixture:
+        clock = args.clock_fixture.resolve()
+        report = json.loads((clock/'results.json').read_text())
+        if not report.get('complete'):
+            raise ValueError('signed clock fixture did not complete its real-VM checks')
+        for name, destination in [('bundle/split32.signed.wasm', '/bundle/clock.signed.wasm'),
+                                  ('bundle/split32-rights.xml', '/bundle/clock-rights.xml'),
+                                  ('test-authority/pki/clock/root.pem', '/trust/clock-root.pem'),
+                                  ('test-authority/pki/clock/signer.pem', '/trust/clock-signer.pem')]:
+            copy(clock/name, destination, 0o644)
+            clock_inputs[str(clock/name)] = digest(root/destination.lstrip('/'))
     denial_source=source/'support/abi_denied.wat'
     denial_compile=[str(args.wat2wasm.resolve()),str(denial_source),'-o',str(root/'bundle/abi-denied.wasm')]
     subprocess.run(denial_compile,check=True,timeout=15)
@@ -120,6 +134,8 @@ def main():
     result={'complete':False,'scope':'x86_64 disposable kernel, no physical robot or systemd recovery qualification',
             'sdk_memory_bytes':args.sdk_memory_bytes,'sdk_engine':args.sdk_engine,'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',Path(__file__)]}}
     receipt=args.output/'results.json'
+    result['clock_fixture_requested'] = bool(args.clock_fixture)
+    result['inputs'].update(clock_inputs)
     result['denial_compile']=denial_compile
     for path in (denial_source,args.wat2wasm.resolve()):
         result['inputs'][str(path)]=digest(path)
@@ -137,11 +153,13 @@ def main():
             result['timeout_seconds']=240
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    expected=39+int(result['signed_sdk_requested'])
+    expected=39+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
     signed_case='signed-sdk-verification-at-deployer-and-vm' in result['cases']
     result['complete']=(code==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text
                         and len(set(result['cases']))==expected and len(result['cases'])==expected
-                        and signed_case==result['signed_sdk_requested'])
+                        and signed_case==result['signed_sdk_requested']
+                        and ('clock-cold-start-preserves-reviewed-reads' in result['cases'])==result['clock_fixture_requested']
+                        and ('clock-empty-recommendations-start-hidden' in result['cases'])==result['clock_fixture_requested'])
     receipt.write_text(json.dumps(result,indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('argv','inputs','compile')},indent=2))
     assert result['complete'],text[-10000:]
