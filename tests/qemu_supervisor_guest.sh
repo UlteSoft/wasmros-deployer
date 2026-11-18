@@ -188,12 +188,18 @@ pass exited-deployer-does-not-transfer-identity
 sdkdigest=$(sha256sum /bundle/sdk.wasm); sdkdigest=${sdkdigest%% *}
 sdk_memory=$(cat /bundle/sdk-memory-bytes)
 sdk_engine=$(cat /bundle/sdk-engine)
+sdk_aot_attribute=
+if test -f /bundle/sdk-aot-policy; then
+    sdk_aot_policy=$(cat /bundle/sdk-aot-policy)
+    case "$sdk_aot_policy" in default|fast-compile|balanced|max) ;; *) fail invalid-aot-policy ;; esac
+    sdk_aot_attribute=" aot-policy=\"$sdk_aot_policy\""
+fi
 parent_limit=$(cat /sys/fs/cgroup/delegated/memory.max)
 if [ "$sdk_memory" -gt "$parent_limit" ]; then
     echo "$sdk_memory" > /sys/fs/cgroup/delegated/memory.max || fail sdk-parent-budget
 fi
 select_sdk() {
-    printf '<deployment id="cell"><vm id="sdk" module="%s" sha256="%s" policy="body.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$1" "$2" "$sdk_memory" "$sdk_engine" > /bundle/current.xml
+    printf '<deployment id="cell"><vm id="sdk" module="%s" sha256="%s" policy="body.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s"%s pids="16" uid="10001" gid="10001"/></deployment>\n' "$1" "$2" "$sdk_memory" "$sdk_engine" "$sdk_aot_attribute" > /bundle/current.xml
 }
 sdk_rights() {
     if test -f /bundle/reviewed-interfaces.xml; then
@@ -205,6 +211,9 @@ sdk_rights() {
 select_sdk sdk.wasm "$sdkdigest"
 sdk_rights
 base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-allow.log 2>&1 || { cat /sdk-allow.log; fail sdk-allowed; }
+if test -n "$sdk_aot_attribute"; then
+    grep -Fq "\"--runtime-llvm-jit-policy\", \"$sdk_aot_policy\"" /sdk-allow.log || fail aot-policy-argument
+fi
 empty; pass sdk-compiled-ros-interface-allowed
 if test -f /bundle/reviewed-interfaces.xml; then
     awk '{gsub(/expose="allow"/, "expose=\"deny\""); print}' /bundle/reviewed-interfaces.xml > /bundle/permissions.xml
@@ -237,7 +246,7 @@ if test -f /bundle/sdk.signed.wasm; then
     admission_state_before=$(sha256sum /state/sdk-admission/state)
     chown -R 10001:10001 /state/sdk-vm
     signed_sdk=$(sha256sum /bundle/sdk.signed.wasm); signed_sdk=${signed_sdk%% *}
-    printf '<deployment id="cell"><vm id="sdk" module="sdk.signed.wasm" sha256="%s" policy="sdk-admission.policy" vm-policy="sdk-vm.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$signed_sdk" "$sdk_memory" "$sdk_engine" > /bundle/current.xml
+    printf '<deployment id="cell"><vm id="sdk" module="sdk.signed.wasm" sha256="%s" policy="sdk-admission.policy" vm-policy="sdk-vm.policy" recommendations="permissions.xml" memory-bytes="%s" engine="%s"%s pids="16" uid="10001" gid="10001"/></deployment>\n' "$signed_sdk" "$sdk_memory" "$sdk_engine" "$sdk_aot_attribute" > /bundle/current.xml
     sdk_rights
     base --runtime /bin/uwvm2-ros > /sdk-signatures.log 2>&1 || { cat /sdk-signatures.log; fail signed-sdk; }
     grep -Fq 'WSEA policy and signature verified for VM "sdk"' /sdk-signatures.log || fail missing-deployer-sdk-verification

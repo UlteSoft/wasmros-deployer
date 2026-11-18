@@ -136,6 +136,8 @@ For the disposable 4 GiB QEMU supervisor test, choose the SDK application's gues
 
 Each VM can select its execution engine with the XML attribute `engine="aot"` (default) or `engine="interpreter"`. The review prints the selected engine, and the launch record contains the full VM option. Both engines use the same reviewed import and resource permissions. Measure startup time and memory inside the intended device cgroup. The QEMU test accepts the same selection with `--sdk-engine`.
 
+A VM with the AOT engine can set `aot-policy="fast-compile"` to favor cold startup, or select `default`, `balanced` or `max`. Review prints the choice, and execution includes the full `--runtime-llvm-jit-policy` argument. Measure cold start and steady-state performance with the actual application and CPU budget.
+
 The full-kernel test checks three permission outcomes. The SDK guest runs with the ABI inquiry granted. With an explicit denial, a dedicated Wasm probe checks the numeric return value 13. Omitting the import from the recommendation causes the VM to reject the SDK guest before entry.
 
 To include the signed application itself, pass its unsigned core Wasm to the test authority using `tests/wsea_preflight.py --sdk-module FILE --sdk-source TRUSTED_SDK_CHECKOUT`. Pass the resulting `bundle/sdk.signed.wasm` to `tests/qemu_supervisor.py --signed-sdk-module` in addition to the unsigned test input. The deployer verifies the signature and checks its protected rollback state read-only. The VM verifies the signature independently and commits the accepted module version in its own rollback store. The test compares the admission store before and after launch and reads the VM version record. Signing keys stay outside the guest.
@@ -166,3 +168,7 @@ Use a C development installation with its site profile. This fixture compiles a 
   --kernel "$KERNEL" --qemu "$QEMU" --bios "$BIOS" --firmware-directory "$FIRMWARE" \
   --output "$DEPLOYER_SOURCE/.tmp/site-aot" --authority-directory "$VM_SOURCE/.tmp/site-test-keys"
 ```
+
+To exercise another installed SDK language, supply a compiled ABI-query application with `--sdk-abi-application FILE` and `--approved-build-receipt-sha256 DIGEST`. The latter pins the adjacent `FILE.wros-build.json` that the operator reviewed. This fixture accepts just the `uwvm_ros_v2.abi` import. It verifies the build for the selected VM, signs a private copy, then checks the deployer and VM signature decisions in the guest.
+
+The full signed installation test accepts `--accelerator tcg` (default) or `--accelerator kvm` and an explicit `--guest-timeout-seconds 30..1800` (default 240). The cgroup must permit the selected backend. A TCG run with a publicly installed Lua interpreter compiled into Wasm passed all 42 checks with the AOT engine, the fast-compile policy and a 1,200-second guest budget. The guest starts fresh VM processes for grant, denial and signature verification. This time budget includes compilation and supervision across the entire test.

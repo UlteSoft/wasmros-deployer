@@ -128,6 +128,8 @@ wros-deployer resume /protected/bundles/cell/deployment.xml \
 
 每个 VM 可通过 XML 属性 `engine="aot"`（默认）或 `engine="interpreter"` 选择执行引擎。审阅界面显示所选引擎，启动记录保留完整 VM 参数。两种引擎遵守相同的导入权限和资源配额。应在目标设备的 cgroup 中实测启动耗时和内存。QEMU 测试通过 `--sdk-engine` 指定同一选项。
 
+使用 AOT 引擎的 VM 可在其 XML 元素上设置 `aot-policy="fast-compile"` 以优先缩短冷启动时间，也可选择 `default`、`balanced` 或 `max`。审阅时显示选择，启动记录给出完整的 `--runtime-llvm-jit-policy` 参数。应使用实际应用和 CPU 配额分别测量冷启动与稳定运行性能。
+
 全内核测试区分三种权限结果。开放 ABI 查询时运行 SDK 应用，显式拒绝时由专用 Wasm 程序核实调用返回 13，省略该接口时核实 VM 在应用入口执行前拒绝链接。
 
 要验证 SDK 应用自身的双重验签，先向测试签发工具 `tests/wsea_preflight.py` 传入 `--sdk-module FILE --sdk-source TRUSTED_SDK_CHECKOUT`，再把生成的 `bundle/sdk.signed.wasm` 作为 `tests/qemu_supervisor.py` 的 `--signed-sdk-module`，并提供原始未签名测试输入。部署器验签并只读核对其防回滚状态，VM 独立验签并在自己的防回滚存储中记录接受的模块版本。测试比较部署器状态在执行前后的摘要，并读取 VM 的版本记录。签名私钥保留在来宾之外。
@@ -158,3 +160,7 @@ wasm64 目标使用 SDK 对应的 `wasip1.clock_time_get_wasm64`。读取分辨�
   --kernel "$KERNEL" --qemu "$QEMU" --bios "$BIOS" --firmware-directory "$FIRMWARE" \
   --output "$DEPLOYER_SOURCE/.tmp/site-aot" --authority-directory "$VM_SOURCE/.tmp/site-test-keys"
 ```
+
+测试另一种 SDK 语言时，使用 `--sdk-abi-application FILE` 指定已编译的 ABI 查询程序，使用 `--approved-build-receipt-sha256 DIGEST` 指定操作员已审核的相邻 `FILE.wros-build.json` 的摘要。该用例仅接受 `uwvm_ros_v2.abi` 导入。它先校验产物与 VM 的匹配关系，再对私有副本签名，随后在 QEMU 来宾中验证部署器和 VM 的两次验签。
+
+完整签名部署测试可指定 `--accelerator tcg`（默认）或 `--accelerator kvm`，还可用 `--guest-timeout-seconds` 设置整个来宾的时限，取值 30 至 1800 秒，默认 240 秒。所选后端需要当前 cgroup 允许。用公开安装的 SDK 将 Lua 解释器编入 Wasm 后，TCG 来宾在 AOT 引擎、fast-compile 策略和 1200 秒时限下通过了全部 42 项检查。来宾会分别启动新的 VM 来验证授权、拒绝和签名，时限包含这些进程的编译和监督时间。

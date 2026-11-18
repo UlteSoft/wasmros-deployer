@@ -29,6 +29,7 @@ impl Engine {
 pub struct Process {
     pub id: String,
     pub engine: Engine,
+    pub aot_policy: Option<&'static str>,
     pub module: PathBuf,
     pub digest: String,
     pub policy: PathBuf,
@@ -288,6 +289,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 "policy",
                 "vm-policy",
                 "engine",
+                "aot-policy",
                 "recommendations",
                 "memory-bytes",
                 "pids",
@@ -356,13 +358,24 @@ pub fn deployment(s: &str) -> Result<Deployment> {
         {
             return Err("invalid CPU or restart bounds".into());
         }
+        let engine = match node.attribute("engine").unwrap_or("aot") {
+            "aot" => Engine::Aot,
+            "interpreter" => Engine::Interpreter,
+            _ => return Err("VM engine must be aot or interpreter".into()),
+        };
+        let aot_policy = match (engine, node.attribute("aot-policy")) {
+            (_, None) => None,
+            (Engine::Interpreter, Some(_)) => return Err("aot-policy requires the AOT engine".into()),
+            (Engine::Aot, Some("default")) => Some("default"),
+            (Engine::Aot, Some("fast-compile")) => Some("fast-compile"),
+            (Engine::Aot, Some("balanced")) => Some("balanced"),
+            (Engine::Aot, Some("max")) => Some("max"),
+            _ => return Err("unknown deployment AOT policy".into()),
+        };
         processes.push(Process {
             id: name.into(),
-            engine: match node.attribute("engine").unwrap_or("aot") {
-                "aot" => Engine::Aot,
-                "interpreter" => Engine::Interpreter,
-                _ => return Err("VM engine must be aot or interpreter".into()),
-            },
+            engine,
+            aot_policy,
             module: path(attr(node, "module")?)?,
             digest: digest.into(),
             policy: path(attr(node, "policy")?)?,

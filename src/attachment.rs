@@ -578,6 +578,13 @@ mod tests {
         let [sender, receiver] = carrier().unwrap();
         let [wake, wait] = carrier().unwrap();
         let [endpoint, _other] = endpoints().unwrap();
+        // Track the kernel objects owned by this test. Other libtest threads may
+        // open or close unrelated descriptors while the delivery is in progress.
+        let identity = |file: &File| {
+            let metadata = file.metadata().unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let injected = identity(&receiver);
         // Prepare everything the child needs before fork; its branch only uses
         // libc syscalls and stack storage, with no Rust allocator or test output.
         let child = unsafe { libc::fork() };
@@ -657,8 +664,25 @@ mod tests {
         let record = endpoint
             .bootstrap(binding, limits, &local, &remote)
             .unwrap();
-        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
-        let before = count();
+        let watched = [
+            injected,
+            identity(endpoint.channel()),
+            identity(endpoint.identity()),
+            identity(&record),
+        ];
+        let tracked_descriptors = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter_map(|path| match std::fs::metadata(path) {
+                    Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("could not inspect open descriptor: {error}"),
+                })
+                .filter(|object| watched.contains(object))
+                .count()
+        };
+        assert_eq!(tracked_descriptors(), 3);
         assert!(deliver(
             &sender,
             endpoint,
@@ -668,7 +692,7 @@ mod tests {
             Duration::from_secs(1)
         )
         .is_err());
-        assert_eq!(count() + 3, before); // consumed endpoint, identity and record
+        assert_eq!(tracked_descriptors(), 0);
         drop(wake);
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);

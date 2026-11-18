@@ -51,8 +51,13 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ("kernel","qemu","deployer","vm","cosign","admission-fixture","sdk-module","output"):
         p.add_argument("--"+name,type=Path,required=True)
+    p.add_argument('--accelerator', choices=('tcg','kvm'), default='tcg',
+                   help='Use kvm for native x86_64 cold-start measurements when available')
     p.add_argument('--bios',type=Path,required=True)
     p.add_argument('--firmware-directory',type=Path,required=True)
+    p.add_argument('--guest-timeout-seconds', type=int, default=240,
+                   help='Bound wall time for the complete guest, including LLVM cold compilation (30..1800)')
+    p.add_argument('--sdk-aot-policy', choices=('default','fast-compile','balanced','max'))
     p.add_argument('--sdk-engine', choices=('aot', 'interpreter'), default='aot')
     p.add_argument('--signed-sdk-module', type=Path,
                    help='SDK application signed with the fixture authority and module ID sdk')
@@ -63,12 +68,16 @@ def main():
     p.add_argument('--sdk-memory-bytes', type=int, default=256 << 20,
                    help='Guest cgroup limit for the SDK application under test (default 256 MiB)')
     args=p.parse_args()
+    if not 30 <= args.guest_timeout_seconds <= 1800:
+        p.error('guest time limit must be between 30 and 1800 seconds')
     if not (1 << 20) <= args.sdk_memory_bytes <= (2 << 30):
         p.error('choose an SDK memory budget between 1 MiB and 2 GiB for this 4 GiB test guest')
     group=Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
     assert Path('/proc/self/cgroup').read_text().strip()=='0::/'+str(group.relative_to('/sys/fs/cgroup'))
     assert (group/'memory.max').read_text().strip()=='68719476736'
     assert (group/'memory.swap.max').read_text().strip()=='0'
+    if args.sdk_aot_policy and args.sdk_engine != 'aot':
+        p.error('--sdk-aot-policy requires --sdk-engine aot')
     args.output=args.output.resolve()
     assert '.tmp' in args.output.parts
     args.output.mkdir(parents=True,exist_ok=False)
@@ -131,6 +140,8 @@ def main():
     subprocess.run(denial_compile,check=True,timeout=15)
     (root/'bundle/sdk-memory-bytes').write_text(str(args.sdk_memory_bytes)+'\n')
     (root/'bundle/sdk-engine').write_text(args.sdk_engine+'\n')
+    if args.sdk_aot_policy:
+        (root/'bundle/sdk-aot-policy').write_text(args.sdk_aot_policy+'\n')
     (root/'bundle/loop.wasm').write_bytes(bytes.fromhex('0061736d0100000001040160000003020100070a01065f737461727400000a0901070003400c000b0b'))
     policy=(args.admission_fixture/'policies/body.policy').read_text()
     trust=next(line.split('=',1)[1] for line in policy.splitlines() if line.startswith('trust_root='))
@@ -138,7 +149,9 @@ def main():
     copy(Path(trust).parent/'signer.pem','/trust/signer.pem',0o644)
     archive=args.output/'initramfs.cpio.gz'
     pack(root,archive)
-    argv=[str(args.qemu),'-nodefaults','-machine','q35','-accel','tcg,thread=multi','-cpu','max','-smp','2,sockets=2,cores=1,threads=1','-m','4096',
+    cpu_options = (['-accel','kvm','-cpu','host'] if args.accelerator == 'kvm'
+                   else ['-accel','tcg,thread=multi','-cpu','max'])
+    argv=[str(args.qemu),'-nodefaults','-machine','q35',*cpu_options,'-smp','2,sockets=2,cores=1,threads=1','-m','4096',
           '-object','memory-backend-ram,id=mem0,size=2G','-object','memory-backend-ram,id=mem1,size=2G',
           '-numa','node,nodeid=0,cpus=0,memdev=mem0','-numa','node,nodeid=1,cpus=1,memdev=mem1',
           '-display','none','-serial','stdio','-monitor','none','-nic','none','-no-reboot','-bios',str(args.bios),'-L',str(args.firmware_directory),
@@ -147,6 +160,9 @@ def main():
     result={'complete':False,'scope':'x86_64 disposable kernel, no physical robot or systemd recovery qualification',
             'sdk_memory_bytes':args.sdk_memory_bytes,'sdk_engine':args.sdk_engine,'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',Path(__file__)]}}
     receipt=args.output/'results.json'
+    result['guest_time_limit_seconds'] = args.guest_timeout_seconds
+    result['accelerator'] = args.accelerator
+    result['sdk_aot_policy'] = args.sdk_aot_policy
     result['interface_probe_requested'] = bool(args.sdk_interface_probe)
     result['inputs'].update(probe_inputs)
     result['clock_fixture_requested'] = bool(args.clock_fixture)
@@ -162,10 +178,10 @@ def main():
     start=time.monotonic()
     with (args.output/'serial.log').open('wb') as log:
         try:
-            code=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=240).returncode
+            code=subprocess.run(argv,stdout=log,stderr=subprocess.STDOUT,timeout=args.guest_timeout_seconds).returncode
         except subprocess.TimeoutExpired:
             code=None
-            result['timeout_seconds']=240
+            result['timeout_seconds']=args.guest_timeout_seconds
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
     expected=39+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])

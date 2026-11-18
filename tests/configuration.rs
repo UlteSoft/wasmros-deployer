@@ -164,3 +164,14 @@ fn clock_import_and_read_authority_are_independent() {
         assert!(recommendations(&format!("<recommendations>{bad}</recommendations>")).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn aot_policy_is_scoped_to_the_aot_engine() {
+    assert!(deployment(&config()).unwrap().processes[0].aot_policy.is_none());
+    for policy in ["default", "fast-compile", "balanced", "max"] {
+        let xml = config().replace("pids=", &format!(r#"aot-policy="{policy}" pids="#));
+        assert_eq!(deployment(&xml).unwrap().processes[0].aot_policy, Some(policy));
+        assert!(deployment(&xml.replace("pids=", r#"engine="interpreter" pids="#)).is_err());
+    }
+    assert!(deployment(&config().replace("pids=", r#"aot-policy="unknown" pids="#)).is_err());
+}

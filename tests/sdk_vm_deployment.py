@@ -22,8 +22,22 @@ def main():
         parser.add_argument('--' + name, required=True, type=lambda value: Path(value).resolve())
     # QEMU installations can use a multi-call launcher that inspects argv[0].
     parser.add_argument('--qemu', required=True, type=lambda value: Path(value).absolute())
+    parser.add_argument('--accelerator', choices=('tcg', 'kvm'), default='tcg',
+                        help='QEMU CPU backend for the isolated x86_64 guest')
+    parser.add_argument('--guest-timeout-seconds', type=int, default=240,
+                        help='Bound the whole QEMU guest run to 30..1800 seconds including compiler startup')
+    parser.add_argument('--aot-policy', choices=('default','fast-compile','balanced','max'))
     parser.add_argument('--engine', choices=('aot', 'interpreter'), required=True)
+    parser.add_argument('--sdk-abi-application', type=lambda value: Path(value).resolve(),
+                        help='Test a signed-site SDK application whose only import is uwvm_ros_v2.abi')
+    parser.add_argument('--approved-build-receipt-sha256', help='Operator-approved SHA-256 of the adjacent .wros-build.json')
     args = parser.parse_args()
+    if args.aot_policy and args.engine != 'aot':
+        parser.error('--aot-policy requires --engine aot')
+    if not 30 <= args.guest_timeout_seconds <= 1800:
+        parser.error('guest time limit must be between 30 and 1800 seconds')
+    if bool(args.sdk_abi_application) != bool(args.approved_build_receipt_sha256):
+        parser.error('provide the SDK application and approved build receipt digest together')
     if not args.output.is_relative_to(TESTS.parent / '.tmp'):
         parser.error('choose a new results directory inside the deployer .tmp')
     if not args.authority_directory.is_relative_to(args.vm_source / '.tmp'):
@@ -33,8 +47,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     args.authority_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     receipt = args.output / 'results.json'
-    state = dict(complete=False, engine=args.engine, inputs={
-        str(p): digest(p) for p in (args.vm, args.deployer, args.cosign, args.sdk / 'bin/wrc',
+    state = dict(complete=False, engine=args.engine, accelerator=args.accelerator, inputs={
+        str(p): digest(p) for p in (args.vm, args.deployer, args.cosign,
                                     args.sdk / 'share/abi/ros.json', args.kernel, args.bios,
                                     TESTS / 'sdk_vm_deployment.py', TESTS / 'ros_interface_review.py',
                                     TESTS / 'qemu_supervisor.py', TESTS / 'qemu_supervisor_guest.sh',
@@ -61,18 +75,42 @@ def main():
     clocks = args.authority_directory / 'clock'
     guest = args.output / 'qemu'
     common = ['--vm', args.vm, '--cosign', args.cosign, '--deployer', args.deployer]
-    run('compile', 'ros_interface_review.py', ['--sdk', args.sdk, '--runtime', args.vm, '--output', probe], 300)
+    if args.sdk_abi_application:
+        artifact = args.output / 'application.wasm'
+        supplied = args.sdk_abi_application
+        build_receipt = args.output / 'application.wros-build.json'
+        for source, target, limit in ((supplied, artifact, 128 << 20),
+                                      (Path(str(supplied)+'.wros-build.json'), build_receipt, 1 << 20)):
+            with source.open('rb') as stream:
+                data = stream.read(limit+1)
+            if len(data) > limit:
+                raise ValueError('SDK input exceeds the test fixture budget')
+            target.write_bytes(data)
+            state['inputs'][str(source)] = digest(target)
+        checker = args.sdk/'install/qualification.py'
+        state['inputs'][str(checker)] = digest(checker)
+        run('verify-build', checker, ['--vm',args.vm,'--artifact',artifact,'--receipt',build_receipt,
+            '--approved-receipt-sha256',args.approved_build_receipt_sha256], 180)
+        state['language'] = json.loads(build_receipt.read_bytes())['language']
+        probe_args = []
+        required_case = 'signed-sdk-verification-at-deployer-and-vm'
+    else:
+        state['inputs'][str(args.sdk/'bin/wrc')] = digest(args.sdk/'bin/wrc')
+        run('compile', 'ros_interface_review.py', ['--sdk', args.sdk, '--runtime', args.vm, '--output', probe], 300)
+        artifact = probe/'catalog.wasm'
+        probe_args = ['--sdk-interface-probe',probe]
+        required_case = 'signed-sdk-reviewed-every-ros-interface'
     run('sign', 'wsea_preflight.py', [*common, '--vm-source', args.vm_source, '--sdk-source', args.sdk,
-        '--sdk-module', probe / 'catalog.wasm', '--sdk-interface-probe', probe, '--output', admitted], 900)
+        '--sdk-module', artifact, *probe_args, '--output', admitted], 900)
     run('clock', 'clock_permissions.py', [*common, '--vm-source', args.vm_source, '--output', clocks], 900)
-    run('deploy', 'qemu_supervisor.py', [*common, '--qemu', args.qemu, '--kernel', args.kernel,
+    run('deploy', 'qemu_supervisor.py', [*common, '--accelerator', args.accelerator, '--guest-timeout-seconds', args.guest_timeout_seconds, '--qemu', args.qemu, '--kernel', args.kernel,
         '--bios', args.bios, '--firmware-directory', args.firmware_directory, '--admission-fixture', admitted,
-        '--signed-sdk-module', admitted / 'bundle/sdk.signed.wasm', '--sdk-module', probe / 'catalog.wasm',
+        '--signed-sdk-module', admitted / 'bundle/sdk.signed.wasm', '--sdk-module', artifact,
         '--sdk-engine', args.engine, '--sdk-memory-bytes', 1536 << 20, '--clock-fixture', clocks,
-        '--sdk-interface-probe', probe, '--output', guest], 1200)
+        *probe_args, *(['--sdk-aot-policy', args.aot_policy] if args.aot_policy else []), '--output', guest], args.guest_timeout_seconds + 180)
     qemu = json.loads((guest / 'results.json').read_bytes())
-    if not qemu['complete'] or 'signed-sdk-reviewed-every-ros-interface' not in qemu['cases']:
-        raise ValueError('missing completed signed interface review')
+    if not qemu['complete'] or required_case not in qemu['cases']:
+        raise ValueError('missing signed deployment result: '+required_case)
     state.update(complete=True, cases=qemu['cases'], qemuReceiptSha256=digest(guest / 'results.json'))
     save()
 
