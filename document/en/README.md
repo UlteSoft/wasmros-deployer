@@ -93,6 +93,8 @@ SIGINT, SIGTERM or SIGHUP stops recovery, requests termination of live instances
 
 Runtime audit output uses a separate writer and a bounded queue of 32 records, each at most 32 KiB. The supervisor never waits for the log consumer while managing processes. Queue saturation or a writer error stops the deployment. At exit, the writer has at most 500 milliseconds to drain; an incomplete drain produces an unsuccessful invocation after VM shutdown. This prevents a full pipe or a stalled log collector from blocking operator stop. Preflight output occurs before any guest starts.
 
+The supervisor gives the direct VM processes a shared two-second grace period after sending SIGTERM. It then writes to the deployment's dedicated `cgroup.kill` to stop all remaining descendants together. The tree and direct children share a single two-second settling budget. A populated group or unreaped child after that budget produces a failure for the outer supervisor. This is a software wait budget. Kernel scheduling, uninterruptible tasks and a blocked storage commit can prevent a wall-clock guarantee. [Kernel cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html#core-interface-files)
+
 For a separately bounded manager and whole-tree service shutdown, use [Independent service supervision](service-supervision.md). It adds `authorize` and `service`, followed by `resume --supervisor-cgroup` under the independent supervisor. Authorization does not launch work. Automatic service installation and the strict-MVP watchdog remain unfinished.
 
 ## Durable approval and cold starts

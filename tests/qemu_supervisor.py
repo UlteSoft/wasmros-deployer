@@ -193,12 +193,16 @@ def main():
             result['timeout_seconds']=args.guest_timeout_seconds
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    expected=40+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
+    expected=41+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
     expected += int(result['interface_probe_requested'])
     expected += 2 * int(args.local_scheduling)
     signed_case='signed-sdk-verification-at-deployer-and-vm' in result['cases']
+    timings=re.findall(r'^MEASURE tree-stop-ms (\d+)$',text,re.MULTILINE)
+    result['tree_stop_ms']=int(timings[0]) if len(timings)==1 else None
     result['complete']=(code==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text
                         and len(set(result['cases']))==expected and len(result['cases'])==expected
+                        and 'operator-stop-forces-whole-tree-and-preserves-independent-deployment' in result['cases']
+                        and result['tree_stop_ms'] is not None
                         and signed_case==result['signed_sdk_requested']
                         and all(('local-scheduling-'+engine in result['cases']) == args.local_scheduling
                                 for engine in ('interpreter', 'aot'))

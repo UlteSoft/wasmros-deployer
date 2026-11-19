@@ -122,6 +122,58 @@ wait "$management" || { cat /stop.log; fail manual-stop; }
 test "$(grep -c 'started with PID' /stop.log)" = 1 || fail restart-after-stop
 empty; pass operator-stop-overrides-recovery
 
+printf '<deployment id="independent"><vm id="stop-independent" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="10100" gid="10100"/></deployment>\n' "$digest" > /bundle/independent.xml
+/bin/wros-deployer run /bundle/independent.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations --runtime /bin/supervisor-peer --allow-unsigned "stop-independent=$digest" > /independent.log 2>&1 & independent=$!
+wait_started /independent.log 1
+loops=0
+while ! grep -q 'PEER orphan pid=' /independent.log; do
+    loops=$((loops+1)); test "$loops" -lt 300 || { cat /independent.log; fail independent-descendant; }
+    sleep .02
+done
+independent_group=/sys/fs/cgroup/delegated/wros-independent/vm-stop-independent
+independent_pids=$(cat "$independent_group/cgroup.procs")
+test "$(echo "$independent_pids" | wc -l)" = 2 || fail independent-members
+{
+    printf '<deployment id="cell">\n'
+    for index in 1 2 3; do
+        printf '<vm id="stop-%s" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="%s" gid="%s"/>\n' "$index" "$digest" "$((10100+index))" "$((10100+index))"
+    done
+    printf '</deployment>\n'
+} > /bundle/current.xml
+/bin/strace -f -yy -e trace=write,pidfd_send_signal -o /tree-stop.trace \
+    /bin/wros-deployer run /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations --runtime /bin/supervisor-peer --allow-unsigned "stop-1=$digest" --allow-unsigned "stop-2=$digest" --allow-unsigned "stop-3=$digest" > /tree-stop.log 2>&1 & trace=$!
+wait_started /tree-stop.log 3
+loops=0
+while test "$(grep -c 'PEER orphan pid=' /tree-stop.log || true)" -lt 3; do
+    loops=$((loops+1)); test "$loops" -lt 300 || { cat /tree-stop.log; fail tree-stop-descendants; }
+    sleep .02
+done
+manager=$(cat /proc/$trace/task/$trace/children | awk '{print $1}')
+test -n "$manager" || fail tree-stop-deployer
+pids=
+for index in 1 2 3; do
+    members=$(cat "/sys/fs/cgroup/delegated/wros-cell/vm-stop-$index/cgroup.procs")
+    test "$(echo "$members" | wc -l)" = 2 || fail tree-stop-members
+    pids="$pids $members"
+done
+before=$(cut -d ' ' -f1 /proc/uptime)
+kill -TERM "$manager"
+wait "$trace" || { cat /tree-stop.log; fail tree-stop; }
+after=$(cut -d ' ' -f1 /proc/uptime)
+awk -v before="$before" -v after="$after" 'BEGIN {printf "MEASURE tree-stop-ms %.0f\n", (after-before)*1000; exit (after < before || after-before > 5)}' || fail tree-stop-time
+awk '/pidfd_send_signal.*SIGTERM/ {term++}
+     term && /cgroup.kill>/ && !forced {forced=1; root=$0 ~ /\/wros-cell\/cgroup.kill>.* = 1$/}
+     END {exit !(term == 3 && forced && root)}' /tree-stop.trace || { grep -E 'pidfd_send_signal|cgroup.kill' /tree-stop.trace; fail tree-stop-first-force-scope; }
+for pid in $pids; do not_running "$pid"; done
+for pid in $independent_pids; do
+    grep -qx "$pid" "$independent_group/cgroup.procs" || fail tree-stop-affected-independent
+done
+kill -TERM "$independent"
+wait "$independent" || { cat /independent.log; fail independent-stop; }
+empty
+test ! -d /sys/fs/cgroup/delegated/wros-independent || fail independent-stale-cgroup
+pass operator-stop-forces-whole-tree-and-preserves-independent-deployment
+
 configure flood false 0 134217728
 fixture flood > /flood.log 2>&1 || { tail -10 /flood.log; fail output-flood; }
 test "$(wc -c < /flood.log)" -lt 20000 || fail unbounded-diagnostic

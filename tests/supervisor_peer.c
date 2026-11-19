@@ -93,11 +93,12 @@ int main(int argc,char **argv) {
     if(!strcmp(mode,"memory")){
         for(;;){unsigned char *p=malloc(4*1024*1024);if(!p)return 77;memset(p,0x5a,4*1024*1024);__asm__ volatile(""::"r"(p):"memory");}
     }
-    if(!strcmp(mode,"orphan") || !strcmp(mode,"stop")){
+    if(!strcmp(mode,"orphan") || !strcmp(mode,"stop") || !strncmp(mode,"stop-",5)){
+        if(strcmp(mode,"orphan"))signal(SIGTERM,SIG_IGN);
         pid_t child=fork();if(child<0)return 78;
         if(child==0){setsid();signal(SIGTERM,SIG_IGN);printf("PEER orphan pid=%d\n",getpid());for(;;)pause();}
         if(!strcmp(mode,"orphan"))return 0;
-        signal(SIGTERM,SIG_IGN);for(;;)pause();
+        for(;;)pause();
     }
     if(!strcmp(mode,"pids")){
         unsigned children=0;

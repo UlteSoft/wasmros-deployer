@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static SIGNALS: AtomicBool = AtomicBool::new(false);
+const STOP_GRACE: Duration = Duration::from_secs(2);
+const STOP_SETTLE: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// A private read-only copy of the sealed image. VM's normal no-follow loader
 /// accepts this regular path without weakening its symlink rejection policy.
 pub const IMAGE_PATH: &str = "/tmp/wros-admitted.wasm";
@@ -100,17 +103,27 @@ struct Session<'a> {
 }
 impl Drop for Session<'_> {
     fn drop(&mut self) {
-        // Groups are exclusively ours. Kill descendants before waiting for direct
-        // children; PID handles avoid targeting an unrelated reused process ID.
-        for group in &self.hierarchy.children {
-            let _ = group.kill();
-        }
-        for slot in &mut self.slots {
-            if let Some(child) = &mut slot.child {
-                let _ = child.kill();
-                let _ = child.wait();
+        // Exceptional teardown still signals every group before reaping.
+        // Avoid an unbounded wait when a kernel task cannot exit.
+        if self.hierarchy.kill().is_err() {
+            for slot in &self.slots {
+                if let Some(fd) = &slot.pidfd {
+                    signal(fd, libc::SIGKILL);
+                }
             }
         }
+        let _ = self.reap_exited(false);
+    }
+}
+fn signal(pidfd: &File, number: i32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            number,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
     }
 }
 fn nonblocking(fd: i32) -> Result<()> {
@@ -397,10 +410,21 @@ fn output(child: &mut Child, id: &str, generation: u64, budget: &mut DiagnosticB
     }
 }
 impl Session<'_> {
-    fn start(&mut self, index: usize, runtime: &File) -> Result<()> {
-        if STOP.load(Ordering::SeqCst) || self.events.failed() {
-            return Err("operator stop or audit failure before VM start".into());
+    fn check_start(&mut self) -> Result<()> {
+        if stopping() {
+            if let Some(journal) = &mut self.journal {
+                journal.stop(false)?;
+            }
+            return Err("operator stop before VM start".into());
         }
+        if self.events.failed() {
+            return Err("audit failure before VM start".into());
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, index: usize, runtime: &File) -> Result<()> {
+        self.check_start()?;
         let slot = &mut self.slots[index];
         let generation = if !slot.started {
             slot.state.operator_start()
@@ -418,10 +442,12 @@ impl Session<'_> {
         }
         self.hierarchy.children[index].drain(Duration::from_secs(2))?;
         self.hierarchy.children[index].verify_placement(&self.launches[index].process)?;
+        let enrollment = self.hierarchy.children[index].enrollment()?;
+        self.check_start()?;
         let (child, pidfd) = spawn(
             runtime,
             &self.launches[index],
-            self.hierarchy.children[index].enrollment()?,
+            enrollment,
         )?;
         self.events.send(format!(
             "INFO VM {:?} generation {} started with PID {}, no motion authority",
@@ -429,6 +455,7 @@ impl Session<'_> {
             generation,
             child.id()
         ));
+        let slot = &mut self.slots[index];
         slot.child = Some(child);
         slot.pidfd = Some(pidfd);
         slot.generation = generation;
@@ -437,27 +464,12 @@ impl Session<'_> {
         slot.output = DiagnosticBudget::default();
         Ok(())
     }
-    fn shutdown(&mut self) -> Result<()> {
-        for slot in &mut self.slots {
-            slot.state.operator_stop();
-            slot.next = None;
-            if let Some(fd) = &slot.pidfd {
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        fd.as_raw_fd(),
-                        libc::SIGTERM,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    );
-                }
-            }
-        }
-        let end = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < end {
-            let mut pending = false;
-            for (i, slot) in self.slots.iter_mut().enumerate() {
-                if let Some(child) = &mut slot.child {
+
+    fn reap_exited(&mut self, diagnostics: bool) -> Result<bool> {
+        let mut all_reaped = true;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(child) = &mut slot.child {
+                if diagnostics {
                     output(
                         child,
                         &self.launches[i].process.id,
@@ -465,28 +477,47 @@ impl Session<'_> {
                         &mut slot.output,
                         self.events,
                     );
-                    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                        slot.child = None;
-                        slot.pidfd = None;
-                    } else {
-                        pending = true;
-                    }
+                }
+                if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                    slot.child = None;
+                    slot.pidfd = None;
+                } else {
+                    all_reaped = false;
                 }
             }
-            if !pending {
-                break;
+        }
+        Ok(all_reaped)
+    }
+
+    fn wait_for_shutdown(&mut self, until: Instant, whole_tree: bool) -> Result<bool> {
+        loop {
+            if self.reap_exited(true)? && (!whole_tree || self.hierarchy.empty()?) {
+                return Ok(true);
             }
-            std::thread::sleep(Duration::from_millis(5));
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            std::thread::sleep(POLL_INTERVAL.min(remaining));
         }
-        for group in &self.hierarchy.children {
-            group.drain(Duration::from_secs(2))?;
-        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let grace = Instant::now() + STOP_GRACE;
         for slot in &mut self.slots {
-            if let Some(mut child) = slot.child.take() {
-                child.wait().map_err(|e| e.to_string())?;
+            slot.state.operator_stop();
+            slot.next = None;
+            if let Some(fd) = &slot.pidfd {
+                signal(fd, libc::SIGTERM);
             }
-            slot.pidfd = None;
         }
+        let graceful = self.wait_for_shutdown(grace, false);
+        let settle = Instant::now() + STOP_SETTLE;
+        self.hierarchy.kill()?;
+        if !self.wait_for_shutdown(settle, true)? {
+            return Err("deployment cgroup or direct children did not settle; supervisor intervention required".into());
+        }
+        graceful?;
         Ok(())
     }
 }
@@ -665,7 +696,7 @@ fn supervise(
                 Ok(())
             };
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 

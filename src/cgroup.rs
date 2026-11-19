@@ -234,6 +234,22 @@ pub struct Hierarchy {
     root: Group,
 }
 impl Hierarchy {
+    /// Stop the exclusive deployment tree in one kernel operation. A failed
+    /// root operation is reported even if the leaf-level fallback succeeds.
+    pub(crate) fn kill(&self) -> Result<()> {
+        if let Err(error) = self.root.kill() {
+            for child in &self.children {
+                let _ = child.kill();
+            }
+            return Err(format!("could not force-stop the deployment cgroup: {error}"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn empty(&self) -> Result<bool> {
+        self.root.empty()
+    }
+
     /// Reclaim only the exact instance set bound to a locked durable approval.
     /// The caller must hold that journal's exclusive lock. Unknown child groups
     /// stop recovery before any signal; existing known children must all drain
@@ -368,6 +384,8 @@ impl Hierarchy {
             return Err("VM memory reservations exceed delegated budget".into());
         }
         let root = Group::create(&parent, &format!("wros-{deployment}"))?;
+        // Require the whole-tree control before starting any VM.
+        root.kill()?;
         write(&root.directory, "memory.max", &memory.to_string())?;
         write(&root.directory, "memory.swap.max", "0")?;
         write(&root.directory, "pids.max", &pids.to_string())?;
