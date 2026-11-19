@@ -221,3 +221,5 @@ A bound VM can report its own permissions. Reduce the information visible to tha
 The VM also refuses a family-wide report that would reveal a denied function. An `allow` decision on a selector adds no filter of its own. Broader denials and the exposure of `permission.report` still apply. Filters can select `preloaddl`, `preloadwasm`, `wasip1`, `ros1v1`, `ros2v1` or `rosv2`. Queries can report that a configured target lacks compiled support.
 
 For a module, each of `module.describe`, `module.imports`, `module.exports`, `module.importers`, `module.group` and `module.permission.report` needs its own review decision. A VM metadata grant accepts `vm.describe` on `runtime`. The guest supplies the approved alias to the observation operation. Each alias belongs to one type, target and binding in the process. These decisions convey read-only access to the corresponding metadata. Interactive review uses `report/SELECTOR` and `metadata/TYPE/ALIAS/TARGET/OPERATION`. Cold startup applies the saved decisions.
+
+Before choosing a recovery module, inspect its MVP entry point, imports and resource ceilings. [Recovery module preflight](recovery-preflight.md)

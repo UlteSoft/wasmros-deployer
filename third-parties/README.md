@@ -18,3 +18,11 @@ Some packages in the lock and vendor tree support build-time or alternate-target
 implementations. Their presence does not mean every module enters the executable.
 Licenses retain upstream copyright and conditions; vendoring does not establish
 ownership of the code or industrial safety certification.
+
+The installer's optional `recovery-preflight` feature uses wasmparser 0.263.0
+and bitflags 2.13.2. The validator uses `WasmFeatures::MVP`. Cargo enables
+`features`, `validate` and `prefer-btree-collections` and disables the
+upstream defaults, including the Component Model and SIMD crate features.
+The packages retain their licenses, upstream sources and registry checksums.
+A prospective watchdog can exclude this installer feature and the entire
+validator dependency using `--no-default-features`.

@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["recovery-preflight"]
+recovery-preflight = ["dep:wasmparser"]
+
 [dependencies]
 roxmltree = "=0.20.0"
+wasmparser = { version = "=0.263.0", optional = true, default-features = false, features = ["features", "validate", "prefer-btree-collections"] }
 sha2 = "=0.10.9"
 libc = "=0.2.191"
 

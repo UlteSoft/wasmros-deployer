@@ -7,6 +7,8 @@ pub mod manifest;
 pub mod ownership;
 pub mod placement;
 pub mod recovery;
+#[cfg(feature = "recovery-preflight")]
+pub mod recovery_module;
 pub mod service;
 pub mod state;
 pub mod supervisor;

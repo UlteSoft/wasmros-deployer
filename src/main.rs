@@ -127,9 +127,29 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
     Ok(rights)
 }
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
+    #[cfg(feature = "recovery-preflight")]
+    if action == "inspect-recovery" {
+        let module = args.next().ok_or(usage)?;
+        if args.next().is_some() {
+            return Err(usage.into());
+        }
+        let report = wros_deployer::recovery_module::inspect_file(std::path::Path::new(&module))
+            .map_err(|e| e.to_string())?;
+        println!("Recovery candidate SHA-256 {}", report.sha256);
+        println!(
+            "Entry {} function {}. Private memory {} to {} pages. Static instructions {}.",
+            report.entry,
+            report.function,
+            report.initial_pages,
+            report.maximum_pages,
+            report.instructions
+        );
+        println!("Host imports 0. Read-only preflight. Deployment and recovery authority require separate approval.");
+        return Ok(());
+    }
     if !matches!(
         action.as_str(),
         "plan" | "review" | "verify" | "authorize" | "service" | "run" | "resume"

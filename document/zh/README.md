@@ -213,3 +213,5 @@ D BetterC 使用所选安装中的 `wrd verify` 核对操作员批准的构建�
 若某个函数的查询被拒绝，VM 也会拒绝能够披露该函数的整族查询。选择器上的 `allow` 表示该项不追加限制。整族拒绝和 `permission.report` 接口本身的暴露规则仍然生效。支持的模块族有 `preloaddl`、`preloadwasm`、`wasip1`、`ros1v1`、`ros2v1` 和 `rosv2`。查询可返回当前构建缺少相应支持的状态。
 
 读取模块描述、导入、导出、反向导入关系、权限组和权限报告分别对应 `module.describe`、`module.imports`、`module.exports`、`module.importers`、`module.group` 和 `module.permission.report`，需要逐项审阅。VM 状态使用固定对象 `runtime` 和操作 `vm.describe`。客体查询时传入已批准的别名。每个别名在一个进程内绑定唯一类型、对象和用途。这些权限均为只读。交互审阅使用 `report/选择器` 和 `metadata/类型/别名/对象/操作`，冷启动时恢复已审阅的决定。
+
+选择恢复模块前，可在本地校验其 MVP 入口、导入和资源上限。[恢复模块预检](recovery-preflight.md)
