@@ -17,11 +17,18 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Check the operator-supplied roots and the binary before executing any code.
 /// Paths of submitted modules are never accepted as the verifier or policy store.
 pub fn protected(path: &Path, bundle: &Path, directory: bool) -> Result<PathBuf> {
+    let real = protected_path(path, directory)?;
+    if real.starts_with(bundle) {
+        return Err(format!("expected a protected path outside the bundle: {path:?}"));
+    }
+    Ok(real)
+}
+
+/// Check a locally configured path whose caller does not consume a bundle.
+pub(crate) fn protected_path(path: &Path, directory: bool) -> Result<PathBuf> {
     let real = path.canonicalize().map_err(|e| e.to_string())?;
-    if !path.is_absolute() || real != path || real.starts_with(bundle) {
-        return Err(format!(
-            "expected a protected absolute path outside the bundle: {path:?}"
-        ));
+    if !path.is_absolute() || real != path {
+        return Err(format!("expected a protected absolute path: {path:?}"));
     }
     let uid = unsafe { libc::geteuid() };
     for ancestor in real.ancestors() {

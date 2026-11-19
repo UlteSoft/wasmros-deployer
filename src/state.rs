@@ -27,6 +27,19 @@ enum Phase {
     Blocked,
     FirstStart,
 }
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Faulted => "faulted",
+            Self::Ended => "ended",
+            Self::Stopped => "stopped",
+            Self::Blocked => "blocked",
+            Self::FirstStart => "first-start",
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub rights: BTreeMap<String, bool>,
@@ -327,34 +340,71 @@ fn private(file: &File, directory: bool) -> Result<()> {
     }
     Ok(())
 }
+fn open_directory(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    private(&directory, true)?;
+    Ok(directory)
+}
+
+fn read_approval(directory: &File) -> Result<Option<Record>> {
+    match open_at(directory, c"approval", libc::O_RDONLY) {
+        Ok(file) => {
+            private(&file, false)?;
+            let mut value = Vec::new();
+            file.take((MAX_RECORD + 1) as u64)
+                .read_to_end(&mut value)
+                .map_err(|e| e.to_string())?;
+            Ok(Some(Record::decode(&value)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// One instance's persisted phase and restart accounting.
+pub struct InstanceStatus {
+    pub id: String,
+    pub phase: &'static str,
+    pub generation: u64,
+    pub restarts: u32,
+}
+
+/// A bounded snapshot of durable state, with no claim about process liveness.
+pub struct Status {
+    pub current_boot: bool,
+    pub instances: Vec<InstanceStatus>,
+}
+
+/// Read a published approval snapshot without acquiring the supervisor lock.
+/// The writer replaces the whole file, so a read uses a single revision of it.
+pub fn status(path: &Path) -> Result<Status> {
+    let directory = open_directory(&crate::verification::protected_path(path, true)?)?;
+    let record = read_approval(&directory)?.ok_or("missing durable approval")?;
+    let current_boot = record.boot == boot_id()?;
+    let instances = record.entries.into_iter().map(|(id, entry)| InstanceStatus {
+        id,
+        phase: entry.phase.name(),
+        generation: entry.generation,
+        restarts: entry.restarts,
+    }).collect();
+    Ok(Status { current_boot, instances })
+}
+
 impl Journal {
     pub fn open(path: &Path, bundle: &Path) -> Result<Self> {
-        crate::verification::protected(path, bundle, true)?;
-        use std::os::unix::fs::OpenOptionsExt;
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|e| e.to_string())?;
-        private(&directory, true)?;
+        let directory = open_directory(&crate::verification::protected(path, bundle, true)?)?;
         let lock = open_at(&directory, c"lock", libc::O_RDWR | libc::O_CREAT)
             .map_err(|e| e.to_string())?;
         private(&lock, false)?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err("deployment state is already owned by another supervisor".into());
         }
-        let record = match open_at(&directory, c"approval", libc::O_RDONLY) {
-            Ok(f) => {
-                private(&f, false)?;
-                let mut value = Vec::new();
-                f.take((MAX_RECORD + 1) as u64)
-                    .read_to_end(&mut value)
-                    .map_err(|e| e.to_string())?;
-                Some(Record::decode(&value)?)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.to_string()),
-        };
+        let record = read_approval(&directory)?;
         Ok(Self {
             directory,
             _lock: lock,

@@ -128,9 +128,28 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
     Ok(rights)
 }
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
+    if action == "status" {
+        if args.next().as_deref() != Some("--state-directory") {
+            return Err(usage.into());
+        }
+        let path = args.next().ok_or(usage)?;
+        if args.next().is_some() {
+            return Err(usage.into());
+        }
+        let status = state::status(std::path::Path::new(&path))?;
+        let boot = if status.current_boot { "current" } else { "previous" };
+        println!("INFO Recorded deployment state from the {boot} boot. Process liveness is unverified.");
+        for instance in status.instances {
+            println!(
+                "INFO Recorded VM {:?} generation {}, phase {}, restarts {}",
+                instance.id, instance.generation, instance.phase, instance.restarts
+            );
+        }
+        return Ok(());
+    }
     #[cfg(feature = "recovery-preflight")]
     if action == "inspect-recovery" {
         let module = args.next().ok_or(usage)?;

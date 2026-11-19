@@ -97,6 +97,20 @@ The initial activation is valid once in the same kernel boot. It does not consum
 
 Do not use `--cgroup-parent` together with `--supervisor-cgroup`. The former remains available for a manually supervised external workload subtree; it does not apply a manager budget. Specifying a supervisor XML budget without the managed mode is rejected rather than silently ignored.
 
+## Inspect the recovery record
+
+```sh
+wros-deployer status --state-directory /protected/state/cell
+```
+
+Run the command as the owner of the private state directory. It reads one
+checksummed approval record while the manager can continue running. It shows
+whether the record is from the current boot and prints each VM's recorded
+phase, generation and consumed retry count. It acquires no supervisor lock
+and grants no control authority. If a concurrent replacement removes the
+file before its ownership check completes, repeat the observation. Use the
+independent manager to check live process state.
+
 ## Platforms without this systemd capability
 
 The production `--supervisor-cgroup` contract is independent of systemd. An alternative platform supervisor must create an exclusive bounded root, enable delegation from its ancestors, place the deployer alone in the `manager` child, own every descendant's lifecycle, provide bounded restart and whole-tree shutdown, and invoke the exact approved `resume` command. The deployer validates the observable cgroup contract. It cannot prove that an arbitrary external supervisor will recover after its own failure.

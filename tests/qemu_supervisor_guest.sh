@@ -404,12 +404,21 @@ empty; pass state-manager-crashes-preserve-retry-budget
 /bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "stop=$digest" > /durable-stop.log 2>&1 & manager=$!
 wait_started /durable-stop.log 1
 grep -q 'generation 4 started' /durable-stop.log || fail operator-reset-generation
+approval_before=$(sha256sum /state/journal/approval)
+/bin/wros-deployer status --state-directory /state/journal > /durable-status.log 2>&1 || { cat /durable-status.log; fail status-during-execution; }
+grep -Fxq 'INFO Recorded VM "stop" generation 4, phase running, restarts 0' /durable-status.log || fail wrong-running-phase
+test "$(sha256sum /state/journal/approval)" = "$approval_before" || fail status-changed-review
 kill -TERM "$manager"; wait "$manager" || { cat /durable-stop.log; fail durable-stop; }
+/bin/wros-deployer status --state-directory /state/journal > /durable-status.log 2>&1 || fail status-after-stop
+grep -Fxq 'INFO Recorded VM "stop" generation 4, phase stopped, restarts 0' /durable-status.log || fail wrong-stopped-phase
+pass state-status-reports-running-and-stopped-without-changes
 /bin/wros-deployer resume "$@" > /durable-stopped.log 2>&1 || fail stopped-resume
 grep -q 'No instance has an automatic cold-start grant' /durable-stopped.log || fail restarted-after-durable-stop
 empty; pass state-operator-stop-survives-manager-replacement
 cp /state/journal/approval /state/journal/backup
 printf X | dd of=/state/journal/approval bs=1 count=1 conv=notrunc 2>/dev/null
+if /bin/wros-deployer status --state-directory /state/journal > /durable-status.log 2>&1; then fail status-accepted-corruption; fi
+grep -q 'checksum mismatch' /durable-status.log || fail wrong-status-corruption-denial
 if /bin/wros-deployer resume "$@" > /durable-tamper.log 2>&1; then fail accepted-corrupt-state; fi
 grep -q 'checksum mismatch' /durable-tamper.log || { cat /durable-tamper.log; fail wrong-tamper-denial; }
 cp /state/journal/backup /state/journal/approval
