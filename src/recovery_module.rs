@@ -3,10 +3,7 @@
 //! and its generation-scoped authority have passed fault qualification.
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use wasmparser::{ExternalKind, FunctionBody, Operator, Parser, Payload, Validator, WasmFeatures};
 
@@ -155,24 +152,7 @@ pub fn inspect(bytes: &[u8]) -> Result<Inspection> {
 /// Inspect a bounded snapshot from one regular file descriptor. Opening a FIFO
 /// cannot block the operator, and a final symlink is refused.
 pub fn inspect_file(path: &Path) -> Result<Inspection> {
-    // An ordinary read-only open can itself invoke a device driver's open
-    // method. Acquire a path descriptor first and reject non-regular inodes.
-    let pin = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-        .open(path)?;
-    let meta = pin.metadata()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES as u64 {
-        return Err("expected a regular recovery module within the size limit".into());
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(format!("/proc/self/fd/{}", pin.as_raw_fd()))?;
-    let opened = file.metadata()?;
-    if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
-        return Err("unable to reopen the pinned recovery module".into());
-    }
+    let file = crate::manifest::open_regular(path, MAX_BYTES as u64)?;
     let mut bytes = Vec::new();
     file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
     inspect(&bytes)

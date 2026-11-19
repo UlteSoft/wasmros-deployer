@@ -34,7 +34,7 @@ Normal signed execution requires both wasm-cosign and VM verification. The desig
 
 ## Verify a signed submission
 
-The XML policy name resolves inside the administrator's independent policy directory. The operator supplies that directory on the command line. Keep the verifier and trust store outside the submitted bundle. Bundle file lookup pins each directory and rejects symlinks. Create a private staging directory owned by the operator with mode 0700.
+The XML policy name resolves inside the administrator's independent policy directory. The operator supplies that directory on the command line. Keep the verifier and trust store outside the submitted bundle. Manifest and artifact reads use the same pinned bundle directory. Artifact lookup rejects symlink components and checks the final inode type before opening any contents. Only regular files are read. Create a private staging directory owned by the operator with mode 0700.
 
 ```sh
 wros-deployer verify deployment.xml --policy-root /protected/policies \

@@ -5,7 +5,10 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+};
 use std::path::{Component, Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -74,12 +77,37 @@ pub struct Supervisor {
     pub memory_nodes: Option<crate::placement::Set>,
 }
 pub fn read_xml(p: &Path) -> Result<String> {
-    let f = OpenOptions::new()
+    xml_contents(open_regular(p, MAX_XML)?)
+}
+
+/// Acquire a reference without opening file contents, then admit a regular file.
+pub(crate) fn open_regular(path: &Path, maximum: u64) -> Result<File> {
+    let pin = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(p)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)
         .map_err(|e| e.to_string())?;
-    xml_contents(f)
+    reopen_regular(pin, maximum)
+}
+
+/// Check an O_PATH handle before reopening the same inode. Special files can
+/// require effects merely to open them, so even a nonblocking read must wait
+/// for the regular-file check.
+fn reopen_regular(pin: File, maximum: u64) -> Result<File> {
+    let meta = pin.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() > maximum {
+        return Err("expected a regular file within the size limit".into());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", pin.as_raw_fd()))
+        .map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+        return Err("unable to reopen the pinned regular file".into());
+    }
+    Ok(file)
 }
 pub fn xml_contents(f: File) -> Result<String> {
     if !f.metadata().map_err(|e| e.to_string())?.is_file() {
@@ -565,7 +593,7 @@ pub fn local_file(root: &File, relative: &Path) -> Result<File> {
         };
         let part = CString::new(part.as_bytes()).map_err(|e| e.to_string())?;
         let last = parts.peek().is_none();
-        let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_RDONLY;
+        let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_PATH;
         if !last {
             flags |= libc::O_DIRECTORY;
         }
@@ -576,10 +604,7 @@ pub fn local_file(root: &File, relative: &Path) -> Result<File> {
         }
         let next = unsafe { File::from_raw_fd(fd) };
         if last {
-            if !next.metadata().map_err(|e| e.to_string())?.is_file() {
-                return Err("bundle artifact must be a regular file".into());
-            }
-            return Ok(next);
+            return reopen_regular(next, u64::MAX);
         }
         directory = next;
     }

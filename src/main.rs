@@ -1,8 +1,9 @@
 //! Local preflight and operator review for one fixed bundle.
-use manifest::{deployment, local_file, read_xml, recommendations, sha256, Result};
+use manifest::{deployment, local_file, recommendations, sha256, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use wros_deployer::{manifest, service, state, supervisor, verdict::Signature, verification};
 
 /// Bind every automatic invocation to the exact reviewed configuration and
@@ -236,8 +237,13 @@ fn run() -> Result<()> {
         None
     };
     let root = manifest.parent().ok_or("deployment directory missing")?;
-    let bundle = std::fs::File::open(root).map_err(|e| e.to_string())?;
-    let xml = read_xml(&manifest)?;
+    let bundle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .map_err(|e| e.to_string())?;
+    let manifest_name = manifest.file_name().ok_or("deployment file name missing")?;
+    let xml = manifest::xml_contents(local_file(&bundle, std::path::Path::new(manifest_name))?)?;
     let plan = deployment(&xml)?;
     if action == "service" {
         print!(

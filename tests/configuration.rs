@@ -50,6 +50,36 @@ fn recommendation_is_separate_and_unique() {
     ))
     .is_err());
 }
+
+#[test]
+fn bundle_reads_regular_files_through_the_pinned_directory() {
+    use std::ffi::CString;
+    use std::fs::{self, File};
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+    use std::path::Path;
+    use wros_deployer::manifest::{local_file, read_xml, xml_contents};
+
+    let directory = std::env::temp_dir().join(format!("wros-bundle-{}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    let root = File::open(&directory).unwrap();
+    let nested = directory.join("submitted");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("deployment.xml"), config()).unwrap();
+    let document = local_file(&root, Path::new("submitted/deployment.xml")).unwrap();
+    assert_eq!(xml_contents(document).unwrap(), config());
+
+    symlink("submitted", directory.join("alias")).unwrap();
+    symlink("submitted/deployment.xml", directory.join("linked.xml")).unwrap();
+    let pipe = CString::new(directory.join("pipe.xml").as_os_str().as_bytes()).unwrap();
+    // The fixture is a FIFO with no writer. A type check must finish immediately.
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+    for path in ["submitted", "alias/deployment.xml", "linked.xml", "pipe.xml"] {
+        assert!(local_file(&root, Path::new(path)).is_err(), "{path}");
+    }
+    assert!(read_xml(&directory.join("pipe.xml")).is_err());
+    assert!(read_xml(Path::new("/dev/null")).is_err());
+    fs::remove_dir_all(directory).unwrap();
+}
 #[test]
 fn bounded_restart_and_nonroot_identity() {
     for attributes in [
