@@ -65,6 +65,7 @@ def main():
     p.add_argument('--clock-fixture', type=Path,
                    help='completed signed guest fixture from tests/clock_permissions.py')
     p.add_argument('--wat2wasm', type=Path, default=Path('/usr/bin/wat2wasm'))
+    p.add_argument('--local-scheduling', action='store_true', help='Run signed local resource decisions from the admission fixture')
     p.add_argument('--sdk-memory-bytes', type=int, default=256 << 20,
                    help='Guest cgroup limit for the SDK application under test (default 256 MiB)')
     args=p.parse_args()
@@ -111,6 +112,12 @@ def main():
         if (digest(root/'bundle/sdk.wasm') != binding['sha256'] or
                 digest(root/'bundle/sdk.signed.wasm') != binding['signed_sha256']):
             raise ValueError('guest inputs differ from the signed SDK fixture')
+    schedule_inputs = {}
+    if args.local_scheduling:
+        for name in ('schedule.signed.wasm', 'schedule-rights.xml'):
+            path = args.admission_fixture/'bundle'/name
+            copy(path, '/bundle/'+name, 0o644)
+            schedule_inputs[str(path.resolve())] = digest(root/'bundle'/name)
     clock_inputs = {}
     if args.clock_fixture:
         clock = args.clock_fixture.resolve()
@@ -167,6 +174,8 @@ def main():
     result['inputs'].update(probe_inputs)
     result['clock_fixture_requested'] = bool(args.clock_fixture)
     result['inputs'].update(clock_inputs)
+    result['inputs'].update(schedule_inputs)
+    result['local_scheduling_requested'] = args.local_scheduling
     result['denial_compile']=denial_compile
     for path in (denial_source,args.wat2wasm.resolve()):
         result['inputs'][str(path)]=digest(path)
@@ -186,10 +195,13 @@ def main():
     result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
     expected=39+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
     expected += int(result['interface_probe_requested'])
+    expected += 2 * int(args.local_scheduling)
     signed_case='signed-sdk-verification-at-deployer-and-vm' in result['cases']
     result['complete']=(code==0 and 'QEMU_SUPERVISOR_PASS' in text and 'QEMU_SUPERVISOR_FAIL' not in text
                         and len(set(result['cases']))==expected and len(result['cases'])==expected
                         and signed_case==result['signed_sdk_requested']
+                        and all(('local-scheduling-'+engine in result['cases']) == args.local_scheduling
+                                for engine in ('interpreter', 'aot'))
                         and ('signed-sdk-reviewed-every-ros-interface' in result['cases'])==result['interface_probe_requested']
                         and ('clock-cold-start-preserves-reviewed-reads' in result['cases'])==result['clock_fixture_requested']
                         and ('clock-empty-recommendations-start-hidden' in result['cases'])==result['clock_fixture_requested'])

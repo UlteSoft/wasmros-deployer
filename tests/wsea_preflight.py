@@ -18,6 +18,7 @@ def main():
                         help="Sign a compiled SDK application with the disposable test authority for a full-kernel run.")
     parser.add_argument("--sdk-source", type=Path, help="Trusted SDK checkout for the core Wasm import reader.")
     parser.add_argument("--sdk-interface-probe", type=Path, help="Completed strict all-interface fixture for this test authority")
+    parser.add_argument("--local-scheduling", action="store_true", help="Sign the per-alias scheduling probe for a QEMU run")
     args = parser.parse_args()
     if args.sdk_interface_probe and not args.sdk_module:
         parser.error("--sdk-interface-probe requires --sdk-module and --sdk-source")
@@ -59,6 +60,9 @@ def main():
     signed = bundle / "body.wasm"
     now = datetime.datetime.now(datetime.timezone.utc)
     stamp = lambda delta: (now + datetime.timedelta(seconds=delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if args.local_scheduling:
+        import local_scheduling
+        local_scheduling.create(args.vm_source.resolve(), out, args.cosign, ca, check, stamp)
     check("sign", [args.cosign, "wasm", "secure", "sign", unsigned, "--policy", policy, "--key", ca["key"],
                    "--certificate", ca["certificate"], "--crl", ca["crl"], "--module-id", "body",
                    "--module-version", "1", "--algorithm", "Ed25519", "--not-before", stamp(-60),

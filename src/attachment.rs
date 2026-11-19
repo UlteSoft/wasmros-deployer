@@ -575,6 +575,7 @@ mod tests {
     use std::os::unix::fs::FileExt;
     #[test]
     fn maximum_descriptor_injection_is_closed_and_denied() {
+        let _isolation = crate::FORK_AND_LOCK_TEST.lock().unwrap();
         let [sender, receiver] = carrier().unwrap();
         let [wake, wait] = carrier().unwrap();
         let [endpoint, _other] = endpoints().unwrap();

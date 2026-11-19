@@ -104,17 +104,24 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
             return Err("review cancelled".into());
         }
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["confirm"] => break,
+            ["confirm"] => match manifest::local_grants(&rights) {
+                Ok(_) => break,
+                Err(error) => eprintln!("{error}"),
+            },
             [action, name] if manifest::Permission::from_key(name).is_some() => match *action {
                 "allow" | "deny" => {
-                    rights.insert(name.to_string(), *action == "allow");
+                    if rights.len() >= manifest::MAX_PERMISSIONS && !rights.contains_key(*name) {
+                        eprintln!("permission count exceeds budget; remove a decision before adding another");
+                    } else {
+                        rights.insert(name.to_string(), *action == "allow");
+                    }
                 }
                 "remove" => {
                     rights.remove(*name);
                 }
                 _ => eprintln!("unknown action"),
             },
-            _ => eprintln!("enter a registered interface or clock read permission, or confirm"),
+            _ => eprintln!("enter a registered interface, a clock read permission or local/TYPE/ALIAS/OPERATION, or confirm"),
         }
     }
     Ok(rights)
@@ -431,11 +438,15 @@ fn run() -> Result<()> {
         if rights.is_empty() {
             println!("INFO VM {:?} has no reviewed interface or resource permissions.", vm.id);
         }
+        for (alias, (kind, operations)) in manifest::local_grants(&rights)? {
+            argv.extend(["--ros-scene-grant".into(), vm.id.clone(), alias.into(), kind.into(),
+                         alias.into(), "local".into(), operations.join(",")]);
+        }
         let mut clock_policy = false;
         for (name, enabled) in rights {
             use manifest::Permission;
             let permission = Permission::from_key(&name).ok_or("unknown reviewed permission")?;
-            if !matches!(permission, Permission::RosInterface(_)) && !clock_policy {
+            if matches!(permission, Permission::ClockInterface(_) | Permission::ClockGrant(_)) && !clock_policy {
                 argv.extend(["--wasip1-single-create".into(), vm.id.clone(),
                              "--wasip1-single-enable".into(), vm.id.clone()]);
                 clock_policy = true;
@@ -456,6 +467,9 @@ fn run() -> Result<()> {
                     println!("INFO VM {:?} WASIp1 clock read permission {}: {}", vm.id, name, decision);
                     let option = if enabled { "--wasip1-single-grant" } else { "--wasip1-single-deny" };
                     argv.extend([option.into(), vm.id.clone(), name.into()]);
+                }
+                Permission::LocalOperation { kind, alias, operation } => {
+                    println!("INFO VM {:?} local {} resource {:?} operation {}: {}", vm.id, kind, alias, operation, decision);
                 }
             }
         }

@@ -175,3 +175,33 @@ fn aot_policy_is_scoped_to_the_aot_engine() {
     }
     assert!(deployment(&config().replace("pids=", r#"aot-policy="unknown" pids="#)).is_err());
 }
+
+#[test]
+fn local_scheduling_actions_bind_one_vm_alias() {
+    use wros_deployer::manifest::{local_grants, Permission};
+    let xml = r#"<recommendations>
+        <local-resource type="guard" alias="signal" operation="guard.create" access="allow"/>
+        <local-resource type="guard" alias="signal" operation="guard.take" access="deny"/>
+        <local-resource type="guard" alias="other" operation="guard.trigger" access="deny"/>
+        <interface name="guard.take" expose="allow"/>
+    </recommendations>"#;
+    let rights = recommendations(xml).unwrap();
+    let grants = local_grants(&rights).unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants["signal"], ("guard", vec!["guard.create"]));
+    for invalid in [
+        xml.replace("alias=\"other\"", "alias=\"signal\" type=\"wait\""),
+        xml.replace("type=\"guard\" alias=\"other\" operation=\"guard.trigger\"", "type=\"wait\" alias=\"signal\" operation=\"wait.poll\""),
+        xml.replace("guard.create", "clock.update"),
+        xml.replace("type=\"guard\"", "type=\"driver\""),
+        xml.replace("alias=\"signal\"", "alias=\"--run\""),
+        xml.replace("operation=\"guard.create\"", "operation=\"guard.create,guard.trigger\""),
+        xml.replace("name=\"guard.take\"", "name=\"local/guard/signal/guard.take\""),
+    ] {
+        assert!(recommendations(&invalid).is_err());
+    }
+    for key in ["local/clock.system/c/clock.update", "local/clock.steady/c/clock.update",
+                "local/guard/a/b/guard.create", "local/timer/t/wait.poll", "local/clock.ros//clock.read"] {
+        assert!(Permission::from_key(key).is_none());
+    }
+}

@@ -166,3 +166,31 @@ wasm64 目标使用 SDK 对应的 `wasip1.clock_time_get_wasm64`。读取分辨�
 完整签名部署测试可指定 `--accelerator tcg`（默认）或 `--accelerator kvm`，还可用 `--guest-timeout-seconds` 设置整个来宾的时限，取值 30 至 1800 秒，默认 240 秒。所选后端需要当前 cgroup 允许。两次 TCG 测试均从各自语言公开安装的 SDK 构建应用，使用 AOT 引擎、fast-compile 策略和 1200 秒来宾时限。编入 Wasm 的 Lua 解释器在 499 秒内通过全部 42 项检查，Fortran 应用在 1036 秒内通过相同的 42 项检查。来宾会分别启动新的 VM 来验证授权、拒绝和签名，时限包含这些进程的编译和监督时间。
 
 D BetterC 使用所选安装中的 `wrd verify` 核对操作员批准的构建回执、Wasm 和 VM，随后才签署应用。公开 SDK 提交 `5fa860a356f19ed29aea514142eb897c3231951f` 的 Unitree D 安装包构建的 Xmake 示例，在 QEMU TCG 解释器部署中通过了全部 42 项用例，包含部署器和 VM 独立验签。该应用只导入 `uwvm_ros_v2.abi`。
+
+### ROSv2 本地调度资源
+
+在各 VM 独立的推荐权限 XML 中，为每个具名资源单独配置操作。下面的来宾可以打开 `signal`、创建并触发 guard。它调用已经暴露的 `guard.take` 时会收到拒绝。
+
+```xml
+<recommendations>
+  <interface name="capability.open" expose="allow"/>
+  <interface name="guard.create" expose="allow"/>
+  <interface name="guard.trigger" expose="allow"/>
+  <interface name="guard.take" expose="allow"/>
+  <local-resource type="guard" alias="signal" operation="guard.create" access="allow"/>
+  <local-resource type="guard" alias="signal" operation="guard.trigger" access="allow"/>
+  <local-resource type="guard" alias="signal" operation="guard.take" access="deny"/>
+</recommendations>
+```
+
+| 资源类型 | 可独立授权的类型专属操作 |
+| --- | --- |
+| `guard` | `guard.create`、`guard.trigger`、`guard.take` |
+| `clock.steady`、`clock.system` | `clock.create`、`clock.read` |
+| `clock.ros` | `clock.create`、`clock.read`、`clock.update` |
+| `timer` | `timer.create`、`timer.reset`、`timer.cancel`、`timer.take` |
+| `wait` | `wait.create`、`wait.add`、`wait.remove`、`wait.acknowledge`、`wait.poll` |
+
+每种资源还可以独立授权 `resource.observe`、`resource.close` 和 `capability.revoke`。来宾调用的导入接口需要单独暴露。其他操作引用该资源时，VM 可以检查其 `resource.observe` 权限。创建定时器时 VM 还会校验时钟权限，向等待集合加入资源时会校验该资源的观察权限。
+
+在审核界面输入 `allow local/guard/signal/guard.create` 可以添加一项操作。部署器将批准的操作合并为该别名的一条本地授权。没有获准操作的别名无法打开。同一个 VM 中的别名只能绑定一种类型。经授权冷启动时，部署器从受保护的状态记录恢复已审核的操作，VM 重新创建句柄。这条路径只启用 ROSv2。

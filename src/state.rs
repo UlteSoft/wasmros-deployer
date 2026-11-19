@@ -245,7 +245,7 @@ impl Record {
                 _ => return Err("unknown signature waiver".into()),
             };
             let n = r.number()?;
-            if n > 256 {
+            if n as usize > crate::manifest::MAX_PERMISSIONS {
                 return Err("permission count exceeds budget".into());
             }
             let mut rights = BTreeMap::new();
@@ -261,6 +261,7 @@ impl Record {
                     return Err("unknown or duplicate approved permission".into());
                 }
             }
+            crate::manifest::local_grants(&rights)?;
             if entries
                 .insert(
                     name,
@@ -590,6 +591,20 @@ mod tests {
         let restored = Record::decode(&record.encode().unwrap()).unwrap();
         assert_eq!(restored.entries["body"].rights, approved);
         record.entries.get_mut("body").unwrap().rights.insert("wasip1.clock.monotonic-timer".into(), true);
+        assert!(record.encode().is_err());
+    }
+    #[test]
+    fn named_operations_preserve_denials_and_an_alias_has_one_type() {
+        let mut record = sample();
+        let entry = record.entries.get_mut("body").unwrap();
+        entry.rights.insert("local/guard/signal/guard.trigger".into(), true);
+        entry.rights.insert("local/guard/signal/guard.take".into(), false);
+        let approved = entry.rights.clone();
+        let restored = Record::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(restored.entries["body"].rights, approved);
+        record.entries.get_mut("body").unwrap().rights.insert(
+            "local/timer/signal/timer.take".into(), false,
+        );
         assert!(record.encode().is_err());
     }
     #[test]

@@ -287,6 +287,30 @@ if test -f /bundle/clock.signed.wasm; then
     empty; pass clock-empty-recommendations-start-hidden
 fi
 
+if test -f /bundle/schedule.signed.wasm; then
+    digest_schedule=$(sha256sum /bundle/schedule.signed.wasm); digest_schedule=${digest_schedule%% *}
+    mkdir -m 700 /state/schedule-admission /state/schedule-vm
+    for role in admission vm; do
+        /bin/cosign wasm secure policy-init --output "/trust/schedule-$role.policy" --state-dir "/state/schedule-$role" --trust-root /trust/root.pem --certificate /trust/signer.pem --module-id schedule --algorithms Ed25519 --capabilities 32
+        chmod 644 "/trust/schedule-$role.policy"
+    done
+    chown -R 10001:10001 /state/schedule-vm
+    for engine in interpreter aot; do
+        review="/state/schedule-$engine"
+        mkdir -m 700 "$review"
+        cp /bundle/schedule-rights.xml /bundle/local-rights.xml
+        printf '<deployment id="cell"><vm id="schedule" module="schedule.signed.wasm" sha256="%s" policy="schedule-admission.policy" vm-policy="schedule-vm.policy" recommendations="local-rights.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$digest_schedule" "$sdk_memory" "$engine" > /bundle/current.xml
+        set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --runtime /bin/uwvm2-ros --cgroup-parent /sys/fs/cgroup/delegated --state-directory "$review"
+        /bin/wros-deployer authorize "$@" --accept-recommendations > /schedule.log 2>&1 || { cat /schedule.log; fail schedule-approval; }
+        printf '<recommendations/>\n' > /bundle/local-rights.xml
+        /bin/wros-deployer resume "$@" >> /schedule.log 2>&1 || { cat /schedule.log; fail schedule-resume; }
+        grep -Fq 'local guard resource "signal" operation guard.take: deny' /schedule.log || fail schedule-review
+        if grep -Fq -- '--wasip1-single-create' /schedule.log; then fail unexpected-wasi-policy; fi
+        grep -Fq 'schedule|1|' /state/schedule-vm/state || fail schedule-secondary-verification
+        empty; pass "local-scheduling-$engine"
+    done
+fi
+
 echo "$parent_limit" > /sys/fs/cgroup/delegated/memory.max || fail sdk-restore-parent-budget
 
 configure parentdeath true 2 134217728

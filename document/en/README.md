@@ -174,3 +174,31 @@ To exercise another installed SDK language, supply a compiled ABI-query applicat
 The full signed installation test accepts `--accelerator tcg` (default) or `--accelerator kvm` and an explicit `--guest-timeout-seconds 30..1800` (default 240). The cgroup must permit the selected backend. Two TCG runs used a public SDK installation for each language, the AOT engine, the fast-compile policy and a 1,200-second guest budget. The Lua interpreter built into Wasm passed all 42 checks in 499 seconds. The Fortran application passed the same 42 checks in 1,036 seconds. The guest starts fresh VM processes for grant, denial and signature verification. This time budget includes compilation and supervision across the entire test.
 
 For D BetterC, the fixture checks the operator-approved receipt digest and runs the installed `wrd verify` against the selected VM before signing the application. A public Unitree D installation built the Xmake application at SDK commit `5fa860a356f19ed29aea514142eb897c3231951f`. It passed all 42 interpreter deployment cases under QEMU TCG, including the independent deployer and VM signature checks. The application imported only `uwvm_ros_v2.abi`.
+
+### Local ROSv2 scheduling resources
+
+A VM can use guards, clocks, timers and wait sets through ROSv2. Put each resource decision in that VM's separate recommendation file. The following example lets a guest open the alias `signal`, create a guard and trigger it. A call to the exposed `guard.take` returns permission denied.
+
+```xml
+<recommendations>
+  <interface name="capability.open" expose="allow"/>
+  <interface name="guard.create" expose="allow"/>
+  <interface name="guard.trigger" expose="allow"/>
+  <interface name="guard.take" expose="allow"/>
+  <local-resource type="guard" alias="signal" operation="guard.create" access="allow"/>
+  <local-resource type="guard" alias="signal" operation="guard.trigger" access="allow"/>
+  <local-resource type="guard" alias="signal" operation="guard.take" access="deny"/>
+</recommendations>
+```
+
+| Resource type | Type-specific operations |
+| --- | --- |
+| `guard` | `guard.create`, `guard.trigger`, `guard.take` |
+| `clock.steady`, `clock.system` | `clock.create`, `clock.read` |
+| `clock.ros` | `clock.create`, `clock.read`, `clock.update` |
+| `timer` | `timer.create`, `timer.reset`, `timer.cancel`, `timer.take` |
+| `wait` | `wait.create`, `wait.add`, `wait.remove`, `wait.acknowledge`, `wait.poll` |
+
+Each type also accepts separate `resource.observe`, `resource.close` and `capability.revoke` decisions. Expose each import that the guest calls separately. The VM uses `resource.observe` when another operation refers to the resource. The VM checks the clock capability when creating a timer and the observed capability when attaching a resource to a wait set.
+
+Use `allow local/guard/signal/guard.create` at the review prompt to add an operation. The deployer combines approved operations into one local grant per alias. An alias with zero approved operations stays unavailable. An alias has one type within its VM. On an authorized cold start, the deployer reads the reviewed operations from its protected state and the VM creates fresh handles. This path activates only ROSv2.

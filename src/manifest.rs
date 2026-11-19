@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_XML: u64 = 256 * 1024;
+pub const MAX_PERMISSIONS: usize = 256;
 /// Execution strategy for a reviewed application VM. Both engines enforce
 /// the same guest permissions. This setting grants no compiler threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,9 +143,33 @@ pub enum Permission<'a> {
     RosInterface(&'a str),
     ClockInterface(&'a str),
     ClockGrant(&'a str),
+    LocalOperation { kind: &'a str, alias: &'a str, operation: &'a str },
 }
 impl<'a> Permission<'a> {
+    /// Host scheduling resources are private to the named VM. Validate all three
+    /// fields before forming a durable review key or emitting a VM argument.
+    fn local(kind: &'a str, alias: &'a str, operation: &'a str) -> Option<Self> {
+        if !id(alias) || alias.starts_with('-') || 8 + kind.len() + alias.len() + operation.len() > 128 {
+            return None;
+        }
+        let specific = match kind {
+            "guard" => matches!(operation, "guard.create" | "guard.trigger" | "guard.take"),
+            "clock.steady" | "clock.system" => matches!(operation, "clock.create" | "clock.read"),
+            "clock.ros" => matches!(operation, "clock.create" | "clock.read" | "clock.update"),
+            "timer" => matches!(operation, "timer.create" | "timer.reset" | "timer.cancel" | "timer.take"),
+            "wait" => matches!(operation, "wait.create" | "wait.add" | "wait.remove" | "wait.acknowledge" | "wait.poll"),
+            _ => return None,
+        };
+        (specific || matches!(operation, "resource.observe" | "resource.close" | "capability.revoke"))
+            .then_some(Self::LocalOperation { kind, alias, operation })
+    }
+
     pub fn from_key(key: &'a str) -> Option<Self> {
+        if let Some(local) = key.strip_prefix("local/") {
+            let (kind, rest) = local.split_once('/')?;
+            let (alias, operation) = rest.split_once('/')?;
+            return Self::local(kind, alias, operation);
+        }
         if let Some(grant) = key.strip_prefix("wasip1.clock.") {
             return match grant {
                 "realtime-clock" | "monotonic-clock" | "process-clock" | "thread-clock"
@@ -162,6 +187,25 @@ impl<'a> Permission<'a> {
         }
         known_interface(key).then_some(Self::RosInterface(key))
     }
+}
+/// The VM registers each alias once. Independent action decisions share that
+/// registration. Omit aliases without a grant so capability.open stays denied.
+pub fn local_grants(rights: &BTreeMap<String, bool>) -> Result<BTreeMap<&str, (&str, Vec<&str>)>> {
+    if rights.len() > MAX_PERMISSIONS {
+        return Err("permission count exceeds budget".into());
+    }
+    let mut aliases = BTreeMap::new();
+    for (key, allow) in rights {
+        if let Permission::LocalOperation { kind, alias, operation } =
+            Permission::from_key(key).ok_or("unknown reviewed permission")?
+        {
+            let (prior, operations) = aliases.entry(alias).or_insert_with(|| (kind, Vec::new()));
+            if *prior != kind { return Err(format!("conflicting local resource types for {alias}")); }
+            if *allow { operations.push(operation); }
+        }
+    }
+    aliases.retain(|_, (_, operations)| !operations.is_empty());
+    Ok(aliases)
 }
 fn id(s: &str) -> bool {
     s.len() <= 128
@@ -432,9 +476,15 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
                 }
                 (key, attr(n, "access")?)
             }
+            "local-resource" => {
+                attributes(n, "local-resource", &["type", "alias", "operation", "access"])?;
+                let (kind, alias, op) = (attr(n, "type")?, attr(n, "alias")?, attr(n, "operation")?);
+                Permission::local(kind, alias, op).ok_or("invalid local resource or operation")?;
+                (format!("local/{kind}/{alias}/{op}"), attr(n, "access")?)
+            }
             _ => return Err("unexpected recommendation element".into()),
         };
-        if grants.len() >= 256 || n.children().any(|x| x.is_element()) {
+        if grants.len() >= MAX_PERMISSIONS || n.children().any(|x| x.is_element()) {
             return Err("invalid permission count or nested recommendation".into());
         }
         let enabled = match decision {
@@ -446,6 +496,7 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
             return Err("duplicate interface".into());
         }
     }
+    local_grants(&grants)?;
     Ok(grants)
 }
 /// Resolve each component relative to a pinned directory descriptor. Symlinks

@@ -304,9 +304,13 @@ pub fn claim_with_devices(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    struct Fixture(std::path::PathBuf);
+    struct Fixture {
+        directory: std::path::PathBuf,
+        _isolation: std::sync::MutexGuard<'static, ()>,
+    }
     impl Fixture {
         fn new() -> Self {
+            let isolation = crate::FORK_AND_LOCK_TEST.lock().unwrap();
             let mut random = [0u8; 16];
             File::open("/dev/urandom")
                 .unwrap()
@@ -318,10 +322,10 @@ mod tests {
             let p = base.join(format!("ownership-{:032x}", u128::from_le_bytes(random)));
             std::fs::create_dir(&p).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self(p)
+            Self { directory: p, _isolation: isolation }
         }
         fn open(&self) -> File {
-            File::open(&self.0).unwrap()
+            File::open(&self.directory).unwrap()
         }
         fn claim(&self, who: u8, names: &[&str]) -> Result<Reservations> {
             reserve(
@@ -333,7 +337,7 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            std::fs::remove_dir_all(&self.directory).unwrap();
         }
     }
     #[test]
@@ -374,7 +378,7 @@ mod tests {
         let f = Fixture::new();
         drop(f.claim(1, &["uid-10002"]).unwrap());
         assert!(f.claim(2, &["gid-10003", "uid-10002"]).is_err());
-        assert!(!f.0.join("gid-10003").exists());
+        assert!(!f.directory.join("gid-10003").exists());
         assert!(f.claim(2, &["gid-10004"]).is_ok());
     }
     #[test]
@@ -414,7 +418,7 @@ mod tests {
     fn malformed_private_records_and_links_fail_closed() {
         let f = Fixture::new();
         drop(f.claim(1, &["uid-10001"]).unwrap());
-        let p = f.0.join("uid-10001");
+        let p = f.directory.join("uid-10001");
         std::fs::write(&p, b"truncated").unwrap();
         assert!(f.claim(1, &["uid-10001"]).is_err());
         std::fs::remove_file(&p).unwrap();
@@ -422,9 +426,9 @@ mod tests {
         assert!(f.claim(1, &["uid-10001"]).is_err());
         std::fs::remove_file(&p).unwrap();
         drop(f.claim(1, &["uid-10001"]).unwrap());
-        std::fs::hard_link(&p, f.0.join("alias")).unwrap();
+        std::fs::hard_link(&p, f.directory.join("alias")).unwrap();
         assert!(f.claim(1, &["uid-10001"]).is_err());
-        std::fs::remove_file(f.0.join("alias")).unwrap();
+        std::fs::remove_file(f.directory.join("alias")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(f.claim(1, &["uid-10001"]).is_err());
     }
@@ -442,8 +446,8 @@ mod tests {
         ] {
             assert!(f.claim(1, names).is_err());
         }
-        assert_ne!(owner(&f.0, "one").unwrap(), owner(&f.0, "two").unwrap());
-        assert!(owner(&f.0, "../one").is_err());
+        assert_ne!(owner(&f.directory, "one").unwrap(), owner(&f.directory, "two").unwrap());
+        assert!(owner(&f.directory, "../one").is_err());
         assert!(owner(Path::new("."), "one").is_err());
         let held = f.claim(1, &["uid-10001"]).unwrap();
         for fd in &held._locks {
@@ -463,14 +467,14 @@ mod tests {
         let mut plan = crate::manifest::deployment(&xml).unwrap();
         let held = reserve(
             f.open(),
-            owner(&f.0, "one").unwrap(),
+            owner(&f.directory, "one").unwrap(),
             &["uid-10001".into(), "gid-10001".into()],
         )
         .unwrap();
-        assert!(held.check(&f.0, "one", &[&plan.processes[0]]).is_ok());
-        assert!(held.check(&f.0, "one", &[]).is_ok());
-        assert!(held.check(&f.0, "other", &[&plan.processes[0]]).is_err());
+        assert!(held.check(&f.directory, "one", &[&plan.processes[0]]).is_ok());
+        assert!(held.check(&f.directory, "one", &[]).is_ok());
+        assert!(held.check(&f.directory, "other", &[&plan.processes[0]]).is_err());
         plan.processes[0].identity = Some((10002, 10001));
-        assert!(held.check(&f.0, "one", &[&plan.processes[0]]).is_err());
+        assert!(held.check(&f.directory, "one", &[&plan.processes[0]]).is_err());
     }
 }

@@ -108,12 +108,12 @@ def main():
         probe_args = ['--sdk-interface-probe',probe]
         required_case = 'signed-sdk-reviewed-every-ros-interface'
     run('sign', 'wsea_preflight.py', [*common, '--vm-source', args.vm_source, '--sdk-source', args.sdk,
-        '--sdk-module', artifact, *probe_args, '--output', admitted], 900)
+        '--sdk-module', artifact, *probe_args, '--local-scheduling', '--output', admitted], 900)
     run('clock', 'clock_permissions.py', [*common, '--vm-source', args.vm_source, '--output', clocks], 900)
     run('deploy', 'qemu_supervisor.py', [*common, '--accelerator', args.accelerator, '--guest-timeout-seconds', args.guest_timeout_seconds, '--qemu', args.qemu, '--kernel', args.kernel,
         '--bios', args.bios, '--firmware-directory', args.firmware_directory, '--admission-fixture', admitted,
         '--signed-sdk-module', admitted / 'bundle/sdk.signed.wasm', '--sdk-module', artifact,
-        '--sdk-engine', args.engine, '--sdk-memory-bytes', 1536 << 20, '--clock-fixture', clocks,
+        '--sdk-engine', args.engine, '--sdk-memory-bytes', 1536 << 20, '--clock-fixture', clocks, '--local-scheduling',
         *probe_args, *(['--sdk-aot-policy', args.aot_policy] if args.aot_policy else []), '--output', guest], args.guest_timeout_seconds + 180)
     qemu = json.loads((guest / 'results.json').read_bytes())
     if not qemu['complete'] or required_case not in qemu['cases']:
