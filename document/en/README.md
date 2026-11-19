@@ -202,3 +202,22 @@ A VM can use guards, clocks, timers and wait sets through ROSv2. Put each resour
 Each type also accepts separate `resource.observe`, `resource.close` and `capability.revoke` decisions. Expose each import that the guest calls separately. The VM uses `resource.observe` when another operation refers to the resource. The VM checks the clock capability when creating a timer and the observed capability when attaching a resource to a wait set.
 
 Use `allow local/guard/signal/guard.create` at the review prompt to add an operation. The deployer combines approved operations into one local grant per alias. An alias with zero approved operations stays unavailable. An alias has one type within its VM. On an authorized cold start, the deployer reads the reviewed operations from its protected state and the VM creates fresh handles. This path activates only ROSv2.
+
+### Reviewing permission reports and metadata
+
+A bound VM can report its own permissions. Reduce the information visible to that guest with a family name or an exact function in its recommendation file. To read another module's declarations or VM runtime metadata, review both the interface and a grant for the exact target.
+
+```xml
+<recommendations>
+  <self-report selector="wasip1.fd_write" access="deny"/>
+  <self-report selector="preloaddl" access="deny"/>
+  <interface name="module.exports" expose="allow"/>
+  <metadata type="module" alias="worker-view" target="worker" operation="module.exports" access="allow"/>
+  <interface name="vm.describe" expose="allow"/>
+  <metadata type="vm" alias="runtime-view" target="runtime" operation="vm.describe" access="allow"/>
+</recommendations>
+```
+
+The VM also refuses a family-wide report that would reveal a denied function. An `allow` decision on a selector adds no filter of its own. Broader denials and the exposure of `permission.report` still apply. Filters can select `preloaddl`, `preloadwasm`, `wasip1`, `ros1v1`, `ros2v1` or `rosv2`. Queries can report that a configured target lacks compiled support.
+
+For a module, each of `module.describe`, `module.imports`, `module.exports`, `module.importers`, `module.group` and `module.permission.report` needs its own review decision. A VM metadata grant accepts `vm.describe` on `runtime`. The guest supplies the approved alias to the observation operation. Each alias belongs to one type, target and binding in the process. These decisions convey read-only access to the corresponding metadata. Interactive review uses `report/SELECTOR` and `metadata/TYPE/ALIAS/TARGET/OPERATION`. Cold startup applies the saved decisions.

@@ -7,22 +7,46 @@ import xml.etree.ElementTree as ET
 def create(vm_source, out, cosign, ca, check, stamp):
     sys.path.insert(0, str(vm_source / "test/0084.ros-runtime"))
     try:
-        from run_scene_vm import Guest
+        from run_module_security_vm import Fixture, record
     finally:
         sys.path.pop(0)
     contract = (vm_source / "src/uwvm2/imported/ros/runtime/contract.h").read_text()
     ops = [dict(name=name, words=int(words), bytes=int(size)) for name, words, size in
            re.findall(r' X\(\w+,"([^"]+)","[^"]+",(\d+),(-?\d+)\)', contract)]
     assert len(ops) == 16
-    guest = Guest(ops)
+    query_ops = ["permission.report", "module.describe", "module.importers", "vm.describe"]
+    guest = Fixture([])
+    guest.operations = ops + [dict(name=name, words=0, bytes=0) for name in query_ops]
     xml = ET.Element("recommendations")
-    for name in ["abi", "capability.open", "capability.close", *[r["name"] for r in ops]]:
+    for name in ["abi", "capability.open", "capability.close", *[r["name"] for r in ops], *query_ops]:
         ET.SubElement(xml, "interface", name=name, expose="allow")
 
     def resource(alias, kind, actions, decision="allow"):
         for operation in actions.split():
             ET.SubElement(xml, "local-resource", type=kind, alias=alias, operation=operation, access=decision)
 
+    for selector in ("wasip1.fd_write", "preloaddl"):
+        ET.SubElement(xml, "self-report", selector=selector, access="deny")
+    for kind, alias, target, operation, access in (
+        ("module", "viewer", "schedule", "module.describe", "allow"),
+        ("module", "viewer", "schedule", "module.importers", "deny"),
+        ("vm", "machine", "runtime", "vm.describe", "allow"),
+    ):
+        ET.SubElement(xml, "metadata", type=kind, alias=alias, target=target, operation=operation, access=access)
+    for family, function in (("wasip1", "fd_write"), ("wasip1", ""), ("preloaddl", "")):
+        guest.write(16384, 3101)
+        guest.write(1024, 3102)
+        guest.request("permission.report", record(family, function, 0), 13)
+        guest.equal(guest.word(16384), 3101)
+        guest.equal(guest.word(1024), 3102)
+    guest.request("permission.report", record("wasip1", "fd_read", 0))
+    guest.equal(guest.word(16384), 1)
+    guest.request("module.describe", record("viewer", 0))
+    guest.find("schedule")
+    guest.request("module.importers", record("viewer", 0), 13)
+    guest.request("vm.describe", record("viewer", 0), 13)
+    guest.request("vm.describe", record("machine", 0))
+    guest.find("query-only")
     resource("signal", "guard", "guard.create guard.trigger")
     resource("signal", "guard", "guard.take", "deny")
     resource("sibling", "guard", "guard.trigger")

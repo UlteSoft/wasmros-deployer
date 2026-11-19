@@ -104,7 +104,7 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
             return Err("review cancelled".into());
         }
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["confirm"] => match manifest::local_grants(&rights) {
+            ["confirm"] => match manifest::reviewed_grants(&rights) {
                 Ok(_) => break,
                 Err(error) => eprintln!("{error}"),
             },
@@ -121,7 +121,7 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
                 }
                 _ => eprintln!("unknown action"),
             },
-            _ => eprintln!("enter a registered interface, a clock read permission or local/TYPE/ALIAS/OPERATION, or confirm"),
+            _ => eprintln!("enter a registered interface, a clock read permission or a local/, metadata/ or report/ decision, or confirm"),
         }
     }
     Ok(rights)
@@ -438,9 +438,9 @@ fn run() -> Result<()> {
         if rights.is_empty() {
             println!("INFO VM {:?} has no reviewed interface or resource permissions.", vm.id);
         }
-        for (alias, (kind, operations)) in manifest::local_grants(&rights)? {
-            argv.extend(["--ros-scene-grant".into(), vm.id.clone(), alias.into(), kind.into(),
-                         alias.into(), "local".into(), operations.join(",")]);
+        for (alias, grant) in manifest::reviewed_grants(&rights)? {
+            argv.extend(["--ros-scene-grant".into(), vm.id.clone(), alias.into(), grant.kind.into(),
+                         grant.target.into(), grant.binding.into(), grant.operations.join(",")]);
         }
         let mut clock_policy = false;
         for (name, enabled) in rights {
@@ -467,6 +467,16 @@ fn run() -> Result<()> {
                     println!("INFO VM {:?} WASIp1 clock read permission {}: {}", vm.id, name, decision);
                     let option = if enabled { "--wasip1-single-grant" } else { "--wasip1-single-deny" };
                     argv.extend([option.into(), vm.id.clone(), name.into()]);
+                }
+                Permission::Metadata { kind, alias, target, operation } => {
+                    println!("INFO VM {:?} metadata grant {:?}, {} {:?}, operation {}: {}", vm.id, alias, kind, target, operation, decision);
+                }
+                Permission::SelfReport(selector) => {
+                    println!("INFO VM {:?} report selector {:?}: {}", vm.id, selector,
+                        if enabled { "no reduction for this selector" } else { "deny" });
+                    if !enabled {
+                        argv.extend(["--ros-scene".into(), vm.id.clone(), "permission.report".into(), selector.into(), "deny".into()]);
+                    }
                 }
                 Permission::LocalOperation { kind, alias, operation } => {
                     println!("INFO VM {:?} local {} resource {:?} operation {}: {}", vm.id, kind, alias, operation, decision);

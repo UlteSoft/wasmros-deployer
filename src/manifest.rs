@@ -144,6 +144,8 @@ pub enum Permission<'a> {
     ClockInterface(&'a str),
     ClockGrant(&'a str),
     LocalOperation { kind: &'a str, alias: &'a str, operation: &'a str },
+    SelfReport(&'a str),
+    Metadata { kind: &'a str, alias: &'a str, target: &'a str, operation: &'a str },
 }
 impl<'a> Permission<'a> {
     /// Host scheduling resources are private to the named VM. Validate all three
@@ -164,7 +166,39 @@ impl<'a> Permission<'a> {
             .then_some(Self::LocalOperation { kind, alias, operation })
     }
 
+    /// Observation grants use a fixed binding. A deployed VM may read only the
+    /// named target and operation. No selector is interpreted as a host path.
+    fn metadata(kind: &'a str, alias: &'a str, target: &'a str, operation: &'a str) -> Option<Self> {
+        if !id(alias) || alias.starts_with('-') || target.is_empty() || matches!(target, "." | "..") || target.starts_with('-') ||
+            !target.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) ||
+            12 + kind.len() + alias.len() + target.len() + operation.len() > 128 {
+            return None;
+        }
+        let valid = match kind {
+            "vm" => target == "runtime" && operation == "vm.describe",
+            "module" => matches!(operation, "module.describe" | "module.imports" | "module.exports" |
+                "module.importers" | "module.group" | "module.permission.report"),
+            _ => false,
+        };
+        valid.then_some(Self::Metadata { kind, alias, target, operation })
+    }
+
     pub fn from_key(key: &'a str) -> Option<Self> {
+        if let Some(selector) = key.strip_prefix("report/") {
+            let (family, function) = selector.split_once('.').map_or((selector, None), |(f, n)| (f, Some(n)));
+            if !matches!(family, "wasip1" | "ros1v1" | "ros2v1" | "rosv2" | "preloaddl" | "preloadwasm") ||
+                function.is_some_and(|n| n.is_empty() || matches!(n, "." | "..") || n.len() > 255 ||
+                    !n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))) {
+                return None;
+            }
+            return Some(Self::SelfReport(selector));
+        }
+        if let Some(rest) = key.strip_prefix("metadata/") {
+            let (kind, rest) = rest.split_once('/')?;
+            let (alias, rest) = rest.split_once('/')?;
+            let (target, operation) = rest.split_once('/')?;
+            return Self::metadata(kind, alias, target, operation);
+        }
         if let Some(local) = key.strip_prefix("local/") {
             let (kind, rest) = local.split_once('/')?;
             let (alias, operation) = rest.split_once('/')?;
@@ -190,21 +224,30 @@ impl<'a> Permission<'a> {
 }
 /// The VM registers each alias once. Independent action decisions share that
 /// registration. Omit aliases without a grant so capability.open stays denied.
-pub fn local_grants(rights: &BTreeMap<String, bool>) -> Result<BTreeMap<&str, (&str, Vec<&str>)>> {
+pub struct ReviewedGrant<'a> {
+    pub kind: &'a str,
+    pub target: &'a str,
+    pub binding: &'static str,
+    pub operations: Vec<&'a str>,
+}
+pub fn reviewed_grants(rights: &BTreeMap<String, bool>) -> Result<BTreeMap<&str, ReviewedGrant<'_>>> {
     if rights.len() > MAX_PERMISSIONS {
         return Err("permission count exceeds budget".into());
     }
     let mut aliases = BTreeMap::new();
     for (key, allow) in rights {
-        if let Permission::LocalOperation { kind, alias, operation } =
-            Permission::from_key(key).ok_or("unknown reviewed permission")?
-        {
-            let (prior, operations) = aliases.entry(alias).or_insert_with(|| (kind, Vec::new()));
-            if *prior != kind { return Err(format!("conflicting local resource types for {alias}")); }
-            if *allow { operations.push(operation); }
+        let (alias, kind, target, binding, operation) = match Permission::from_key(key).ok_or("unknown reviewed permission")? {
+            Permission::LocalOperation { kind, alias, operation } => (alias, kind, alias, "local", operation),
+            Permission::Metadata { kind, alias, target, operation } => (alias, kind, target, "metadata", operation),
+            _ => continue,
+        };
+        let prior = aliases.entry(alias).or_insert_with(|| ReviewedGrant { kind, target, binding, operations: Vec::new() });
+        if (prior.kind, prior.target, prior.binding) != (kind, target, binding) {
+            return Err(format!("conflicting resource bindings for {alias}"));
         }
+        if *allow { prior.operations.push(operation); }
     }
-    aliases.retain(|_, (_, operations)| !operations.is_empty());
+    aliases.retain(|_, grant| !grant.operations.is_empty());
     Ok(aliases)
 }
 fn id(s: &str) -> bool {
@@ -476,6 +519,18 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
                 }
                 (key, attr(n, "access")?)
             }
+            "self-report" => {
+                attributes(n, "self-report", &["selector", "access"])?;
+                let key = format!("report/{}", attr(n, "selector")?);
+                Permission::from_key(&key).ok_or("invalid permission-report selector")?;
+                (key, attr(n, "access")?)
+            }
+            "metadata" => {
+                attributes(n, "metadata", &["type", "alias", "target", "operation", "access"])?;
+                let (kind, alias, target, op) = (attr(n,"type")?, attr(n,"alias")?, attr(n,"target")?, attr(n,"operation")?);
+                Permission::metadata(kind, alias, target, op).ok_or("invalid metadata target or operation")?;
+                (format!("metadata/{kind}/{alias}/{target}/{op}"), attr(n,"access")?)
+            }
             "local-resource" => {
                 attributes(n, "local-resource", &["type", "alias", "operation", "access"])?;
                 let (kind, alias, op) = (attr(n, "type")?, attr(n, "alias")?, attr(n, "operation")?);
@@ -496,7 +551,7 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
             return Err("duplicate interface".into());
         }
     }
-    local_grants(&grants)?;
+    reviewed_grants(&grants)?;
     Ok(grants)
 }
 /// Resolve each component relative to a pinned directory descriptor. Symlinks

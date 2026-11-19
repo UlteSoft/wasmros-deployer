@@ -178,7 +178,7 @@ fn aot_policy_is_scoped_to_the_aot_engine() {
 
 #[test]
 fn local_scheduling_actions_bind_one_vm_alias() {
-    use wros_deployer::manifest::{local_grants, Permission};
+    use wros_deployer::manifest::{reviewed_grants, Permission};
     let xml = r#"<recommendations>
         <local-resource type="guard" alias="signal" operation="guard.create" access="allow"/>
         <local-resource type="guard" alias="signal" operation="guard.take" access="deny"/>
@@ -186,9 +186,10 @@ fn local_scheduling_actions_bind_one_vm_alias() {
         <interface name="guard.take" expose="allow"/>
     </recommendations>"#;
     let rights = recommendations(xml).unwrap();
-    let grants = local_grants(&rights).unwrap();
+    let grants = reviewed_grants(&rights).unwrap();
     assert_eq!(grants.len(), 1);
-    assert_eq!(grants["signal"], ("guard", vec!["guard.create"]));
+    assert_eq!(grants["signal"].kind, "guard");
+    assert_eq!(grants["signal"].operations, ["guard.create"]);
     for invalid in [
         xml.replace("alias=\"other\"", "alias=\"signal\" type=\"wait\""),
         xml.replace("type=\"guard\" alias=\"other\" operation=\"guard.trigger\"", "type=\"wait\" alias=\"signal\" operation=\"wait.poll\""),
@@ -203,5 +204,34 @@ fn local_scheduling_actions_bind_one_vm_alias() {
     for key in ["local/clock.system/c/clock.update", "local/clock.steady/c/clock.update",
                 "local/guard/a/b/guard.create", "local/timer/t/wait.poll", "local/clock.ros//clock.read"] {
         assert!(Permission::from_key(key).is_none());
+    }
+}
+
+#[test]
+fn report_visibility_and_foreign_metadata_are_independent() {
+    use wros_deployer::manifest::{reviewed_grants, Permission};
+    let xml = r#"<recommendations>
+      <self-report selector="wasip1.fd_write" access="deny"/>
+      <self-report selector="preloadwasm" access="allow"/>
+      <metadata type="module" alias="observer" target="worker" operation="module.exports" access="allow"/>
+      <metadata type="module" alias="observer" target="worker" operation="module.importers" access="deny"/>
+      <metadata type="vm" alias="host" target="runtime" operation="vm.describe" access="allow"/>
+    </recommendations>"#;
+    let rights = recommendations(xml).unwrap();
+    let grants = reviewed_grants(&rights).unwrap();
+    assert_eq!(grants.len(), 2);
+    assert_eq!(grants["observer"].operations, ["module.exports"]);
+    assert_eq!(grants["observer"].target, "worker");
+    assert_eq!(grants["host"].binding, "metadata");
+    assert!(!rights["report/wasip1.fd_write"]);
+    for s in ["rosv2.", "*", "vm", "rosv2..", "rosv2...", "bad.fd_write", "rosv2.*", "wasip1.fd/write"] {
+        assert!(recommendations(&xml.replace("wasip1.fd_write", s)).is_err());
+    }
+    assert!(Permission::from_key(&format!("report/preloadwasm.{}", "x".repeat(255))).is_some());
+    assert!(Permission::from_key(&format!("report/preloadwasm.{}", "x".repeat(256))).is_none());
+    for bad in [xml.replace("vm.describe", "driver.submit"), xml.replace("runtime", "wrong"),
+        xml.replace("module.importers", "capability.revoke"), xml.replace("host", "observer"),
+        xml.replace(r#"target="worker" operation="module.exports""#, r#"target="other" operation="module.exports""#)] {
+        assert!(recommendations(&bad).is_err());
     }
 }

@@ -250,7 +250,7 @@ impl Record {
             }
             let mut rights = BTreeMap::new();
             for _ in 0..n {
-                let name = r.string(128)?;
+                let name = r.string(6 + 10 + 1 + 255)?; // report/<family>.<exact function>
                 let allow = match r.take(1)?[0] {
                     0 => false,
                     1 => true,
@@ -261,7 +261,7 @@ impl Record {
                     return Err("unknown or duplicate approved permission".into());
                 }
             }
-            crate::manifest::local_grants(&rights)?;
+            crate::manifest::reviewed_grants(&rights)?;
             if entries
                 .insert(
                     name,

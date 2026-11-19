@@ -194,3 +194,22 @@ D BetterC 使用所选安装中的 `wrd verify` 核对操作员批准的构建�
 每种资源还可以独立授权 `resource.observe`、`resource.close` 和 `capability.revoke`。来宾调用的导入接口需要单独暴露。其他操作引用该资源时，VM 可以检查其 `resource.observe` 权限。创建定时器时 VM 还会校验时钟权限，向等待集合加入资源时会校验该资源的观察权限。
 
 在审核界面输入 `allow local/guard/signal/guard.create` 可以添加一项操作。部署器将批准的操作合并为该别名的一条本地授权。没有获准操作的别名无法打开。同一个 VM 中的别名只能绑定一种类型。经授权冷启动时，部署器从受保护的状态记录恢复已审核的操作，VM 重新创建句柄。这条路径只启用 ROSv2。
+
+### 审阅权限报告和元数据
+
+绑定到 ROSv2 的模块默认可以查询自身权限。可以在该进程的推荐权限文件中按模块族或具体函数限制报告内容。查询其他模块的声明或 VM 运行时状态时，要分别审阅接口和针对指定对象的授权。
+
+```xml
+<recommendations>
+  <self-report selector="wasip1.fd_write" access="deny"/>
+  <self-report selector="preloaddl" access="deny"/>
+  <interface name="module.exports" expose="allow"/>
+  <metadata type="module" alias="worker-view" target="worker" operation="module.exports" access="allow"/>
+  <interface name="vm.describe" expose="allow"/>
+  <metadata type="vm" alias="runtime-view" target="runtime" operation="vm.describe" access="allow"/>
+</recommendations>
+```
+
+若某个函数的查询被拒绝，VM 也会拒绝能够披露该函数的整族查询。选择器上的 `allow` 表示该项不追加限制。整族拒绝和 `permission.report` 接口本身的暴露规则仍然生效。支持的模块族有 `preloaddl`、`preloadwasm`、`wasip1`、`ros1v1`、`ros2v1` 和 `rosv2`。查询可返回当前构建缺少相应支持的状态。
+
+读取模块描述、导入、导出、反向导入关系、权限组和权限报告分别对应 `module.describe`、`module.imports`、`module.exports`、`module.importers`、`module.group` 和 `module.permission.report`，需要逐项审阅。VM 状态使用固定对象 `runtime` 和操作 `vm.describe`。客体查询时传入已批准的别名。每个别名在一个进程内绑定唯一类型、对象和用途。这些权限均为只读。交互审阅使用 `report/选择器` 和 `metadata/类型/别名/对象/操作`，冷启动时恢复已审阅的决定。
