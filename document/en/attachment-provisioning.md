@@ -182,3 +182,30 @@ generates fixed telemetry in the test guest. Physical Go2 and production driver
 startup are separate acceptance gates.
 
 [Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2)
+
+### Universal Robots Client Library
+
+`tests/vendor_universal_robots.py` verifies the local Universal Robots Client
+Library 2.16.0 and GoogleTest 1.17.0 archives and builds the upstream offline
+suite with optimization and debug line information. The runner signs the
+compiled test binaries, libraries and CTest plan with a throwaway Ed25519 key.
+It verifies their hashes before each executable runs in a fresh loopback-only
+network namespace. Independent namespaces prevent earlier tests from occupying
+the hardcoded ports of later tests.
+
+The offline suite covers 673 registered cases, including RTDE negotiation and
+telemetry, reconnects, command serialization, primary and dashboard protocol
+handling, and trajectory interfaces. The receipt tracks every test name, status
+and signed file digest. The same runner accepts `--suite rtde` for the focused
+parser and RTDE client suite. URSim and the ROS hardware driver require their
+own integration runs with the matching controller version.
+
+```sh
+systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 \
+  python3 -B tests/vendor_universal_robots.py \
+  --archive "$PWD/.tmp/urcl-2.16.0.tar.gz" \
+  --gtest-archive "$PWD/.tmp/googletest-1.17.0.tar.gz" \
+  --output "$PWD/.tmp/urcl-offline"
+```
+
+[Universal Robots Client Library 2.16.0](https://github.com/UniversalRobots/Universal_Robots_Client_Library/releases/tag/2.16.0)

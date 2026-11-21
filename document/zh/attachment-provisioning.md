@@ -122,3 +122,26 @@ DDS 发布端分别进入独立 cgroup。解释器和 AOT 都在 Wasm 内校验�
 生成固定遥测数据。实体 Go2 和生产部署器的原厂驱动启动需要单独验收。
 
 [Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2)
+
+### Universal Robots Client Library
+
+`tests/vendor_universal_robots.py` 校验本地 Universal Robots Client Library
+2.16.0 和 GoogleTest 1.17.0 归档，以开启优化和调试行号的配置编译上游离线
+测试。测试程序用临时 Ed25519 密钥签署原生测试程序、库和 CTest 执行计划。
+每个测试程序在独立且仅有回环接口的网络命名空间运行，启动前复核签名和摘要。
+独立命名空间避免早先的测试占用后续用例的固定端口。
+
+离线套件共登记 673 项，覆盖 RTDE 协商和遥测、重连、指令序列化、Primary 和
+Dashboard 协议及轨迹接口。回执记录用例名称、状态与签名文件摘要。可使用
+`--suite rtde` 聚焦解析器和 RTDE 客户端。URSim 和 ROS 硬件驱动还需匹配的
+控制器版本进行联调。
+
+```sh
+systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 \
+  python3 -B tests/vendor_universal_robots.py \
+  --archive "$PWD/.tmp/urcl-2.16.0.tar.gz" \
+  --gtest-archive "$PWD/.tmp/googletest-1.17.0.tar.gz" \
+  --output "$PWD/.tmp/urcl-offline"
+```
+
+[Universal Robots Client Library 2.16.0](https://github.com/UniversalRobots/Universal_Robots_Client_Library/releases/tag/2.16.0)
