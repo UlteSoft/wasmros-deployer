@@ -93,6 +93,15 @@ layouts and ownership; QEMU-user's user-owned redirected root is correctly
 rejected. Positive device inspection and BPF enforcement require the full-kernel
 fixture. QEMU timings are not native hardware performance measurements.
 
+`tests/vendor_unitree_qemu.py` builds the unmodified HelloWorld source from
+Unitree SDK 2.0.2 and a Go2 `LowState` fixture that uses the same official
+native SDK archive, IDL and DDS libraries. The harness signs the isolated guest's
+executable and library inventory with a disposable Ed25519 key. The guest verifies
+the signature and file digests before starting two non-root processes in separate
+cgroups. It rejects an altered inventory and checks delivery of both sample types
+on guest loopback. Production native driver admission still requires the work
+described below. [Unitree SDK source](https://github.com/unitreerobotics/unitree_sdk2/tree/811bc77cdcffb4691d4b40172f9a57857bf6cffb)
+
 The VM baseline is active in production supervision. Native provider declarations
 remain refused by `run`/`resume`: reviewed resource XML, vendor adapters, physical
 identity, safe stop and native lifecycle admission still require integration.

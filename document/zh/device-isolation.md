@@ -67,6 +67,13 @@ mknod、BPF 安装、特权命令、磁盘、共享目录、网络或物理设�
 到用户拥有的根目录时正确拒绝。正常设备准入和 BPF 必须由完整内核测试验证。
 QEMU 耗时不作为原生硬件性能结论。
 
+`tests/vendor_unitree_qemu.py` 编译 Unitree SDK 2.0.2 中未修改的
+HelloWorld 源码，并使用同一套官方原生 SDK、IDL 和 DDS 库构建 Go2
+`LowState` 遥测用例。测试器用临时 Ed25519 密钥签署来宾中可执行文件和库的
+摘要清单。来宾先验签、核验文件摘要，再以不同的非 root 用户在两个独立 cgroup
+中启动进程。测试同时验证修改后的清单被拒绝，以及两种消息都可经来宾回环传输。
+[Unitree SDK 源码](https://github.com/unitreerobotics/unitree_sdk2/tree/811bc77cdcffb4691d4b40172f9a57857bf6cffb)
+
 VM 基础规则已进入实际监管路径。`run`/`resume` 仍拒绝 native 驱动声明：资源 XML
 审核、具体适配器、物理身份、安全停机和完整 native 生命周期还需联动。本组件与
 [加密交付](attachment-provisioning.md)不代表任意厂商驱动已可用或已经工业安全认证。
