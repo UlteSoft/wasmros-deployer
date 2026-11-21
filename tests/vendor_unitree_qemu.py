@@ -4,6 +4,8 @@
 """
 
 import argparse
+from datetime import datetime, timedelta, timezone
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,8 +14,10 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ET
 
 from qemu_supervisor import digest, pack
+from vendor_qualification import cgroup
 
 
 REVISION = "811bc77cdcffb4691d4b40172f9a57857bf6cffb"
@@ -23,6 +27,13 @@ GUEST_CASES = {
     "altered-manifest-denied",
     "unitree-official-hello-world",
     "unitree-go2-low-state",
+}
+ATTACHMENT_CASES = {
+    "unitree-wsea-admission",
+    "unitree-modified-wasm-denied",
+    "unitree-go2-attachment-int",
+    "unitree-go2-attachment-aot",
+    "unitree-attachment-authentication-denied",
 }
 GUEST_INIT = """#!/bin/sh
 set -eu
@@ -105,27 +116,10 @@ for role in reader writer; do
     test "$(busybox cat "$role/cgroup.events" | busybox head -1)" = 'populated 0'
     busybox grep -Fx 'oom 0' "$role/memory.events"
     busybox grep -Fx 'oom_kill 0' "$role/memory.events"
+    busybox rmdir "$role"
 done
 echo 'CASE unitree-go2-low-state PASS'
-echo WROS_UNITREE_PASS
 """
-
-
-def cgroup():
-    """@brief Resolve the verified host cgroup enclosing the replay."""
-    relative = next((line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
-                     if line.startswith("0::")), None)
-    if relative is not None:
-        root = Path("/sys/fs/cgroup")
-        member = root / relative.lstrip("/")
-        for path in (member, *member.parents):
-            if not path.is_relative_to(root):
-                break
-            memory = path / "memory.max"
-            if memory.is_file() and memory.read_text().strip() == "68719476736":
-                if (path / "memory.swap.max").read_text().strip() == "0":
-                    return path
-    raise ValueError("run inside a 64 GiB cgroup with zero swap")
 
 
 def run(argv, **kwargs):
@@ -135,7 +129,9 @@ def run(argv, **kwargs):
 
 def stage_binary(root, source, name, library_dir=None):
     """@brief Copy a test executable and its exact runtime libraries."""
-    shutil.copy2(source, root / "bin" / name)
+    executable = root / "bin" / name
+    shutil.copyfile(source, executable)
+    executable.chmod(0o755)
     env = {"PATH": "/usr/bin:/bin"}
     if library_dir is not None:
         env["LD_LIBRARY_PATH"] = str(library_dir)
@@ -202,6 +198,106 @@ def sign(root, output):
     return {path.name: digest(path) for path in trust.iterdir()}
 
 
+def sign_wasm(args, root, wasm):
+    """@brief Issue a fixture certificate and sign the guest without staging private keys."""
+    fixtures = args.vm_source / "test/0073.ros-tests/support/source/security_wsea/algorithm_matrix.py"
+    spec = importlib.util.spec_from_file_location("fixture_signer", fixtures)
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    with tempfile.TemporaryDirectory(dir=args.signing_scratch) as directory:
+        scratch = Path(directory)
+        authority = fixture.Fixtures(scratch / "authority").pki("unitree", family="ED25519")
+        policy = scratch / "sign.policy"
+        state = scratch / "state"
+        state.mkdir(mode=0o700)
+        unsigned = scratch / "unsigned.wasm"
+        shutil.copyfile(wasm, unsigned)
+        prefix = [args.cosign, "wasm", "secure"]
+        run([*prefix, "policy-init", "--output", policy, "--state-dir", state,
+             "--trust-root", authority["root"], "--certificate", authority["certificate"],
+             "--module-id", "main", "--algorithms", "Ed25519", "--capabilities", "32"])
+        now = datetime.now(timezone.utc)
+        before = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        after = (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        signed = scratch / "signed.wasm"
+        run([*prefix, "sign", unsigned, "--policy", policy, "--key", authority["key"],
+             "--certificate", authority["certificate"], "--crl", authority["crl"],
+             "--module-id", "main", "--module-version", "1", "--algorithm", "Ed25519",
+             "--capabilities", "32", "--not-before", before, "--not-after", after,
+             "--output", signed])
+        for source, target in ((authority["root"], "trust/wasm-root.pem"),
+                               (authority["certificate"], "trust/wasm-signer.pem"),
+                               (signed, "bundle/controller.wasm")):
+            shutil.copyfile(source, root / target)
+            (root / target).chmod(0o644)
+
+
+def build_attachment(args, root):
+    """@brief Stage the original SDK, its read-only adapter and the signed Wasm guest."""
+    tests = Path(__file__).resolve().parent
+    support = tests / "support"
+    out = args.output
+    sdk = out / "unitree" / ("unitree_sdk2-" + REVISION)
+    libraries = sdk / "thirdparty/lib/x86_64"
+    binary = out / "unitree-provider"
+    source = [support / "unitree_low_state.cpp", support / "unitree_attachment.cpp"]
+    ssl = args.openssl_root
+    ssl_inputs = [ssl / "libssl.a", ssl / "libcrypto.a"]
+    compile_provider = [
+        "/usr/bin/clang++-22", "-std=c++23", "-O3", "-g", "-Wall", "-Wextra", "-Werror", "-pthread",
+        "-DWROS_UNITREE_ATTACHMENT", "-DUWVM_ROS_ATTACHMENT_OPENSSL",
+        "-I", args.vm_source / "src", "-isystem", args.vm_source / "third-parties/fast_io/include",
+        "-isystem", ssl / "include", "-isystem", sdk / "include",
+        "-isystem", sdk / "thirdparty/include", "-isystem", sdk / "thirdparty/include/ddscxx",
+        *source, sdk / "lib/x86_64/libunitree_sdk2.a", *ssl_inputs, "-L", libraries,
+        "-lddscxx", "-lddsc", "-ldl", "-Wl,-rpath,/opt/unitree", "-o", binary,
+    ]
+    with (out / "attachment-build.log").open("wb") as log:
+        run(compile_provider, stdout=log, stderr=subprocess.STDOUT)
+    stage_binary(root, binary, "unitree-provider", libraries)
+    for executable, filename in ((args.vm, "uwvm2-ros"), (args.cosign, "cosign"),
+                                 (args.deployer, "wros-deployer"), (args.provisioner, "provisioner")):
+        stage_binary(root, executable, filename)
+
+    bundle = root / "bundle"
+    bundle.mkdir()
+    (root / "bin/unitree-provider").rename(bundle / "unitree-provider")
+    wasm = out / "controller.wasm"
+    wat = support / "unitree_low_state.wat"
+    assembler = args.wrwat
+    build_wasm = [assembler, wat, "-g", "--build-receipt", "-o", wasm]
+    for operation in ("capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"):
+        build_wasm.extend(("--ros-operation", operation))
+    run(build_wasm)
+    sign_wasm(args, root, wasm)
+    controller = bundle / "controller.wasm"
+    data = controller.read_bytes()
+    if data.count(b"go2-state") != 1:
+        raise ValueError("cannot construct the expected Wasm integrity refusal")
+    tampered = bundle / "changed.wasm"
+    tampered.write_bytes(data.replace(b"go2-state", b"go2-statf"))
+    for module, filename in ((controller, "deployment.xml"), (tampered, "changed.xml")):
+        manifest = ET.Element("deployment", id="unitree-read-only")
+        ET.SubElement(manifest, "vm", id="main", module=module.name, policy="admission.policy",
+                      sha256=digest(module), **{"memory-bytes": "536870912", "pids": "16"})
+        ET.SubElement(manifest, "driver", id="unitree", file="unitree-provider", kind="executable",
+                      sha256=digest(binary), **{"vendor-version": "2.0.2", "hardware-id": "offline-go2"})
+        ET.ElementTree(manifest).write(bundle / filename)
+
+    guest = tests / "vendor_unitree_attachment_guest.sh"
+    shutil.copyfile(guest, root / "run/attachment-test.sh")
+    inputs = [*source, wat, support / "unitree_low_state_contract.txt", guest, *ssl_inputs,
+              args.vm, args.cosign, args.deployer, args.provisioner, assembler]
+    return {
+        "inputs": {str(path): digest(path) for path in inputs},
+        "compile_provider": list(map(str, compile_provider)),
+        "assemble_guest": list(map(str, build_wasm)),
+        "guest_build_receipt": json.loads(wasm.with_suffix(".wasm.wros-wat.json").read_text()),
+        "signed_wasm_sha256": digest(controller),
+        "native_provider_sha256": digest(binary),
+    }
+
+
 def main():
     """@brief Build and verify the isolated driver replay."""
     cli = argparse.ArgumentParser(description=__doc__)
@@ -209,32 +305,58 @@ def main():
         cli.add_argument("--" + option, type=lambda path: Path(path).resolve(), required=True)
     # Keep the name used by launchers that dispatch on argv[0].
     cli.add_argument("--qemu", type=lambda path: Path(path).absolute(), required=True)
+    cli.add_argument("--accelerator", choices=("tcg", "kvm"), default="tcg")
+    attachment_options = ("vm", "vm-source", "openssl-root", "deployer", "provisioner",
+                          "wrwat", "cosign", "signing-scratch")
+    for option in attachment_options:
+        cli.add_argument("--" + option, type=lambda path: Path(path).resolve(strict=True))
     args = cli.parse_args()
+    selected = [getattr(args, name.replace("-", "_")) is not None for name in attachment_options]
+    if any(selected) and not all(selected):
+        cli.error("the authenticated attachment replay requires all VM, SDK, deployer and signing inputs")
+    attachment = all(selected)
     group = cgroup()
     if ".tmp" not in args.output.parts:
         cli.error("choose a fresh output within .tmp")
+    if attachment and (".tmp" not in args.signing_scratch.parts
+                       or args.signing_scratch.stat().st_uid != os.geteuid()
+                       or args.signing_scratch.stat().st_mode & 0o077):
+        cli.error("choose a private signing scratch directory owned by the current user under .tmp")
     if digest(args.archive) != ARCHIVE_SHA256:
         cli.error("the SDK archive differs from the pinned upstream bytes")
+    os.umask(0o077)
     args.output.mkdir(mode=0o700)
-    os.environ["TMPDIR"] = str(args.output)
+    for variable in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[variable] = str(args.output)
     root = args.output / "root"
     for folder in ("bin", "dev", "proc", "sys", "run", "etc", "trust"):
         (root / folder).mkdir(parents=True)
     (root / "etc/passwd").write_text(
         "root:x:0:0:root:/:/bin/sh\n"
-        "reader:x:24001:24001:reader:/:/bin/sh\nwriter:x:24002:24002:writer:/:/bin/sh\n")
-    (root / "etc/group").write_text("root:x:0:\nreader:x:24001:\nwriter:x:24002:\n")
+        "reader:x:24001:24001:reader:/:/bin/sh\n"
+        "writer:x:24002:24002:writer:/:/bin/sh\n"
+        "telemetry:x:24003:24003:telemetry:/:/bin/sh\n")
+    (root / "etc/group").write_text("root:x:0:\nreader:x:24001:\nwriter:x:24002:\ntelemetry:x:24003:\n")
+    for name in ("passwd", "group"):
+        (root / "etc" / name).chmod(0o644)
     stage_binary(root, Path("/bin/busybox"), "busybox")
     stage_binary(root, Path("/usr/bin/openssl"), "openssl")
     (root / "bin/sh").symlink_to("busybox")
-    (root / "init").write_text(GUEST_INIT)
-    (root / "init").chmod(0o755)
     vendor_inputs = build_vendor(args.archive, args.output, root)
+    attachment_inputs = build_attachment(args, root) if attachment else None
+    init = GUEST_INIT
+    if attachment:
+        init += "\n/bin/sh /run/attachment-test.sh\n"
+    (root / "init").write_text(init + "\necho WROS_UNITREE_PASS\n")
+    (root / "init").chmod(0o755)
     native_signature = sign(root, args.output)
     initramfs = args.output / "initramfs.cpio.gz"
     pack(root, initramfs)
-    argv = [args.qemu, "-nodefaults", "-machine", "q35", "-accel", "tcg,thread=multi", "-cpu", "max",
-            "-smp", "2", "-m", "768", "-display", "none", "-serial", "stdio", "-monitor", "none",
+    cpu = ["-accel", "kvm", "-cpu", "host"] if args.accelerator == "kvm" else [
+        "-accel", "tcg,thread=multi", "-cpu", "max"]
+    argv = [args.qemu, "-nodefaults", "-machine", "q35", *cpu,
+            "-smp", "2", "-m", "2048" if attachment else "768",
+            "-display", "none", "-serial", "stdio", "-monitor", "none",
             "-nic", "none", "-no-reboot", "-bios", args.bios, "-L", args.firmware_directory,
             "-kernel", args.kernel, "-initrd", initramfs,
             "-append", "console=ttyS0 quiet panic=-1 rdinit=/init cgroup_no_v1=all"]
@@ -242,6 +364,7 @@ def main():
         "complete": False, "vendor": "Unitree", "release": "2.0.2", "revision": REVISION,
         "archive_sha256": ARCHIVE_SHA256, "cgroup": str(group),
         "upstream_and_fixture_inputs": vendor_inputs, "native_signature": native_signature,
+        "secure_attachment": attachment_inputs,
         "kernel_sha256": digest(args.kernel), "initramfs_sha256": digest(initramfs),
         "argv": list(map(str, argv)), "host_memory_events_before": (group / "memory.events").read_text(),
     }
@@ -249,13 +372,14 @@ def main():
     receipt.write_text(json.dumps(record, indent=2) + "\n")
     serial = args.output / "serial.log"
     with serial.open("wb") as log:
-        result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=90)
+        result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=110)
     transcript = serial.read_text(errors="replace")
     cases = re.findall(r"^CASE (\S+) PASS$", transcript, re.MULTILINE)
     record.update(cases=cases, exit=result.returncode, serial_sha256=digest(serial),
                   host_memory_events_after=(group / "memory.events").read_text())
+    expected = GUEST_CASES | ATTACHMENT_CASES if attachment else GUEST_CASES
     record["complete"] = (result.returncode == 0 and "WROS_UNITREE_PASS" in transcript
-                          and set(cases) == GUEST_CASES and len(cases) == len(GUEST_CASES))
+                          and set(cases) == expected and len(cases) == len(expected))
     receipt.write_text(json.dumps(record, indent=2) + "\n")
     if not record["complete"]:
         raise SystemExit(transcript[-3000:])

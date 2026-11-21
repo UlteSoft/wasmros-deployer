@@ -1,6 +1,7 @@
 //! Test-only orchestration of the production provisioning primitives.
 //! The deployer CLI does not acquire native-provider launch authority from this
 //! harness. Privileged UID/cgroup tests run only in the disposable QEMU guest.
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::{fs::FileExt, process::CommandExt};
@@ -19,7 +20,7 @@ impl Drop for Children {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|n| format!("{n:02x}")).collect()
 }
-fn prepare(command: &mut Command, inherited: Vec<i32>, uid: u32, group: &str) {
+fn prepare(command: &mut Command, inherited: Vec<i32>, uid: u32, group: &str, network: Option<File>) {
     let privileged = unsafe { libc::geteuid() == 0 };
     let parent = unsafe { libc::getpid() };
     let enrollment = std::env::var("WROS_TEST_CHILD_CGROUP_ROOT")
@@ -49,14 +50,23 @@ fn prepare(command: &mut Command, inherited: Vec<i32>, uid: u32, group: &str) {
                     return Err(fail());
                 }
             }
-            if privileged
-                && (libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS)
-                    != 0
-                    || libc::setgroups(0, std::ptr::null()) != 0
+            if privileged {
+                let ipc_and_uts = libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
+                if let Some(network) = &network {
+                    if libc::setns(network.as_raw_fd(), libc::CLONE_NEWNET) != 0
+                        || libc::unshare(ipc_and_uts) != 0
+                    {
+                        return Err(fail());
+                    }
+                } else if libc::unshare(ipc_and_uts | libc::CLONE_NEWNET) != 0 {
+                    return Err(fail());
+                }
+                if libc::setgroups(0, std::ptr::null()) != 0
                     || libc::setresgid(uid, uid, uid) != 0
-                    || libc::setresuid(uid, uid, uid) != 0)
-            {
-                return Err(fail());
+                    || libc::setresuid(uid, uid, uid) != 0
+                {
+                    return Err(fail());
+                }
             }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
                 || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
@@ -86,6 +96,30 @@ fn prepare(command: &mut Command, inherited: Vec<i32>, uid: u32, group: &str) {
         });
     }
 }
+
+/// Run the synthetic DDS telemetry writer in the provider's loopback-only
+/// namespace. The writer has an independent UID and resource limits.
+fn start_unitree_writer(program: &str, provider_pid: u32) -> Child {
+    let path = format!("/proc/{provider_pid}/ns/net");
+    let network = File::open(&path).unwrap();
+    let setup = Command::new("/bin/busybox")
+        .args(["nsenter", &format!("--net={path}"), "/bin/busybox",
+            "ip", "link", "set", "lo", "multicast", "on", "up"])
+        .status()
+        .unwrap();
+    assert!(setup.success(), "bring up the private DDS loopback");
+
+    let mut writer = Command::new(program);
+    writer.arg("publish");
+    prepare(&mut writer, vec![], 24003, "writer", Some(network));
+    let child = writer.spawn().unwrap();
+    let root = std::env::var_os("WROS_TEST_CHILD_CGROUP_ROOT").unwrap();
+    let group = std::path::Path::new(&root).join("writer/cgroup.procs");
+    assert!(std::fs::read_to_string(group).unwrap().lines()
+        .any(|pid| pid == child.id().to_string()));
+    child
+}
+
 fn corrupt(file: File, offset: usize) -> File {
     let mut record = [0u8; 256];
     file.read_exact_at(&mut record, 0).unwrap();
@@ -104,7 +138,7 @@ fn corrupt(file: File, offset: usize) -> File {
 }
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    assert_eq!(args.len(), 5, "runtime peer module mode");
+    assert!(matches!(args.len(), 5 | 7), "runtime peer module mode [engine WSEA-policy]");
     let mode = &args[4];
     assert!([
         "success",
@@ -118,7 +152,13 @@ fn main() {
         "bad-origin"
     ]
     .contains(&mode.as_str()));
+    let unitree = args.len() == 7;
     let root = unsafe { libc::geteuid() == 0 };
+    if unitree {
+        assert!(root && std::env::var_os("WROS_TEST_CHILD_CGROUP_ROOT").is_some());
+        assert!(matches!(args[5].as_str(), "--runtime-int" | "--runtime-aot"));
+        assert!(matches!(mode.as_str(), "success" | "wrong-key"));
+    }
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let vm_uid = if root { 24001 } else { uid };
@@ -141,6 +181,7 @@ fn main() {
         vec![receiver.as_raw_fd()],
         provider_uid,
         "provider",
+        None,
     );
     let mut children = Children(vec![peer.spawn().unwrap()]);
     drop(receiver);
@@ -150,12 +191,17 @@ fn main() {
         gid: provider_gid,
     })
     .unwrap();
+    let contract = if unitree {
+        Sha256::digest(include_bytes!("unitree_low_state_contract.txt")).into()
+    } else {
+        std::array::from_fn(|i| (i + 1) as u8)
+    };
     let binding = a::Binding::fresh(
         a::identifier().unwrap(),
         a::identifier().unwrap(),
         a::identifier().unwrap(),
         a::identifier().unwrap(),
-        std::array::from_fn(|i| (i + 1) as u8),
+        contract,
     )
     .unwrap();
     let limits = a::Limits {
@@ -173,29 +219,36 @@ fn main() {
     command.args([
         "--wasm-set-main-module-name",
         "main",
-        "--runtime-int",
+        if unitree { &args[5] } else { "--runtime-int" },
         "--ros-scene-create",
         "robot",
         "--ros-scene-bind",
         "robot",
         "main",
     ]);
-    let names = [
+    let ordinary_names = [
         "driver.connect",
         "driver.submit",
         "driver.result",
         "driver.describe",
         "driver.disconnect",
     ];
-    for name in std::iter::once("capability.open").chain(names) {
+    let telemetry_names = ["driver.connect", "driver.submit", "driver.result", "driver.disconnect"];
+    let names = if unitree { &telemetry_names[..] } else { &ordinary_names[..] };
+    let (alias, resource, schema) = if unitree {
+        ("go2-state", "go2-low-state", "buffer.read")
+    } else {
+        ("arm-query", "arm-parameters", "parameter.exists")
+    };
+    for name in std::iter::once("capability.open").chain(names.iter().copied()) {
         command.args(["--ros-scene-interface", "robot", name, "allow"]);
     }
     command.args([
         "--ros-scene-grant",
         "robot",
-        "arm-query",
+        alias,
         "driver",
-        "arm-parameters",
+        resource,
         "registered-driver",
         &names.join(","),
         "--ros-scene-driver-budget",
@@ -203,7 +256,7 @@ fn main() {
         "1",
         "1048576",
     ]);
-    command.args(["--ros-scene-driver-channel", "robot", "arm-query", "main"]);
+    command.args(["--ros-scene-driver-channel", "robot", alias, "main"]);
     command.args([
         client.channel().as_raw_fd().to_string(),
         provider.credentials().pid.to_string(),
@@ -225,14 +278,22 @@ fn main() {
     command.args([
         "--ros-scene-driver-schema",
         "robot",
-        "arm-query",
-        "parameter.exists",
+        alias,
+        schema,
         "64",
         "64",
         "8",
-        "--run",
-        &args[3],
     ]);
+    if unitree {
+        command.args([
+            "--runtime-compile-threads", "0",
+            "--runtime-llvm-jit-cache-path", "disable",
+            "--runtime-memtag-mode", "sync",
+            "--debug-fault-action", "exit",
+            "--secure", "module", &args[3], &args[6],
+        ]);
+    }
+    command.args(["--run", &args[3]]);
     prepare(
         &mut command,
         vec![
@@ -242,6 +303,7 @@ fn main() {
         ],
         vm_uid,
         "vm",
+        None,
     );
     children.0.push(command.spawn().unwrap());
     let vm = a::Peer::pin(a::Credentials {
@@ -304,6 +366,12 @@ fn main() {
     drop(sender);
     drop(client);
     drop(wrong_client);
+    let writer = if unitree && mode == "success" {
+        Some(start_unitree_writer(&args[2], provider.credentials().pid))
+    } else {
+        None
+    };
+    let _writer = Children(writer.into_iter().collect());
     let until = Instant::now() + Duration::from_secs(15);
     let mut statuses = [None, None];
     while Instant::now() < until {
@@ -333,5 +401,7 @@ fn main() {
         );
         assert!(!statuses[0].unwrap().success());
     }
-    println!("CASE rust-provisioned-{mode} PASS");
+    if !unitree {
+        println!("CASE rust-provisioned-{mode} PASS");
+    }
 }

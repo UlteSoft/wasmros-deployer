@@ -11,6 +11,10 @@
 #include <string_view>
 #include <thread>
 
+#ifdef WROS_UNITREE_ATTACHMENT
+int receive_go2_attachment(char** argv);
+#endif
+
 namespace
 {
     using Sample = unitree_go::msg::dds_::LowState_;
@@ -58,6 +62,10 @@ namespace
 
 int main(int argc, char** argv)
 {
+#ifdef WROS_UNITREE_ATTACHMENT
+    if (argc == 6)
+        return receive_go2_attachment(argv);
+#endif
     if (argc != 2)
         return 2;
     auto const mode = std::string_view(argv[1]);

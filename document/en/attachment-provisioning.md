@@ -155,3 +155,30 @@ dependency must also use `-O3 -g`; debug symbols on only the calling program are
 insufficient for source and assembly attribution. Hardware sampling measures
 long repeated workloads. Its event period is not a guarantee that each sample
 arrives at a fixed wall-clock interval.
+
+### Unitree Go2 native telemetry
+
+`tests/vendor_unitree_qemu.py` uses a local Unitree SDK 2.0.2 archive with a pinned
+SHA-256. The offline guest runs the upstream HelloWorld pair and exchanges Go2
+`LowState` through the release's native DDS libraries. The fixture signs the staged
+executables and libraries with a disposable Ed25519 key. The guest verifies the
+manifest and rejects a modified copy before starting the native processes.
+
+The optional attachment inputs add a `wrwat` guest with WasmMTE enabled. The
+signer produces a WSEA-signed module using a disposable certificate. The
+deployer checks it first and the VM checks it again with independent rollback
+state. The Rust test provisioner passes fresh TLS credentials and sealed
+bootstrap descriptors to separate non-root processes. The Go2 adapter reads a
+single joint sample from the official SDK and exposes only that bounded read.
+The VM, adapter, and loopback-only DDS writer have distinct cgroups. The
+interpreter and AOT engine both check the DDS sample in Wasm. Additional cases
+require explicit rejection of modified Wasm bytes and a mismatched peer key.
+
+Use `--help` for the full attachment and QEMU inputs. Select a private
+`--signing-scratch` under the VM's disk-backed `.tmp`, and run the test inside a
+64 GiB cgroup with zero swap. The results record the upstream archive, executable
+and compiler input hashes, the selected engine, and guest checks. The publisher
+generates fixed telemetry in the test guest. Physical Go2 and production driver
+startup are separate acceptance gates.
+
+[Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2)
