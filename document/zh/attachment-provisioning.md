@@ -121,7 +121,17 @@ DDS 发布端分别进入独立 cgroup。解释器和 AOT 都在 Wasm 内校验�
 回执记录上游归档、执行文件及编译输入的摘要和来宾检查结果。发布端在来宾内
 生成固定遥测数据。实体 Go2 和生产部署器的原厂驱动启动需要单独验收。
 
-[Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2)
+`tests/vendor_unitree_mujoco.py` 单独验收原厂仿真路径。它在 MuJoCo 3.4.0
+加载固定版本的官方 Go2 模型并运行宇树原厂 Python DDS 桥。独立编译的原厂
+C++ SDK 订阅端与原厂 Python SDK 订阅端分别检查关节位置、IMU 四元数和机身
+位置。测试为仿真及订阅端的输入签名，验签后在只有回环接口的网络命名空间
+运行。测试采用无界面模式并关闭手柄输入。用 `--help` 指定模型及来源记录、
+两份固定的原厂桥文件、本地 SDK 源码和 Python 依赖目录。Cyclone DDS 0.10.2
+的 Python 绑定需链接 SDK 自带的 Cyclone 库。Python 依赖目录须包含 MuJoCo
+3.4.0、NumPy 和 Pygame。
+
+[Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2) ·
+[宇树 MuJoCo 桥](https://github.com/unitreerobotics/unitree_mujoco/tree/1eb6642e3f3fdfb7fb13a9794fd6a2dd93ea0e7d)
 
 ### Universal Robots Client Library
 

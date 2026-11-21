@@ -181,7 +181,20 @@ and compiler input hashes, the selected engine, and guest checks. The publisher
 generates fixed telemetry in the test guest. Physical Go2 and production driver
 startup are separate acceptance gates.
 
-[Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2)
+`tests/vendor_unitree_mujoco.py` exercises the separate simulation path. It
+loads the pinned official Go2 model and Unitree's original Python DDS bridge
+under MuJoCo 3.4.0. An independently built native SDK subscriber and the pinned
+official Python SDK both verify joint position, IMU quaternion and base position.
+The replay signs the simulator and both readers' staged inputs and checks the
+signature before running inside a loopback-only network namespace. It runs
+headless with joystick input disabled. Use `--help` to supply the model and its
+provenance, the two pinned bridge files, the local SDK sources and the Python
+dependency directory. Install the Cyclone DDS 0.10.2 Python binding against the
+SDK's native Cyclone library. Set the dependency directory to one containing
+MuJoCo 3.4.0, NumPy and Pygame for the selected Python executable.
+
+[Unitree SDK 2.0.2](https://github.com/unitreerobotics/unitree_sdk2/releases/tag/v2.0.2) ·
+[Unitree MuJoCo bridge](https://github.com/unitreerobotics/unitree_mujoco/tree/1eb6642e3f3fdfb7fb13a9794fd6a2dd93ea0e7d)
 
 ### Universal Robots Client Library
 
