@@ -1,5 +1,5 @@
 //! Deployment-specific assessments and the operator's final confirmation.
-use wros_deployer::manifest::{Deployment, Permission, Result, HIDE_SELF_REPORT, SELF_REPORT};
+use wros_deployer::manifest::{hidden_key, Deployment, Permission, Result, HIDE_ABI, HIDE_SELF_REPORT, SELF_REPORT};
 use wros_deployer::guest_imports::ImportAssessment;
 use wros_deployer::verdict::Signature;
 use std::collections::BTreeMap;
@@ -30,6 +30,21 @@ impl fmt::Display for Risk {
     }
 }
 
+fn grade(value: &str) -> Option<u8> {
+    match value.as_bytes() {
+        [n @ b'0'..=b'9'] => Some(n - b'0'),
+        b"10" => Some(10),
+        _ => None,
+    }
+}
+
+pub fn acceptance_threshold(value: &str) -> Result<u8> {
+    if value == "default" {
+        return Ok(3);
+    }
+    grade(value).ok_or_else(|| "invalid --risk-accept-threshold value; use default or 0 through 10".into())
+}
+
 /// Operator output filter. No display mode modifies permission decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RiskReport {
@@ -44,12 +59,8 @@ impl Default for RiskReport {
 impl RiskReport {
     pub fn parse(value: &str) -> Result<Self> {
         if value == "none" { return Ok(Self::None); }
-        let grade = value.strip_prefix(">=").unwrap_or(value);
-        match grade.as_bytes() {
-            [n @ b'0'..=b'9'] => Ok(Self::AtLeast(n - b'0')),
-            b"10" => Ok(Self::AtLeast(10)),
-            _ => Err("invalid --risk-report value; use none or a threshold from 0 through 10, optionally prefixed with >=".into()),
-        }
+        grade(value.strip_prefix(">=").unwrap_or(value)).map(Self::AtLeast)
+            .ok_or_else(|| "invalid --risk-report value; use none or a threshold from 0 through 10, optionally prefixed with >=".into())
     }
 
     fn show(self, label: &str, items: impl IntoIterator<Item = (String, Risk)>) {
@@ -128,6 +139,26 @@ fn operation_risk(name: &str) -> Risk {
             (4, "manages an independently authorized buffer"),
         "model.open" | "model.submit" | "media.open" | "media.submit" =>
             (6, "can submit data for processing through a separately authorized resource"),
+        "context.open" | "node.open" =>
+            (3, "opens a context or node through its separately approved resource"),
+        "action.open" | "lifecycle.open" | "parameter.open" | "sensor.open" | "service.open"
+        | "topic.open" | "transform.open" | "event.stream.open" | "replay.open" =>
+            (5, "opens a separately authorized operational or application data channel"),
+        "action.take" | "lifecycle.take" | "model.take" | "module.call.result" | "module.call.take"
+        | "parameter.take" | "service.take" | "topic.take" | "transform.take" | "event.stream.poll"
+        | "proposal.read" | "communication.open.take" =>
+            (5, "receives a result, request or data from a separately approved resource"),
+        "module.call.acknowledge" | "qos.acknowledgements.wait" | "service.acknowledge"
+        | "topic.acknowledge" | "topic.reserve" | "service.reserve" =>
+            (5, "can advance delivery or reserve bounded communication capacity"),
+        "artifact.abort" | "communication.open.cancel" | "model.cancel" | "module.call.cancel"
+        | "recording.stop" | "service.abandon" | "transform.cancel" | "replay.seek" =>
+            (6, "can interrupt an outstanding operation or change replay position"),
+        "event.stream.close" | "media.close" | "request.release" | "service.release" | "topic.release" =>
+            (4, "closes a stream or releases a retained request or delivery"),
+        "parameter.respond" | "qos.liveliness.assert" | "proposal.capture"
+        | "proposal.publish" | "proposal.accept" =>
+            (7, "can change a peer's observed state or share and accept a resource proposal"),
         "log.emit" => (3, "writes diagnostic output"),
         _ => return Risk::Unassessed("registered interface with no reviewed risk classification; an independent resource grant may still be required"),
     };
@@ -142,6 +173,8 @@ fn permission_risk(name: &str) -> Risk {
             Risk::Scored(0, "legacy ABI version only; requires an explicit legacy VM build and provides no ROS data or gateway rights"),
         Some(Permission::HideSelfReport) =>
             Risk::Scored(0, "hides the guest's read-only self report"),
+        Some(Permission::HideAbi) =>
+            Risk::Scored(0, "hides the guest's read-only ABI version query"),
         Some(Permission::RosInterface(operation) | Permission::LocalOperation { operation, .. }) =>
             operation_risk(operation),
         Some(Permission::Metadata { .. }) =>
@@ -197,6 +230,10 @@ pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>, repor
     if !rights.contains_key(SELF_REPORT) && !rights.contains_key(HIDE_SELF_REPORT) {
         println!("  default read-only self observation via {SELF_REPORT:?}");
     }
+    let default_abi = !rights.contains_key("abi") && !rights.contains_key(HIDE_ABI);
+    if default_abi {
+        println!("  default read-only ABI version via \"abi\"");
+    }
     for (name, enabled) in rights {
         let (name, access) = decision(name, *enabled);
         println!("  {access} {name:?}");
@@ -204,7 +241,7 @@ pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>, repor
     report.show(&format!("VM {vm:?} {phase}"), rights.iter().map(|(key, enabled)| {
         let (name, access) = decision(key, *enabled);
         (format!("{access} {name:?} (risk if allowed)"), permission_risk(key))
-    }));
+    }).chain(default_abi.then(|| ("default read-only ABI version via \"abi\"".into(), permission_risk("abi")))));
     let wasip1 = rights.iter().filter(|(_, enabled)| **enabled).filter_map(|(key, _)| Permission::from_key(key));
     let (mut time, mut res, mut time_grant, mut res_grant) = (false, false, false, false);
     for key in wasip1 {
@@ -222,47 +259,55 @@ pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>, repor
 }
 
 fn decision(name: &str, enabled: bool) -> (&str, &str) {
-    if name == HIDE_SELF_REPORT {
-        (SELF_REPORT, "hidden")
-    } else {
-        (name, if enabled { "allow" } else { "deny" })
+    match name {
+        HIDE_SELF_REPORT => (SELF_REPORT, "hidden"),
+        HIDE_ABI => ("abi", "hidden"),
+        _ => (name, if enabled { "allow" } else { "deny" }),
     }
 }
 
 fn edit(rights: &mut BTreeMap<String, bool>, name: &str, action: &str) -> Result<()> {
-    let replacing_self = name == SELF_REPORT && (rights.contains_key(SELF_REPORT) || rights.contains_key(HIDE_SELF_REPORT));
+    let hidden = hidden_key(name);
+    let replacing_hidden = hidden.is_some_and(|key| rights.contains_key(key));
     if action != "remove" && rights.len() >= wros_deployer::manifest::MAX_PERMISSIONS
-        && !rights.contains_key(name) && !replacing_self {
+        && !rights.contains_key(name) && !replacing_hidden {
         return Err("permission count exceeds budget; remove a decision before adding another".into());
     }
-    if name == SELF_REPORT {
-        rights.remove(HIDE_SELF_REPORT);
-        rights.remove(SELF_REPORT);
+    if let Some(key) = hidden {
+        rights.remove(key);
+        rights.remove(name);
     }
     match action {
         "allow" | "deny" => { rights.insert(name.into(), action == "allow"); }
-        "hide" => { rights.insert(HIDE_SELF_REPORT.into(), true); }
+        "hide" => { rights.insert(hidden.ok_or("unsupported hidden interface")?.into(), true); }
         "remove" => { rights.remove(name); }
         _ => unreachable!("validated edit"),
     }
     Ok(())
 }
 
-pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport) -> Result<BTreeMap<String, bool>> {
+pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport, threshold: Option<u8>) -> Result<BTreeMap<String, bool>> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
+    let mut manual = threshold.is_none();
     for (key, enabled) in rights.clone() {
         let (name, recommendation) = decision(&key, enabled);
-        let choices = if name == SELF_REPORT { "allow, deny or hide" } else { "allow or deny" };
+        let risk = permission_risk(&key);
+        if matches!((threshold, risk), (Some(maximum), Risk::Scored(score, _)) if score <= maximum) {
+            println!("  Adopted {recommendation} {name:?} under the configured acceptance threshold");
+            continue;
+        }
+        manual = true;
+        let choices = if hidden_key(name).is_some() { "allow, deny or hide" } else { "allow or deny" };
         loop {
             eprint!(
                 "VM {vm:?} {name:?} [recommended {recommendation}] review detail {}. {choices}? ",
-                permission_risk(&key)
+                risk
             );
             io::stderr().flush().map_err(|e| e.to_string())?;
             let answer = read_answer(&mut input)?.ok_or("review cancelled")?;
             match answer.trim() {
-                action if matches!(action, "allow" | "deny") || (action == "hide" && name == SELF_REPORT) => {
+                action if matches!(action, "allow" | "deny") || (action == "hide" && hidden_key(name).is_some()) => {
                     edit(&mut rights, name, action)?;
                     break;
                 }
@@ -271,8 +316,12 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport)
             }
         }
     }
+    if !manual {
+        wros_deployer::manifest::reviewed_grants(&rights)?;
+        return Ok(rights);
+    }
     loop {
-        eprint!("VM {vm:?} edits [allow NAME | deny NAME | hide permission.report | remove NAME | show | confirm | cancel]: ");
+        eprint!("VM {vm:?} edits [allow NAME | deny NAME | hide abi | hide permission.report | remove NAME | show | confirm | cancel]: ");
         io::stderr().flush().map_err(|e| e.to_string())?;
         let line = read_answer(&mut input)?.ok_or("review cancelled")?;
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
@@ -284,8 +333,8 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport)
             },
             [_, name] if wros_deployer::manifest::native_preload_request(name) =>
                 eprintln!("{}", wros_deployer::manifest::NATIVE_PRELOAD_REFUSED),
-            [action, name] if *name != HIDE_SELF_REPORT && Permission::from_key(name).is_some()
-                && (matches!(*action, "allow" | "deny" | "remove") || (*action == "hide" && *name == SELF_REPORT)) => {
+            [action, name] if !name.starts_with("hide/") && Permission::from_key(name).is_some()
+                && (matches!(*action, "allow" | "deny" | "remove") || (*action == "hide" && hidden_key(name).is_some())) => {
                 if let Err(error) = edit(&mut rights, name, action) {
                     eprintln!("{error}");
                 } else if matches!(*action, "allow" | "deny") {
@@ -299,6 +348,7 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport)
 
 pub fn show_deployment(plan: &Deployment, report: RiskReport) {
     println!("Deployment assessment: VM filesystem mounts, host folder access and guest sockets are unsupported by this manifest schema.");
+    println!("Deployment assessment: workloads cannot open deployment management, debugger, dump, update or direct driver endpoints. The deployer may hand each approved VM/driver pair a connected read-only business attachment.");
     println!("Deployment assessment: legacy ROS is limited to the two independently reviewed ABI-version queries; production VMs omit legacy modules by default.");
     println!("Deployment assessment: in-process native preload is unavailable through this deployer; report/preloaddl controls read-only build-status visibility.");
     let mut items = vec![(
@@ -354,13 +404,14 @@ pub fn show_signature_exception(kind: Signature, id: &str, report: RiskReport) {
     report.show("requested signature exception", [(format!("artifact {id:?}"), risk)]);
 }
 
-pub fn show_imports(vm: &str, result: ImportAssessment, report: RiskReport) {
+pub fn show_imports(vm: &str, result: ImportAssessment, requires: &std::collections::BTreeSet<String>, report: RiskReport) {
     let mut unknown = Vec::new();
     match result {
         ImportAssessment::Complete { imports } => {
             println!("  VM {vm:?} has {} declared Wasm imports.", imports.len());
             for (namespace, name) in imports {
                 let status = match namespace.as_str() {
+                    alias if requires.contains(alias) => "declared Wasm library; the closure checks its submitted function type and export",
                     "uwvm_ros_v2" => "ROSv2 host namespace; individual interface and resource decisions apply",
                     "uwvm_ros1_v1" | "uwvm_ros2_v1" if name == "abi_version" =>
                         "deprecated legacy ABI-version query; both an exact permission and a legacy-enabled VM build are required",
@@ -385,7 +436,9 @@ pub fn show_imports(vm: &str, result: ImportAssessment, report: RiskReport) {
     if !unknown.is_empty() {
         report.show(&format!("VM {vm:?} imports"), unknown);
     }
-    println!("  Preloaded Wasm dependencies are not specified by this manifest format. Import declarations do not resolve dependency paths.");
+    if !requires.is_empty() {
+        println!("  Declared Wasm libraries are resolved against this VM’s explicit dependency graph and checked against their submitted images.");
+    }
 }
 
 pub fn confirm_deployment(action: &str, id: &str, digest: &str) -> Result<()> {
@@ -410,7 +463,9 @@ mod tests {
             assert!(matches!(permission_risk(name), Risk::Scored(0, _)), "{name}");
         }
         assert!(matches!(permission_risk("control.submit"), Risk::Scored(9, _)));
-        assert!(matches!(permission_risk("context.open"), Risk::Unassessed(_)));
+        for name in include_str!("../protocol/ros-interfaces.txt").lines() {
+            assert!(matches!(permission_risk(name), Risk::Scored(0..=10, _)), "{name}");
+        }
         assert!(matches!(permission_risk("wasip1.sock_open"), Risk::Unassessed(_)));
     }
 

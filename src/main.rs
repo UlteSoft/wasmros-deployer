@@ -1,17 +1,18 @@
 //! Local preflight and operator review for one fixed bundle.
-use manifest::{deployment, local_file, recommendations, sha256, Result};
+use manifest::{bundle::{Bundle, Kind}, deployment, local_file, recommendations, sha256, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::os::unix::fs::OpenOptionsExt;
 use wros_deployer::{driver as native, guest_imports, manifest, service, state, supervisor, verdict::Signature, verification};
 
 mod review;
+mod wasm_library_admission;
 
 /// Bind every automatic invocation to the exact reviewed configuration and
 /// executable/trust-policy bytes. Recommendation files are not read on resume:
 /// the independently reviewed permission map is stored in the protected record.
 fn binding(
-    xml: &str,
+    deployment_digest: &str,
     manifest: &std::path::Path,
     plan: &manifest::Deployment,
     options: &BTreeMap<String, std::path::PathBuf>,
@@ -23,7 +24,7 @@ fn binding(
         h.update(value);
     };
     add(b"wros reviewed local cold start with operator assessment v2");
-    add(xml.as_bytes());
+    add(deployment_digest.as_bytes());
     add(manifest.as_os_str().as_encoded_bytes());
     for name in ["--runtime", "--cosign"] {
         let file =
@@ -58,12 +59,22 @@ fn binding(
     } else {
         b"external workload parent"
     });
+    let mut library_trust = std::collections::BTreeSet::new();
     for vm in &plan.processes {
-        for name in std::iter::once(&vm.policy).chain(vm.vm_policy.iter()) {
+        for name in std::iter::once(&vm.policy).chain(vm.vm_policy.iter())
+            .chain(vm.libraries.ordered.iter().flat_map(|lib| [&lib.policy, &lib.vm_policy])) {
             let p = verification::policy(&options["--policy-root"], name, root)?;
+            if !vm.libraries.ordered.is_empty() {
+                library_trust.insert(verification::policy_trust_root(&p, root)?);
+            }
             add(p.as_os_str().as_encoded_bytes());
             add(sha256(std::fs::File::open(p).map_err(|e| e.to_string())?)?.as_bytes());
         }
+    }
+    for trust_root in library_trust {
+        add(b"WSEA library graph trusted CA");
+        add(trust_root.as_os_str().as_encoded_bytes());
+        add(sha256(std::fs::File::open(trust_root).map_err(|e| e.to_string())?)?.as_bytes());
     }
     if !plan.drivers.is_empty() {
         let verifier = verification::protected(options.get("--elf-verifier").ok_or("missing ELF verifier")?, root, false)?;
@@ -82,7 +93,7 @@ fn binding(
 }
 
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--risk-report none|0..10 for plan/review/verify/authorize/run/resume] [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--risk-report none|0..10 for plan/review/verify/authorize/run/resume] [--accept-recommendations-through-risk --risk-accept-threshold default|0..10 for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ITEM=SHA256 | --allow-invalid-signature ITEM=SHA256 for verify/authorize/run; ITEM is VM or VM/LIBRARY_NAMESPACE] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if action == "status" {
@@ -139,7 +150,8 @@ fn run() -> Result<()> {
         .canonicalize()
         .map_err(|e| e.to_string())?;
     let mut options = BTreeMap::new();
-    let mut accept = false;
+    let mut accept_through_risk = false;
+    let mut accept_threshold = None;
     let mut risk_report = None;
     let mut exceptions = BTreeMap::new();
     let mut elf_exceptions = BTreeMap::new();
@@ -156,10 +168,23 @@ fn run() -> Result<()> {
             };
             risk_report = Some(review::RiskReport::parse(&value)?);
         } else if matches!(action.as_str(), "review" | "authorize" | "run")
-            && key == "--accept-recommendations"
-            && !accept
+            && key == "--accept-recommendations-through-risk"
         {
-            accept = true;
+            if accept_through_risk {
+                return Err("duplicate --accept-recommendations-through-risk".into());
+            }
+            accept_through_risk = true;
+        } else if matches!(action.as_str(), "review" | "authorize" | "run")
+            && (key == "--risk-accept-threshold" || key.starts_with("--risk-accept-threshold="))
+        {
+            if accept_threshold.is_some() {
+                return Err("duplicate --risk-accept-threshold".into());
+            }
+            let value = match key.strip_prefix("--risk-accept-threshold=") {
+                Some(value) => value.into(),
+                None => args.next().ok_or("missing --risk-accept-threshold value")?,
+            };
+            accept_threshold = Some(review::acceptance_threshold(&value)?);
         } else if matches!(action.as_str(), "verify" | "authorize" | "run")
             && matches!(
                 key.as_str(),
@@ -177,7 +202,7 @@ fn run() -> Result<()> {
                 .insert(id.to_owned(), (digest.to_owned(), kind))
                 .is_some()
             {
-                return Err("duplicate signature exception for one VM".into());
+                return Err("duplicate signature exception for one Wasm image".into());
             }
         } else if matches!(action.as_str(), "verify" | "run")
             && matches!(key.as_str(), "--allow-unsigned-elf" | "--allow-invalid-elf-signature")
@@ -219,6 +244,9 @@ fn run() -> Result<()> {
             return Err(usage.into());
         }
     }
+    if accept_through_risk != accept_threshold.is_some() {
+        return Err("use --accept-recommendations-through-risk together with --risk-accept-threshold default|0..10".into());
+    }
     let risk_report = risk_report.unwrap_or_default();
     if let Some(root) = options.get("--supervisor-cgroup") {
         let parent = service::root_path(root)?.join("workloads");
@@ -248,8 +276,9 @@ fn run() -> Result<()> {
         .open(root)
         .map_err(|e| e.to_string())?;
     let manifest_name = manifest.file_name().ok_or("deployment file name missing")?;
-    let xml = manifest::xml_contents(local_file(&bundle, std::path::Path::new(manifest_name))?)?;
-    let plan = deployment(&xml)?;
+    let mut documents = Bundle::new(&bundle);
+    let graph = documents.expand(std::path::Path::new(manifest_name), Kind::Deployment)?;
+    let plan = deployment(&graph.xml)?;
     if action == "service" {
         print!(
             "{}",
@@ -268,7 +297,7 @@ fn run() -> Result<()> {
     if interactive {
         review::require_terminal()?;
     }
-    let manifest_digest = format!("{:x}", Sha256::digest(xml.as_bytes()));
+    let manifest_digest = graph.digest;
     let execution = if executing || authorizing {
         if plan.supervisor.is_some() && !options.contains_key("--supervisor-cgroup") {
             return Err(
@@ -300,7 +329,7 @@ fn run() -> Result<()> {
         return Err("authorize/resume require a durable state directory".into());
     }
     let approved_binding = if executing || authorizing {
-        let value = binding(&xml, &manifest, &plan, &options, root)?;
+        let value = binding(&manifest_digest, &manifest, &plan, &options, root)?;
         if let Some(j) = &journal {
             if j.existing() || action == "resume" {
                 j.check(&value)?;
@@ -329,6 +358,11 @@ fn run() -> Result<()> {
             if let Some(kind) = j.entry(&vm.id)?.waiver {
                 exceptions.insert(vm.id.clone(), (vm.digest.clone(), kind));
             }
+            for (name, kind) in &j.entry(&vm.id)?.library_waivers {
+                let lib = vm.libraries.ordered.iter().find(|lib| &lib.namespace == name)
+                    .ok_or("durable library exception targets an absent module")?;
+                exceptions.insert(format!("{}/{}", vm.id, name), (lib.digest.clone(), *kind));
+            }
         }
         println!("INFO Resuming only durable XML-authorized cold starts. The stored review is unchanged; no motion authority or running memory is restored.");
     }
@@ -338,19 +372,19 @@ fn run() -> Result<()> {
         if !plan
             .processes
             .iter()
-            .any(|vm| &vm.id == id && &vm.digest == digest)
+            .any(|vm| (&vm.id == id && &vm.digest == digest)
+                || vm.libraries.ordered.iter().any(|lib| id == &format!("{}/{}", vm.id, lib.namespace) && &lib.digest == digest))
         {
             return Err(format!(
-                "signature exception does not match a submitted VM and digest: {id:?}"
+                "signature exception does not match a submitted VM and digest or library and digest: {id:?}"
             ));
         }
     }
-    if accept {
-        eprintln!(
-            "WARNING: adopting parsed recommendations without per-VM edits; initial deployment still requires final confirmation."
-        )
+    if let Some(maximum) = accept_threshold {
+        eprintln!("WARNING: adopting scored recommendations at or below {maximum}/10. Other recommendations require individual review. Initial deployment requires final confirmation.");
     }
     println!("deployment {:?}; manifest SHA256 {manifest_digest}", plan.id);
+    println!("INFO Deployment configuration inputs {:?}", graph.inputs);
     review::show_deployment(&plan, risk_report);
     for (id, (digest, _)) in &elf_exceptions {
         if !plan
@@ -411,15 +445,20 @@ fn run() -> Result<()> {
         println!("INFO Local driver {:?}, vendor version {:?}, format {:?}, file {:?}, SHA256 {}, exclusive device {:?}, encrypted local attachment required.",
                  driver.id,driver.vendor_version,driver.kind,driver.file,driver.digest,driver.hardware_id);
     }
+    let mut prepared = Vec::with_capacity(plan.processes.len());
     for vm in &plan.processes {
         let module = root.join(&vm.module);
         let file = local_file(&bundle, &vm.module)?;
         let policy = verification::policy(policies, &vm.policy, root)?;
-        let mut rights = if action == "resume" {
+        let rights = if action == "resume" {
             journal.as_ref().unwrap().entry(&vm.id)?.rights.clone()
         } else {
             match &vm.recommendations {
-                Some(p) => recommendations(&manifest::xml_contents(local_file(&bundle, p)?)?)?,
+                Some(p) => {
+                    let policy_graph = documents.expand(p, Kind::Recommendations)?;
+                    println!("INFO VM {:?} recommendation inputs {:?}, SHA256 {}", vm.id, policy_graph.inputs, policy_graph.digest);
+                    recommendations(&policy_graph.xml)?
+                }
                 None => BTreeMap::new(),
             }
         };
@@ -436,8 +475,9 @@ fn run() -> Result<()> {
                  vm.memory_nodes.as_ref().map(ToString::to_string).unwrap_or_else(|| "inherited".into()));
         let mut secondary_verification = true;
         let mut admitted = None;
+        let main_image;
         if let Some((exe, scratch)) = verifier {
-            let admission = verification::admit(exe, scratch, root, file, &vm.digest, &policy);
+            let admission = verification::admit_image(exe, scratch, root, file, &vm.digest, &policy, vm.module_id.as_deref());
             if (executing || authorizing) && supervisor::stopping() {
                 if let Some(j) = &mut journal {
                     if j.existing() {
@@ -448,12 +488,9 @@ fn run() -> Result<()> {
             }
             let admission = admission?;
             let result = admission.signature;
-            review::show_imports(&vm.id, guest_imports::inspect(&admission.module.0)?, risk_report);
-            if executing {
-                admitted = Some(verification::FrozenFile(supervisor::retained(
-                    admission.module.0,
-                )?));
-            }
+            let imports = guest_imports::require_complete(guest_imports::inspect(&admission.module.0)?)?;
+            review::show_imports(&vm.id, imports, &vm.libraries.requires, risk_report);
+            main_image = admission.module;
             if let Some((_, kind)) = exceptions.get(&vm.id) {
                 eprintln!(
                     "WARNING: operator requested {:?} signature exception for VM {:?} at SHA256 {}",
@@ -476,14 +513,35 @@ fn run() -> Result<()> {
                 return Err(format!("{:?} signature rejected for {:?}", result, vm.id));
             }
         } else {
-            let image = verification::snapshot_for_review(file, &vm.digest)?;
-            review::show_imports(&vm.id, guest_imports::inspect(&image.0)?, risk_report);
+            main_image = verification::snapshot_for_review(file, &vm.digest)?;
+            let imports = guest_imports::inspect(&main_image.0)?;
+            let imports = if interactive { guest_imports::require_complete(imports)? } else { imports };
+            review::show_imports(&vm.id, imports, &vm.libraries.requires, risk_report);
         }
+        let libraries = wasm_library_admission::prepare(vm, &main_image.0, &bundle, root, policies, verifier, executing,
+            &exceptions, risk_report)?;
+        if executing { admitted = Some(verification::FrozenFile(supervisor::retained(main_image.0)?)); }
+        let policy = if (executing || authorizing || !vm.libraries.ordered.is_empty()) && secondary_verification {
+            let secondary = verification::policy(
+                policies,
+                vm.vm_policy.as_ref().ok_or(
+                    "signed run requires vm-policy with an independent VM-owned state directory",
+                )?,
+                root,
+            )?;
+            verification::equivalent_vm_policy(&policy, &secondary)?;
+            println!("INFO VM secondary verification policy {:?}; identical trust rules with a separate VM-owned rollback store",secondary);
+            secondary
+        } else {
+            policy
+        };
         review::show_rights(if action == "resume" { "durable approval" } else { "recommendations" }, &vm.id, &rights, risk_report);
+        prepared.push((vm, module, policy, rights, admitted, secondary_verification, libraries));
+    }
+    // No prompt may adopt an earlier VM before admission of its dependencies.
+    for (vm, module, policy, mut rights, admitted, secondary_verification, libraries) in prepared {
         if interactive {
-            if !accept {
-                rights = review::approve(&vm.id, rights, risk_report)?;
-            }
+            rights = review::approve(&vm.id, rights, risk_report, accept_threshold)?;
             review::show_rights("effective decisions", &vm.id, &rights, risk_report);
         }
         let driver = native_launches.remove(&vm.id);
@@ -511,20 +569,7 @@ fn run() -> Result<()> {
                 )
             },
         );
-        let policy = if (executing || authorizing) && secondary_verification {
-            let secondary = verification::policy(
-                policies,
-                vm.vm_policy.as_ref().ok_or(
-                    "signed run requires vm-policy with an independent VM-owned state directory",
-                )?,
-                root,
-            )?;
-            verification::equivalent_vm_policy(&policy, &secondary)?;
-            println!("INFO VM secondary verification policy {:?}; identical trust rules with a separate VM-owned rollback store",secondary);
-            secondary
-        } else {
-            policy
-        };
+        approved.get_mut(&vm.id).unwrap().library_waivers = libraries.waivers;
         let module = if admitted.is_some() {
             std::path::PathBuf::from(supervisor::IMAGE_PATH)
         } else {
@@ -534,6 +579,10 @@ fn run() -> Result<()> {
             "--wasm-set-main-module-name".into(),
             vm.id.clone(),
             vm.engine.argument().into(),
+            "--debug-permissions".into(),
+            "none".into(),
+            "--debug-dump-force".into(),
+            "none".into(),
             "--runtime-memtag-mode".into(),
             "sync".into(),
             "--runtime-memtag-action".into(),
@@ -565,10 +614,11 @@ fn run() -> Result<()> {
             }
             let decision = if enabled { "allow" } else { "deny" };
             match permission {
-                Permission::HideSelfReport => {
-                    println!("INFO VM {:?} ROSv2 interface permission.report: hidden", vm.id);
+                Permission::HideSelfReport | Permission::HideAbi => {
+                    let interface = if permission == Permission::HideAbi { "abi" } else { manifest::SELF_REPORT };
+                    println!("INFO VM {:?} ROSv2 interface {interface}: hidden", vm.id);
                     argv.extend(["--ros-scene-interface".into(), vm.id.clone(),
-                                 manifest::SELF_REPORT.into(), "hidden".into()]);
+                                 interface.into(), "hidden".into()]);
                 }
                 Permission::RosInterface(name) => {
                     println!("INFO VM {:?} ROSv2 interface {}: {}", vm.id, name, decision);
@@ -626,17 +676,20 @@ fn run() -> Result<()> {
         if secondary_verification {
             argv.extend([
                 "--secure".into(),
-                "module".into(),
+                if vm.module_id.is_some() { "named-module" } else { "module" }.into(),
                 module.display().to_string(),
                 policy.display().to_string(),
             ]);
+            if let Some(id) = &vm.module_id { argv.push(id.clone()); }
         }
+        argv.extend(libraries.argv);
         argv.extend(["--run".into(), module.display().to_string()]);
         println!("VM argv {:?}", argv);
         if let Some(module) = admitted {
             launches.push(supervisor::Launch {
                 process: vm.clone(),
                 module,
+                libraries: libraries.images,
                 arguments: argv,
                 driver,
             });
@@ -647,9 +700,13 @@ fn run() -> Result<()> {
             review::confirm_deployment(&action, &plan.id, &manifest_digest)?;
         }
         if supervisor::stopping() {
+            if let Some(j) = journal.as_mut().filter(|j| j.existing()) {
+                j.stop(false)?;
+            }
             return Err("operator stop cancelled deployment before authorization".into());
         }
-        let current_binding = binding(&xml, &manifest, &plan, &options, root)
+        documents.revalidate()?;
+        let current_binding = binding(&manifest_digest, &manifest, &plan, &options, root)
             .map_err(|error| format!("could not revalidate the reviewed deployment before launch: {error}"))?;
         if Some(current_binding) != approved_binding {
             return Err("reviewed executable, trust policy or deployment path changed before launch".into());
@@ -659,6 +716,9 @@ fn run() -> Result<()> {
                 wros_deployer::cgroup::require_inactive(parent)?;
             }
             if supervisor::stopping() {
+                if let Some(j) = journal.as_mut().filter(|j| j.existing()) {
+                    j.stop(false)?;
+                }
                 return Err("operator stop cancelled authorization".into());
             }
             journal.as_mut().unwrap().approve(

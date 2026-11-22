@@ -49,12 +49,13 @@ int main(int argc, char **argv) {
     for (char *i = identity; i < last; ++i) {
         if (!(isalnum((unsigned char)*i) || *i == '-' || *i == '_')) die("validate fixture ID");
     }
-    int one_click = 0;
+    int ranked = 0, threshold = 0;
     for (int i = 4; i < argc; ++i) {
-        if (strcmp(argv[i], "--accept-recommendations") == 0) one_click = 1;
+        if (strcmp(argv[i], "--accept-recommendations-through-risk") == 0) ranked = 1;
+        if (strcmp(argv[i], "--risk-accept-threshold") == 0 && i + 1 < argc && strcmp(argv[i+1], "10") == 0) threshold = 1;
     }
-    if (!one_click) {
-        fputs("review-terminal requires the fixture's one-click recommendation option\n", stderr);
+    if (!ranked || !threshold) {
+        fputs("review-terminal requires the fixture's explicit 10/10 recommendation threshold\n", stderr);
         return 125;
     }
     char final[160];

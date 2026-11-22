@@ -82,6 +82,7 @@ pub fn stopping() -> bool {
 pub struct Launch {
     pub process: Process,
     pub module: FrozenFile,
+    pub libraries: Vec<FrozenFile>,
     pub arguments: Vec<String>,
     pub driver: Option<crate::driver::Launch>,
 }
@@ -110,6 +111,7 @@ struct Session<'a> {
     events: &'a Events,
     journal: Option<&'a mut crate::state::Journal>,
     driver_groups: Vec<Option<usize>>,
+    roots: Vec<std::sync::Arc<crate::workload_fs::Root>>,
 }
 impl Drop for Session<'_> {
     fn drop(&mut self) {
@@ -183,11 +185,93 @@ pub fn retained(file: File) -> Result<File> {
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
-fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], inherited: &[i32]) -> Result<(Child, File)> {
+/// Copy one sealed admission fd into the unshared root before its read-only
+/// remount. This function runs after fork and uses only fixed storage and syscalls.
+unsafe fn copy_image(module: i32, name: &std::ffi::CStr, uid: u32, gid: u32) -> std::io::Result<()> {
+    let fail = std::io::Error::last_os_error;
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    let seals = libc::fcntl(module, libc::F_GET_SEALS);
+    if seals < 0 || seals & required != required {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    let target = libc::open(
+        name.as_ptr(),
+        libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+        0o600,
+    );
+    if target < 0 {
+        return Err(fail());
+    }
+    // Anonymous shmem has no bindable user mount on all supported kernels.
+    // Copy immutable admitted bytes inside the already bounded child group.
+    // The allocation-free loop also bounds syscall work if admission is ever
+    // called through another trusted embedding rather than the CLI.
+    let mut offset = 0i64;
+    let mut buffer = [0u8; 32768];
+    loop {
+        let n = libc::pread64(module, buffer.as_mut_ptr().cast(), buffer.len(), offset);
+        if n < 0 {
+            if fail().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(fail());
+        }
+        if n == 0 {
+            break;
+        }
+        offset += n as i64;
+        if offset as u64 > crate::manifest::libraries::MAX_IMAGE_BYTES {
+            return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        let mut done = 0usize;
+        while done < n as usize {
+            let wrote =
+                libc::write(target, buffer.as_ptr().add(done).cast(), n as usize - done);
+            if wrote < 0 {
+                if fail().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(fail());
+            }
+            if wrote == 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            done += wrote as usize;
+        }
+    }
+    // Service managers normally impose umask 0077. Pin the admitted
+    // image to the final guest identity and exact read-only mode rather
+    // than depending on the caller's mask or world-readable access.
+    // The private mount is made read-only before credentials are dropped.
+    if libc::fchown(target, uid, gid) != 0 || libc::fchmod(target, 0o400) != 0 {
+        return Err(fail());
+    }
+    if libc::close(target) != 0 {
+        return Err(fail());
+    }
+    Ok(())
+}
+fn spawn(runtime: &File, root: std::sync::Arc<crate::workload_fs::Root>, launch: &Launch, enrollment: File, extra: &[String], inherited: &[i32]) -> Result<(Child, File)> {
+    use std::os::unix::fs::FileExt;
     let enrollment = retained(enrollment)?;
     let join = enrollment.as_raw_fd();
-    let module = launch.module.0.as_raw_fd();
+    if launch.libraries.len() != launch.process.libraries.ordered.len() {
+        return Err("incomplete private Wasm image set".into());
+    }
+    crate::manifest::libraries::image_budget(&launch.module.0, &launch.libraries)?;
+    let mut image_files = vec![(launch.module.0.as_raw_fd(), c"/tmp/tmp/wros-admitted.wasm".to_owned())];
+    for (index, image) in launch.libraries.iter().enumerate() {
+        // Before chroot the private root is mounted at /tmp; index is supervisor-generated.
+        let name = std::ffi::CString::new(format!("/tmp{}", crate::manifest::libraries::image_path(index)))
+            .map_err(|e| e.to_string())?;
+        image_files.push((image.0.as_raw_fd(), name));
+    }
     let exe = runtime.as_raw_fd();
+    let mut magic = [0; 2];
+    runtime.read_exact_at(&mut magic, 0).map_err(|e| e.to_string())?;
+    // A trusted script's interpreter reopens the script descriptor after exec.
+    // An ELF runtime consumes its inode in exec and needs no retained handle.
+    let script = (magic == *b"#!").then_some(exe);
     let (uid, gid) = launch.process.identity.ok_or("missing guest identity")?;
     let parent = unsafe { libc::getpid() };
     let affinity = launch
@@ -206,6 +290,7 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], in
         command.args(setup).args(extra).args(run);
     }
     let inherited = inherited.to_vec();
+    let (mut mount_errors, errors) = std::io::pipe().map_err(|e| e.to_string())?;
     command
         .env_clear()
         .current_dir("/")
@@ -217,6 +302,10 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], in
     unsafe {
         command.pre_exec(move || {
             let fail = || std::io::Error::last_os_error();
+            let stage = |name: &[u8]| {
+                libc::write(errors.as_raw_fd(), name.as_ptr().cast(), name.len());
+            };
+            stage(b"enroll ");
             if libc::write(join, b"0".as_ptr().cast(), 1) != 1 {
                 return Err(fail());
             }
@@ -230,6 +319,7 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], in
                     return Err(fail());
                 }
             }
+            stage(b"namespace ");
             if libc::unshare(
                 libc::CLONE_NEWNET
                     | libc::CLONE_NEWIPC
@@ -250,71 +340,25 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], in
             {
                 return Err(fail());
             }
+            stage(b"reopen mounts ");
+            root.repin_mounts()?;
+            stage(b"tmpfs ");
             let mount_flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
             if libc::mount(
                 c"wros-images".as_ptr(),
                 c"/tmp".as_ptr(),
                 c"tmpfs".as_ptr(),
                 mount_flags,
-                c"size=269484032,nr_inodes=32,mode=0755".as_ptr().cast(),
+                c"size=269484032,nr_inodes=1024,mode=0755".as_ptr().cast(),
             ) != 0
             {
                 return Err(fail());
             }
-            let target = libc::open(
-                c"/tmp/wros-admitted.wasm".as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
-                0o600,
-            );
-            if target < 0 {
-                return Err(fail());
-            }
-            // Anonymous shmem has no bindable user mount on all supported kernels.
-            // Copy immutable admitted bytes inside the already bounded child group.
-            // The allocation-free loop also bounds syscall work if admission is ever
-            // called through another trusted embedding rather than the CLI.
-            let mut offset = 0i64;
-            let mut buffer = [0u8; 32768];
-            loop {
-                let n = libc::pread64(module, buffer.as_mut_ptr().cast(), buffer.len(), offset);
-                if n < 0 {
-                    if fail().raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    return Err(fail());
-                }
-                if n == 0 {
-                    break;
-                }
-                offset += n as i64;
-                if offset > 268435456 {
-                    return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
-                }
-                let mut done = 0usize;
-                while done < n as usize {
-                    let wrote =
-                        libc::write(target, buffer.as_ptr().add(done).cast(), n as usize - done);
-                    if wrote < 0 {
-                        if fail().raw_os_error() == Some(libc::EINTR) {
-                            continue;
-                        }
-                        return Err(fail());
-                    }
-                    if wrote == 0 {
-                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                    }
-                    done += wrote as usize;
-                }
-            }
-            // Service managers normally impose umask 0077. Pin the admitted
-            // image to the final guest identity and exact read-only mode rather
-            // than depending on the caller's mask or world-readable access.
-            // The private mount is made read-only before credentials are dropped.
-            if libc::fchown(target, uid, gid) != 0 || libc::fchmod(target, 0o400) != 0 {
-                return Err(fail());
-            }
-            if libc::close(target) != 0 {
-                return Err(fail());
+            stage(b"mounts ");
+            root.mount(errors.as_raw_fd())?;
+            stage(b"images ");
+            for (image, name) in &image_files {
+                copy_image(*image, name, uid, gid)?;
             }
             if libc::mount(
                 std::ptr::null(),
@@ -326,8 +370,14 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], in
             {
                 return Err(fail());
             }
-            finish_child((uid, gid), parent)?;
-            for fd in inherited.iter().copied().chain(std::iter::once(exe)) {
+            stage(b"chroot ");
+            if libc::chroot(c"/tmp".as_ptr()) != 0 || libc::chdir(c"/".as_ptr()) != 0 {
+                return Err(fail());
+            }
+            stage(b"identity ");
+            finish_child((uid, gid), parent, crate::containment::Role::Vm)?;
+            stage(b"exec");
+            for fd in inherited.iter().copied().chain(script) {
                 if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                     return Err(fail());
                 }
@@ -335,12 +385,18 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], in
             Ok(())
         });
     }
-    spawn_pinned(command, "VM")
+    let result = spawn_pinned(command, "VM");
+    if let Err(error) = result {
+        let mut detail = String::new();
+        let _ = (&mut mount_errors).take(512).read_to_string(&mut detail);
+        return Err(if detail.is_empty() { error } else { format!("{error} ({detail})") });
+    }
+    result
 }
 
 /// Common allocation-free restrictions installed in the child before exec.
 /// The child has already enrolled in its cgroup and entered its namespaces.
-pub(crate) unsafe fn finish_child((uid, gid): (u32, u32), parent: libc::pid_t) -> std::io::Result<()> {
+pub(crate) unsafe fn finish_child((uid, gid): (u32, u32), parent: libc::pid_t, role: crate::containment::Role) -> std::io::Result<()> {
     let fail = std::io::Error::last_os_error;
     if libc::setsid() < 0 {
         return Err(fail());
@@ -387,7 +443,7 @@ pub(crate) unsafe fn finish_child((uid, gid): (u32, u32), parent: libc::pid_t) -
     if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
         return Err(fail());
     }
-    crate::containment::pin_namespaces()?;
+    crate::containment::restrict_workload(role)?;
     if libc::syscall(
         libc::SYS_close_range,
         3u32,
@@ -524,14 +580,14 @@ impl Session<'_> {
             let (arguments, inherited) = bootstrap.vm_arguments(driver, &launch.process.id);
             self.events.send(format!("INFO VM {:?} extra driver CLI {:?}", launch.process.id, arguments));
             self.check_start()?;
-            let (child, pidfd) = spawn(runtime, launch, enrollment, &arguments, &inherited)?;
+            let (child, pidfd) = spawn(runtime, self.roots[index].clone(), launch, enrollment, &arguments, &inherited)?;
             self.slots[index].child = Some(child);
             self.slots[index].pidfd = Some(pidfd);
             bootstrap.deliver(self.slots[index].child.as_ref().unwrap(), launch.process.identity.unwrap())?;
             self.events.send(format!("INFO Driver {:?} bootstrap delivered for authenticated TLS", driver.artifact.id));
             (self.slots[index].child.take().unwrap(), self.slots[index].pidfd.take().unwrap())
         } else {
-            spawn(runtime, launch, enrollment, &[], &[])?
+            spawn(runtime, self.roots[index].clone(), launch, enrollment, &[], &[])?
         };
         self.events.send(format!(
             "INFO VM {:?} generation {} started with PID {}, no motion authority",
@@ -685,7 +741,7 @@ pub fn run_reserved(
     let result = result.and(logged);
     if result.is_err() {
         if let Some(journal) = journal {
-            journal.stop(true)?;
+            journal.stop(!stopping())?;
         }
     }
     result
@@ -699,6 +755,11 @@ fn supervise(
     journal: Option<&mut crate::state::Journal>,
 ) -> Result<()> {
     let runtime = retained(File::open(runtime).map_err(|e| e.to_string())?)?;
+    let libraries = crate::workload_fs::Libraries::inspect(&runtime)?;
+    let roots = launches.iter().map(|launch| {
+        let identity = launch.process.identity.ok_or("missing VM identity")?;
+        crate::workload_fs::Root::prepare(&libraries, &launch.arguments, identity).map(std::sync::Arc::new)
+    }).collect::<Result<Vec<_>>>()?;
     let mut workloads = launches.iter().map(|l| Workload::from(&l.process)).collect::<Vec<_>>();
     let mut driver_groups = Vec::with_capacity(launches.len());
     for launch in launches {
@@ -739,6 +800,7 @@ fn supervise(
         events,
         journal,
         driver_groups,
+        roots,
     };
     for i in 0..launches.len() {
         session.start(i, &runtime)?;

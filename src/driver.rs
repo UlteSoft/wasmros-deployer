@@ -6,7 +6,7 @@ use crate::verification::{self, NativeAdmission};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
-use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt};
+use std::os::unix::{ffi::OsStrExt, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -24,40 +24,13 @@ impl Launch {
             return Err("driver sandbox root must be independent of the submitted bundle".into());
         }
         let sandbox = verification::protected(&root.join(&attachment.sandbox), bundle, true)?;
-        validate_sandbox(&sandbox)?;
+        crate::workload_fs::immutable_tree(&sandbox, 16384)?;
         let proc = verification::protected(&sandbox.join("proc"), bundle, true)?;
         if fs::read_dir(proc).map_err(|e| e.to_string())?.next().is_some() {
             return Err("driver sandbox needs an empty proc mountpoint".into());
         }
         Ok(Self { artifact, admission, sandbox })
     }
-}
-
-fn validate_sandbox(root: &Path) -> Result<()> {
-    let device = fs::metadata(root).map_err(|e| e.to_string())?.dev();
-    let mut pending = vec![(root.to_owned(), 0usize)];
-    let mut count = 0;
-    while let Some((directory, depth)) = pending.pop() {
-        for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
-            count += 1;
-            if count > 16384 || depth > 32 {
-                return Err("driver sandbox dependency tree exceeds the validation budget".into());
-            }
-            let entry = entry.map_err(|e| e.to_string())?;
-            let info = entry.metadata().map_err(|e| e.to_string())?;
-            let kind = info.file_type();
-            if info.uid() != 0 || info.dev() != device
-                || (!kind.is_symlink() && info.mode() & 0o022 != 0)
-                || !(kind.is_dir() || kind.is_file() || kind.is_symlink())
-            {
-                return Err(format!("untrusted driver sandbox entry {:?}", entry.path()));
-            }
-            if kind.is_dir() {
-                pending.push((entry.path(), depth + 1));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// A one-use bootstrap, retained only in the trusted supervisor.
@@ -111,28 +84,6 @@ impl Bootstrap {
         let record = self.server.bootstrap(self.binding, self.limits, &self.provider, &vm)?;
         attachment::deliver(&self.courier, self.server, record, &self.provider, &vm, Duration::from_secs(2))
     }
-}
-
-/// DDS providers can communicate inside this namespace through its own lo.
-/// No host interfaces or routes are copied into the new namespace.
-unsafe fn private_loopback() -> std::io::Result<()> {
-    use std::os::fd::FromRawFd;
-    let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let socket = File::from_raw_fd(fd);
-    let mut request: libc::ifreq = std::mem::zeroed();
-    request.ifr_name[0] = b'l' as libc::c_char;
-    request.ifr_name[1] = b'o' as libc::c_char;
-    if libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request) < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_MULTICAST) as libc::c_short;
-    if libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request) < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub(crate) fn start(launch: &Launch, enrollment: File) -> Result<((Child, File), Bootstrap)> {
@@ -191,8 +142,7 @@ pub(crate) fn start(launch: &Launch, enrollment: File) -> Result<((Child, File),
             {
                 return Err(fail());
             }
-            private_loopback()?;
-            crate::supervisor::finish_child(identity, parent)?;
+            crate::supervisor::finish_child(identity, parent, crate::containment::Role::NativeDriver)?;
             if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                 return Err(fail());
             }

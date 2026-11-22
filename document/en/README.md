@@ -2,6 +2,8 @@
 
 Build with `cargo build --release --locked --offline`. Release builds use optimization level 3, full debug information and checked arithmetic. Rust dependencies and their licenses are included under `third-parties/cargo`.
 
+To review workloads and per-VM permission files from one XML entry, see [Deploying a bundle from one XML file](configuration-dependencies.md).
+
 The [encrypted attachment provisioning contract](attachment-provisioning.md)
 describes the Rust key/descriptor handoff primitives and their real-VM tests.
 The production CLI uses these primitives for explicitly reviewed read-only native providers.
@@ -10,7 +12,7 @@ Every deployed VM requires [kernel device access control](device-isolation.md).
 The module also supplies exact-device rules and original-owner reservations for
 trusted external provisioners. Native lifecycle integration remains separate.
 
-Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` or `hide permission.report`, then `confirm`. An absent recommendation file starts with no recommended grants. Use `show` to see updated scores and `cancel` to leave the review. The `--accept-recommendations` option adopts the recommendations directly and emits a warning. The effective decisions and configured risk report are still displayed. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
+Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME`, `hide abi` or `hide permission.report`, then `confirm`. An absent recommendation file starts with no recommended grants. Use `show` to see updated scores and `cancel` to leave the review. The pair `--accept-recommendations-through-risk --risk-accept-threshold default` adopts scored recommendations through 3/10. Higher and unassessed recommendations require individual decisions. Use an explicit integer from 0 through 10 to choose another ceiling. The effective decisions and configured risk report are still displayed. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
 
 ```xml
 <deployment id="cell">
@@ -71,7 +73,7 @@ Add an attachment inside the driver's `<driver kind="executable" ...>` element.
     memory-bytes="268435456" pids="32" cpu-micros="100000"/>
 ```
 
-Supply `--driver-root /protected/provider-roots` and `--elf-verifier /opt/wros/bin/uwvm2-ros` to `run` along with the VM options below. The administrator provisions `/protected/provider-roots/go2` with the reviewed loader, libraries, configuration and an empty `proc` directory for a read-only process view. The mount uses `hidepid=2,subset=pid` and preserves access to the provider's own executable and time namespace. Installation must preserve root ownership and deny group and other write access. The deployer mounts this tree read-only, supplies a private loopback interface and grants zero physical devices. Vendor shared libraries run through a signed executable adapter in that root. Each provider has a distinct non-root UID, GID and cgroup. Its executable implements the inherited descriptor handshake in [attachment provisioning](attachment-provisioning.md).
+Supply `--driver-root /protected/provider-roots` and `--elf-verifier /opt/wros/bin/uwvm2-ros` to `run` along with the VM options below. The administrator provisions `/protected/provider-roots/go2` with the reviewed loader, libraries, configuration and an empty `proc` directory for a read-only process view. The mount uses `hidepid=2,subset=pid` and preserves access to the provider's own executable and time namespace. Installation must preserve root ownership and deny group and other write access. The deployer mounts this tree read-only, delivers a connected business attachment and grants zero physical devices. Vendor shared libraries run through a signed executable adapter in that root. Each provider has a distinct non-root UID, GID and cgroup. Its executable implements the inherited descriptor handshake in [attachment provisioning](attachment-provisioning.md).
 
 Review `capability.open`, `driver.connect`, `driver.submit`, `driver.result` and `driver.disconnect` separately from the resource decision `driver/joints/buffer.read`. The recommendation XML can propose the resource decision with `<driver-resource alias="joints" operation="buffer.read" access="allow"/>`. This profile accepts one attached provider per VM and uses the bounded `buffer.read` wire schema.
 
@@ -105,7 +107,11 @@ Every child first joins its assigned group, creates network, IPC, UTS, mount and
 
 Normal signed runs use two rollback stores. Initialize `policy` for privileged admission and `vm-policy` for the dedicated VM user, using the official wasm-cosign policy initializer. The policies must have identical trust roots, signer rules, algorithm allowlists, versions and limits; only `state_dir` may differ. Provision the VM state directory and its initialized files with the VM's ownership, directory mode 0700 and file mode 0600. Keep both policy files administrator-owned and readable by the VM. Do not copy a rollback record after changing its policy paths: records bind the policy fingerprint. A fresh deployment needs correctly initialized stores for its actual paths. The VM performs the second verification itself.
 
-The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. The terminal editor shows the available decisions for every VM. By default, confirm each VM after editing its permissions. `--accept-recommendations` adopts all parsed recommendations in one step. In either mode, review the effective decisions and exact arguments, then type `deploy DEPLOYMENT_ID` to start. A closed terminal or missing confirmation stops the launch. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
+The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. The terminal editor shows the available decisions for every VM. By default, confirm each VM after editing its permissions. Both risk-acceptance options are required for bounded adoption. In either mode, review the effective decisions and exact arguments, then type `deploy DEPLOYMENT_ID` to start. A closed terminal or missing confirmation stops the launch. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
+
+Every production VM runs inside a private read-only root. The deployer binds validated immutable system library trees, the exact WSEA policy and trust root, and the VM-owned mode-0700 rollback directory. Four kernel-filtered pseudo-devices and a read-only, PID-filtered procfs support the runtime. Other host paths, shared memory directories and host FIFOs are absent. Managed processes inherit only standard streams and the descriptors required for their role. A trusted script runtime also retains its script descriptor for its interpreter.
+
+Workload seccomp permanently denies new socket endpoints, io_uring, named IPC creation, cross-process memory and descriptor inspection. Each VM and driver has separate network and IPC namespaces. Both roles reject filesystem notification watches. Native drivers also reject advisory locks and leases on shared inodes. The trusted VM uses file locks in its private WSEA rollback directory. An approved driver attachment remains usable through its connected socket, kernel peer credentials and mutual TLS. Drivers needing a new DDS or other socket at runtime require a provisioned business transport. No manifest permission, threshold or terminal edit opens a management listener. The fixed VM arguments include `--debug-permissions none --debug-dump-force none`. The deployer supplies no debugger, dump or live-update controller to a workload.
 
 Each managed VM starts with `--runtime-memtag-mode sync` and
 `--runtime-memtag-action crash`. A detected tag mismatch terminates the VM at
@@ -119,8 +125,7 @@ evidence. Scores describe the effect of granting an operation and confer no
 authority. The review shows overlapping explicit CPU and NUMA placement and
 shared native sandbox paths. It inventories import declarations from the
 digest-bound Wasm. Imported namespaces identify a link interface and may be
-host services. This manifest cannot declare preloaded Wasm or authorize
-arbitrary host mounts or folders.
+host services. Preloaded Wasm libraries require explicit dependencies, pinned images and independent signature policies. The manifest grants no arbitrary host mounts or folders.
 
 In-process native preload requests score 10 and are refused, including
 `--wasm-register-dl` and its `-Wdl` alias. The separate `report/preloaddl` decision
@@ -171,7 +176,7 @@ wros-deployer resume /protected/bundles/cell/deployment.xml \
   --state-directory /protected/state/cell
 ```
 
-`resume` requires matching durable approval. It does not accept `--accept-recommendations` or new signature-waiver options. It repeats signature admission, retains VM verification for normally signed modules, and repeats warnings for a previously approved waiver. The exact uploaded digest still must match. It checks and clears the previously approved cgroup tree before selecting any new work. Unknown child groups or nested groups stop recovery before any kill; unknown or busy leftovers are never attached to as a fresh deployment. A separate process with the same state directory is rejected by the lock.
+`resume` requires matching durable approval. It reuses the exact approved decisions. Review-time acceptance switches and new signature waivers are rejected. It repeats signature admission, retains VM verification for normally signed modules, and repeats warnings for a previously approved waiver. The exact uploaded digest still must match. It checks and clears the previously approved cgroup tree before selecting any new work. Unknown child groups or nested groups stop recovery before any kill; unknown or busy leftovers are never attached to as a fresh deployment. A separate process with the same state directory is rejected by the lock.
 
 Within the same kernel boot, a manager crash and a VM crash consume the same `restart-limit`. Only interrupted or faulted instances with `restart-on-crash="true"` can restart. Successful completion, operator stop and a failed/blocked deployment do not restart automatically in that boot. `resume` waits at least the largest configured restart delay among the selected instances; operator stop cancels this wait. An explicit new reviewed `run` may reset retry counts while retaining monotonically increasing generations.
 
@@ -268,9 +273,10 @@ The operator's risk report displays scores of 5/10 and above by default, with
 unassessed items listed separately. Use `--risk-report 0` through
 `--risk-report 10` to display scores at or above a different threshold. The
 quoting form `--risk-report '>=7'` is also accepted. `--risk-report none`
-turns off this report. The threshold applies equally to manual review and
-`--accept-recommendations`. Effective permissions, final launch confirmation
+turns off this report. The display threshold applies independently of the maximum score selected for adoption. Effective permissions, final launch confirmation
 and required signature or policy diagnostics are still shown when applicable.
+
+Each newly bound ROSv2 module can query the ABI major through `abi` by default (risk 0/10). This opens no data channel or resource. `deny abi` keeps the import linkable and returns permission denied. `hide abi` rejects the import at link time. The XML spelling for hiding is `<interface name="abi" expose="hidden"/>`. Use `remove abi` in the editor to restore the default. Cold recovery preserves explicit decisions from the approval.
 
 A VM can read its own permission state through `permission.report` by
 default. Limit the report by family or exact function. Use

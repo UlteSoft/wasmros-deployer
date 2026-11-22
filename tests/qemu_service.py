@@ -90,7 +90,7 @@ def main():
     result.update(exit=run.returncode, elapsed_seconds=time.monotonic()-start,
                   cases=re.findall(r'CASE (\S+) PASS', text), events_after=(group/'memory.events').read_text(),
                   systemd=re.findall(r'SERVICE_SYSTEMD (.+)', text))
-    result['complete'] = run.returncode == 0 and 'QEMU_SERVICE_PASS' in text and 'QEMU_SERVICE_FAIL' not in text and len(result['cases']) == 14
+    result['complete'] = run.returncode == 0 and 'QEMU_SERVICE_PASS' in text and 'QEMU_SERVICE_FAIL' not in text and len(result['cases']) == 16 and {'changed-dependency-refused-before-activation', 'recursively-reviewed-vm-starts-under-systemd'} <= set(result['cases'])
     receipt.write_text(json.dumps(result, indent=2))
     print(json.dumps({k:v for k,v in result.items() if k not in ('inputs', 'argv')}, indent=2))
     assert result['complete'], text[-12000:]

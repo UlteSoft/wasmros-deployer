@@ -9,9 +9,12 @@ from pathlib import Path
 import resource
 import struct
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
+sys.dont_write_bytecode = True
 from deployment_review import terminal_run
+from vendor_qualification import qualification_environment
 
 
 WASI = ("wasi_snapshot_preview1", "clock_time_get", "wasip1.clock_time_get")
@@ -90,7 +93,7 @@ def check_argv(argv, identity, decisions, legacy_key):
         ("--ros-scene-interface", identity, ROS_V2[1], ros),
     ]:
         found = [i for i in occurrences(name) if argv[i+2] == function]
-        if decision == HIDDEN:
+        if decision == HIDDEN and (function != "abi" or not found):
             assert not found, argv
         else:
             assert len(found) == 1 and argv[found[0]+1:found[0]+4] == [prefix, function, decision], argv
@@ -122,10 +125,7 @@ def main():
     p.add_argument("--engines", choices=("interpreter", "aot"), nargs="+", default=("interpreter", "aot"))
     args = p.parse_args()
     runtime, deployer, out = args.vm.resolve(), args.deployer.resolve(), args.output.resolve()
-    assert ".tmp" in out.parts
-    group = Path("/sys/fs/cgroup") / Path("/proc/self/cgroup").read_text().strip().removeprefix("0::/")
-    assert (group/"memory.max").read_text().strip() == "68719476736"
-    assert (group/"memory.swap.max").read_text().strip() == "0"
+    group = qualification_environment(out)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.umask(0o077)
     out.mkdir()
@@ -135,7 +135,7 @@ def main():
     (trust/"review-preview.policy").write_text("test preview never executes a signature policy\n")
     manifest = bundle/"deployment.xml"
     review = [deployer, "review", manifest, "--policy-root", trust]
-    adopt = [*review, "--accept-recommendations"]
+    adopt = [*review, "--accept-recommendations-through-risk", "--risk-accept-threshold", "default"]
     aggregates = Counter()
     built = {}
     outcomes = (out/"matrix.jsonl").open("w", buffering=1)
@@ -168,7 +168,7 @@ def main():
                 default = "deny" if effective == "allow" else "allow"
                 interface_xml(rec, key, default)
                 recommended[key] = default
-                verb = "remove" if effective == HIDDEN else effective
+                verb = ("hide" if key == "abi" else "remove") if effective == HIDDEN else effective
                 changes.append(f"{verb} {key}")
                 if bit == 0:
                     recommended["wasip1.clock.monotonic-clock"] = default

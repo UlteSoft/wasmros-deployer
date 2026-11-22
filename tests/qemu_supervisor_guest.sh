@@ -28,7 +28,7 @@ pass() { echo "CASE $1 PASS"; }
 base() {
     /bin/review-terminal /bin/wros-deployer run /bundle/current.xml --policy-root /trust \
         --cosign /bin/cosign --scratch-directory /scratch \
-        --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations "$@"
+        --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations-through-risk --risk-accept-threshold 10 "$@"
 }
 digest=$(sha256sum /bundle/unsigned.wasm); digest=${digest%% *}
 configure() {
@@ -45,7 +45,7 @@ not_running() {
 }
 wait_started() {
     log=$1; expected=$2; loops=0
-    while test "$(grep -c 'started with PID' "$log" || true)" -lt "$expected"; do
+    while ! test -f "$log" || test "$(grep -c 'started with PID' "$log" || true)" -lt "$expected"; do
         loops=$((loops+1)); test "$loops" -lt 300 || { cat "$log"; fail start-timeout; }
         sleep .02
     done
@@ -125,7 +125,7 @@ test "$(grep -c 'started with PID' /stop.log)" = 1 || fail restart-after-stop
 empty; pass operator-stop-overrides-recovery
 
 printf '<deployment id="independent"><vm id="stop-independent" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="10100" gid="10100"/></deployment>\n' "$digest" > /bundle/independent.xml
-/bin/review-terminal /bin/wros-deployer run /bundle/independent.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations --runtime /bin/supervisor-peer --allow-unsigned "stop-independent=$digest" > /independent.log 2>&1 & independent=$!
+/bin/review-terminal /bin/wros-deployer run /bundle/independent.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations-through-risk --risk-accept-threshold 10 --runtime /bin/supervisor-peer --allow-unsigned "stop-independent=$digest" > /independent.log 2>&1 & independent=$!
 wait_started /independent.log 1
 loops=0
 while ! grep -q 'PEER orphan pid=' /independent.log; do
@@ -143,7 +143,7 @@ test "$(echo "$independent_pids" | wc -l)" = 2 || fail independent-members
     printf '</deployment>\n'
 } > /bundle/current.xml
 /bin/strace -f -yy -e trace=write,pidfd_send_signal -o /tree-stop.trace \
-    /bin/review-terminal /bin/wros-deployer run /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations --runtime /bin/supervisor-peer --allow-unsigned "stop-1=$digest" --allow-unsigned "stop-2=$digest" --allow-unsigned "stop-3=$digest" > /tree-stop.log 2>&1 & trace=$!
+    /bin/review-terminal /bin/wros-deployer run /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations-through-risk --risk-accept-threshold 10 --runtime /bin/supervisor-peer --allow-unsigned "stop-1=$digest" --allow-unsigned "stop-2=$digest" --allow-unsigned "stop-3=$digest" > /tree-stop.log 2>&1 & trace=$!
 wait_started /tree-stop.log 3
 loops=0
 while test "$(grep -c 'PEER orphan pid=' /tree-stop.log || true)" -lt 3; do
@@ -183,7 +183,14 @@ test "$(grep -c 'WARNING VM "flood" generation 1 diagnostic byte limit reached' 
 empty; pass bounded-diagnostic-flood
 
 configure floodstop false 0 134217728
-/bin/supervisor-peer --blocked-supervisor /bin/review-terminal /bin/wros-deployer run /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations --runtime /bin/supervisor-peer --allow-unsigned "floodstop=$digest" > /backpressure.log 2>&1 || { cat /backpressure.log; fail blocked-audit; }
+# Interactive admission uses one terminal. Apply backpressure directly to the
+# independent supervisor's real audit pipe after consuming that approval.
+mkdir -m 700 /state/floodstop-review
+set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch \
+    --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/floodstop-review
+/bin/review-terminal /bin/wros-deployer authorize "$@" --accept-recommendations-through-risk --risk-accept-threshold 10 \
+    --allow-unsigned "floodstop=$digest" >/backpressure-approval.log 2>&1 || { cat /backpressure-approval.log; fail blocked-audit-approval; }
+/bin/supervisor-peer --blocked-supervisor /bin/wros-deployer resume "$@" > /backpressure.log 2>&1 || { cat /backpressure.log; fail blocked-audit; }
 empty; pass blocked-audit-consumer-cannot-block-stop
 
 # Use the real VM and a real WSEA signature with two independently owned stores.
@@ -191,7 +198,7 @@ signed=$(sha256sum /bundle/body.wasm); signed=${signed%% *}
 printf '<deployment id="cell"><vm id="body" module="body.wasm" sha256="%s" policy="body.policy" vm-policy="body-vm.policy" memory-bytes="268435456" pids="16" uid="10001" gid="10001"/></deployment>\n' "$signed" > /bundle/current.xml
 base --runtime /bin/uwvm2-ros > /signed.log 2>&1 || {
     cat /signed.log
-    /bin/strace -f -o /failure.trace /bin/review-terminal /bin/wros-deployer run /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations --runtime /bin/uwvm2-ros || true
+    /bin/strace -f -o /failure.trace /bin/review-terminal /bin/wros-deployer run /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --accept-recommendations-through-risk --risk-accept-threshold 10 --runtime /bin/uwvm2-ros || true
     tail -100 /failure.trace
     fail signed-real-vm
 }
@@ -217,7 +224,7 @@ test "$(awk '/Mems_allowed_list:/{print $2}' /proc/$second/status)" = 1 || fail 
 # identities; matching only a GID is also an isolation failure.
 competitor() {
     printf '<deployment id="other"><vm id="normal" module="unsigned.wasm" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="%s" gid="%s"/></deployment>\n' "$digest" "$1" "$2" > /bundle/other.xml
-    /bin/review-terminal /bin/wros-deployer run /bundle/other.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --accept-recommendations --allow-unsigned "normal=$digest"
+    /bin/review-terminal /bin/wros-deployer run /bundle/other.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "normal=$digest"
 }
 if competitor 10001 11001 > /uid-conflict.log 2>&1; then fail uid-collision-accepted; fi
 grep -q 'host identity or device is busy' /uid-conflict.log || { cat /uid-conflict.log; fail wrong-uid-conflict; }
@@ -284,7 +291,15 @@ base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$probedigest" > /sdk-status.
 empty; pass explicit-abi-denial-returns-permission-code
 
 select_sdk sdk.wasm "$sdkdigest"
-printf '<recommendations/>\n' > /bundle/permissions.xml
+sdk_rights
+/bin/busybox sed 's|<interface name="abi" expose="allow" */>||g' /bundle/permissions.xml > /bundle/default-abi.xml
+cp /bundle/default-abi.xml /bundle/permissions.xml
+base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-default.log 2>&1 || { cat /sdk-default.log; fail sdk-default-abi; }
+grep -Fq 'default read-only ABI version via "abi"' /sdk-default.log || fail sdk-default-abi-report
+empty; pass sdk-default-abi-returns-version
+sdk_rights
+/bin/busybox sed 's|name="abi" expose="allow"|name="abi" expose="hidden"|g' /bundle/permissions.xml > /bundle/hidden-abi.xml
+cp /bundle/hidden-abi.xml /bundle/permissions.xml
 if base --runtime /bin/uwvm2-ros --allow-unsigned "sdk=$sdkdigest" > /sdk-hidden.log 2>&1; then fail sdk-hidden; fi
 grep -Fq 'ROS scene interface is hidden' /sdk-hidden.log || { cat /sdk-hidden.log; fail wrong-sdk-hidden-diagnostic; }
 empty; pass sdk-hidden-import-rejected-before-entry
@@ -309,6 +324,14 @@ if test -f /bundle/sdk.signed.wasm; then
     grep -Fq 'sdk|1|' /state/sdk-vm/state || fail missing-vm-sdk-rollback-record
     cat /sdk-signatures.log
     empty; pass signed-sdk-verification-at-deployer-and-vm
+    cp /bundle/default-abi.xml /bundle/permissions.xml
+    base --runtime /bin/uwvm2-ros > /sdk-signed-default.log 2>&1 || { cat /sdk-signed-default.log; fail sdk-signed-default; }
+    grep -Fq 'WSEA policy and signature verified for VM "sdk"' /sdk-signed-default.log || fail sdk-signed-default-signature
+    cp /bundle/hidden-abi.xml /bundle/permissions.xml
+    if base --runtime /bin/uwvm2-ros > /sdk-signed-hidden.log 2>&1; then fail sdk-signed-hidden; fi
+    grep -Fq 'ROS scene interface is hidden' /sdk-signed-hidden.log || { cat /sdk-signed-hidden.log; fail sdk-signed-hidden-diagnostic; }
+    sdk_rights
+    empty; pass signed-sdk-abi-default-and-explicit-hidden
     if test -f /bundle/ros-interfaces.txt; then
         while read -r name; do
             decision=deny
@@ -330,7 +353,7 @@ if test -f /bundle/clock.signed.wasm; then
     clockdigest=$(sha256sum /bundle/clock.signed.wasm); clockdigest=${clockdigest%% *}
     printf '<deployment id="cell"><vm id="clock" module="clock.signed.wasm" sha256="%s" policy="clock-admission.policy" vm-policy="clock-vm.policy" recommendations="clock-rights.xml" memory-bytes="%s" engine="interpreter" pids="16" uid="10001" gid="10001"/></deployment>\n' "$clockdigest" "$sdk_memory" > /bundle/current.xml
     set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --runtime /bin/uwvm2-ros --cgroup-parent /sys/fs/cgroup/delegated --state-directory /state/clock-review
-    /bin/review-terminal /bin/wros-deployer authorize "$@" --accept-recommendations > /clock-authorize.log 2>&1 || { cat /clock-authorize.log; fail clock-approval; }
+    /bin/review-terminal /bin/wros-deployer authorize "$@" --accept-recommendations-through-risk --risk-accept-threshold 10 > /clock-authorize.log 2>&1 || { cat /clock-authorize.log; fail clock-approval; }
     printf '<recommendations/>\n' > /bundle/clock-rights.xml
     /bin/wros-deployer resume "$@" > /clock-resume.log 2>&1 || { cat /clock-resume.log; fail clock-resume; }
     grep -Fq 'split32|1|' /state/clock-vm/state || fail clock-secondary-signature-check
@@ -355,7 +378,7 @@ if test -f /bundle/schedule.signed.wasm; then
         cp /bundle/schedule-rights.xml /bundle/local-rights.xml
         printf '<deployment id="cell"><vm id="schedule" module="schedule.signed.wasm" sha256="%s" policy="schedule-admission.policy" vm-policy="schedule-vm.policy" recommendations="local-rights.xml" memory-bytes="%s" engine="%s" pids="16" uid="10001" gid="10001"/></deployment>\n' "$digest_schedule" "$sdk_memory" "$engine" > /bundle/current.xml
         set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --runtime /bin/uwvm2-ros --cgroup-parent /sys/fs/cgroup/delegated --state-directory "$review"
-        /bin/review-terminal /bin/wros-deployer authorize "$@" --accept-recommendations > /schedule.log 2>&1 || { cat /schedule.log; fail schedule-approval; }
+        /bin/review-terminal /bin/wros-deployer authorize "$@" --accept-recommendations-through-risk --risk-accept-threshold 10 > /schedule.log 2>&1 || { cat /schedule.log; fail schedule-approval; }
         printf '<recommendations/>\n' > /bundle/local-rights.xml
         /bin/wros-deployer resume "$@" >> /schedule.log 2>&1 || { cat /schedule.log; fail schedule-resume; }
         grep -Fq 'local guard resource "signal" operation guard.take: deny' /schedule.log || fail schedule-review
@@ -398,11 +421,11 @@ set -- /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-d
 # Both approvals are created while the deployment is inactive; their state
 # directories differ. This checks admission order, not just competing spawn.
 mkdir /state/second-journal; chmod 700 /state/second-journal
-/bin/review-terminal /bin/wros-deployer authorize /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/second-journal --accept-recommendations --allow-unsigned "stop=$digest" > /second-approval.log 2>&1 || { cat /second-approval.log; fail second-approval; }
+/bin/review-terminal /bin/wros-deployer authorize /bundle/current.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/second-journal --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "stop=$digest" > /second-approval.log 2>&1 || { cat /second-approval.log; fail second-approval; }
 mkdir /state/changed-journal; chmod 700 /state/changed-journal
 /bin/busybox sed 's/uid="10001" gid="10001"/uid="12001" gid="12001"/' /bundle/current.xml > /bundle/changed-identity.xml
-/bin/review-terminal /bin/wros-deployer authorize /bundle/changed-identity.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/changed-journal --accept-recommendations --allow-unsigned "stop=$digest" > /changed-approval.log 2>&1 || { cat /changed-approval.log; fail changed-approval; }
-/bin/review-terminal /bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "stop=$digest" > /durable-first.log 2>&1 & manager=$!
+/bin/review-terminal /bin/wros-deployer authorize /bundle/changed-identity.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/supervisor-peer --state-directory /state/changed-journal --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "stop=$digest" > /changed-approval.log 2>&1 || { cat /changed-approval.log; fail changed-approval; }
+/bin/review-terminal /bin/wros-deployer run "$@" --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "stop=$digest" > /durable-first.log 2>&1 & manager=$!
 wait_started /durable-first.log 1
 sleep .1
 before_pids=$(cat /sys/fs/cgroup/delegated/wros-cell/vm-stop/cgroup.procs)
@@ -455,7 +478,7 @@ grep -q 'No instance has an automatic cold-start grant' /durable-exhausted.log |
 empty; pass state-manager-crashes-preserve-retry-budget
 # A fresh operator-reviewed invocation may reset retries, but an automatic one
 # may not. Operator shutdown is committed before descendant termination.
-/bin/review-terminal /bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "stop=$digest" > /durable-stop.log 2>&1 & manager=$!
+/bin/review-terminal /bin/wros-deployer run "$@" --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "stop=$digest" > /durable-stop.log 2>&1 & manager=$!
 wait_started /durable-stop.log 1
 grep -q 'generation 4 started' /durable-stop.log || fail operator-reset-generation
 approval_before=$(sha256sum /state/journal/approval)

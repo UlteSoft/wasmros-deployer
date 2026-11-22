@@ -44,6 +44,7 @@ impl Phase {
 pub struct Entry {
     pub rights: BTreeMap<String, bool>,
     pub waiver: Option<Signature>,
+    pub library_waivers: BTreeMap<String, Signature>,
     phase: Phase,
     pub generation: u64,
     pub restarts: u32,
@@ -61,6 +62,7 @@ impl Entry {
         Self {
             rights,
             waiver,
+            library_waivers: BTreeMap::new(),
             phase: Phase::Ready,
             generation: 0,
             restarts: 0,
@@ -124,6 +126,13 @@ impl<'a> Reader<'a> {
     }
 }
 impl Record {
+    fn stop(&mut self, boot: String, blocked: bool) {
+        self.boot = boot;
+        for entry in self.entries.values_mut() {
+            entry.phase = if blocked { Phase::Blocked } else { Phase::Stopped };
+        }
+    }
+
     fn resume(&mut self, boot: String, processes: &[&Process]) -> Result<Vec<String>> {
         let new_boot = self.boot != boot;
         if self.entries.len() != processes.len()
@@ -194,6 +203,22 @@ impl Record {
             for (name, allow) in &e.rights {
                 text(&mut out, name);
                 out.push(u8::from(*allow));
+            }
+        }
+        let waivers: Vec<_> = self.entries.iter().filter(|(_, e)| !e.library_waivers.is_empty()).collect();
+        if !waivers.is_empty() {
+            out.extend(b"WLIB1");
+            out.extend((waivers.len() as u32).to_le_bytes());
+            for (vm, entry) in waivers {
+                text(&mut out, vm);
+                out.extend((entry.library_waivers.len() as u32).to_le_bytes());
+                for (name, kind) in &entry.library_waivers {
+                    text(&mut out, name);
+                    out.push(match kind {
+                        Signature::Unsigned => 1, Signature::Invalid => 2,
+                        Signature::Verified => return Err("verified library needs no waiver".into()),
+                    });
+                }
             }
         }
         let digest = Sha256::digest(&out);
@@ -281,6 +306,7 @@ impl Record {
                     Entry {
                         rights,
                         waiver,
+                        library_waivers: BTreeMap::new(),
                         phase,
                         generation,
                         restarts,
@@ -292,7 +318,28 @@ impl Record {
             }
         }
         if !r.0.is_empty() {
-            return Err("trailing approval data".into());
+            if r.take(5)? != b"WLIB1" { return Err("unknown approval extension".into()); }
+            let groups = r.number()? as usize;
+            if groups == 0 || groups > entries.len() { return Err("invalid library waiver group count".into()); }
+            for _ in 0..groups {
+                let vm = r.string(128)?;
+                let entry = entries.get_mut(&vm).ok_or("unknown VM in library waiver set")?;
+                let count = r.number()? as usize;
+                if !entry.library_waivers.is_empty() || !(1..=crate::manifest::libraries::MAX_LIBRARIES).contains(&count) {
+                    return Err("invalid or duplicated library waiver set".into());
+                }
+                for _ in 0..count {
+                    let name = r.string(255)?;
+                    let kind = match r.take(1)?[0] {
+                        1 => Signature::Unsigned, 2 => Signature::Invalid,
+                        _ => return Err("invalid library waiver kind".into()),
+                    };
+                    if !crate::manifest::libraries::identifier(&name) || entry.library_waivers.insert(name, kind).is_some() {
+                        return Err("invalid or duplicate library waiver".into());
+                    }
+                }
+            }
+            if !r.0.is_empty() { return Err("trailing approval data".into()); }
         }
         Ok(Self {
             binding,
@@ -533,13 +580,9 @@ impl Journal {
     }
     pub fn stop(&mut self, blocked: bool) -> Result<()> {
         let mut r = self.record.clone().ok_or("missing durable approval")?;
-        for e in r.entries.values_mut() {
-            e.phase = if blocked {
-                Phase::Blocked
-            } else {
-                Phase::Stopped
-            };
-        }
+        // A stop during admission can precede the first resume of this boot.
+        // Its operator intent must apply to subsequent invocations on this boot.
+        r.stop(boot_id()?, blocked);
         self.replace(r)
     }
 }
@@ -560,6 +603,21 @@ mod tests {
     fn process(restart: bool, start: bool, limit: u32) -> Process {
         crate::manifest::deployment(&format!("<deployment id=\"cell\"><vm id=\"body\" module=\"body.wasm\" sha256=\"{}\" policy=\"body.policy\" memory-bytes=\"1024\" pids=\"4\" restart-on-crash=\"{}\" start-on-boot=\"{}\" restart-limit=\"{}\"/></deployment>","a".repeat(64),restart,start,limit)).unwrap().processes.remove(0)
     }
+    #[test]
+    fn library_waivers_survive_resume_without_granting_main_rights() {
+        let mut record = sample();
+        let old = record.encode().unwrap();
+        assert!(Record::decode(&old).unwrap().entries["body"].library_waivers.is_empty());
+        let entry = record.entries.get_mut("body").unwrap();
+        entry.library_waivers.insert("leaf".into(), Signature::Unsigned);
+        let restored = Record::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(restored.entries["body"].library_waivers.get("leaf"), Some(&Signature::Unsigned));
+        assert!(restored.entries["body"].waiver.is_none());
+        assert_eq!(restored.entries["body"].rights, record.entries["body"].rights);
+        record.entries.get_mut("body").unwrap().library_waivers.insert("leaf".into(), Signature::Verified);
+        assert!(record.encode().is_err());
+    }
+
     #[test]
     fn manager_crashes_cannot_reset_approved_retry_budget() {
         let mut r = sample();
@@ -601,6 +659,15 @@ mod tests {
         assert!(r.resume(r.boot.clone(), &[&p]).unwrap().is_empty());
     }
     #[test]
+    fn stop_before_new_boot_admission_consumes_that_boot_start() {
+        let mut record = sample();
+        let process = process(true, true, 3);
+        let new_boot = "00000000-0000-0000-0000-000000000002".to_owned();
+        record.stop(new_boot.clone(), false);
+        assert!(record.resume(new_boot, &[&process]).unwrap().is_empty());
+        assert_eq!(record.entries["body"].phase, Phase::Stopped);
+    }
+    #[test]
     fn automatic_resume_cannot_add_instances_or_authority() {
         let mut r = sample();
         let mut p = process(true, true, 3);
@@ -629,6 +696,19 @@ mod tests {
             .resume("00000000-0000-0000-0000-000000000002".into(), &[&p])
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn abi_visibility_round_trips_without_resource_authority() {
+        for rights in [
+            BTreeMap::new(), BTreeMap::from([("abi".into(), false)]),
+            BTreeMap::from([("hide/abi".into(), true)]),
+        ] {
+            let mut record = sample();
+            record.entries.get_mut("body").unwrap().rights = rights.clone();
+            let saved = Record::decode(&record.encode().unwrap()).unwrap();
+            assert_eq!(saved.entries["body"].rights, rights);
+            assert!(crate::manifest::reviewed_grants(&rights).unwrap().is_empty());
+        }
     }
     #[test]
     fn exact_clock_authority_survives_durable_review() {

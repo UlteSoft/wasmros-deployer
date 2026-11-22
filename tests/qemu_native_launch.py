@@ -11,11 +11,12 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import xml.etree.ElementTree as ET
 
 from qemu_supervisor import digest, pack
 from vendor_qualification import cgroup
-from vendor_unitree_qemu import sign_attachment
+from vendor_unitree_qemu import ARCHIVE_SHA256, REVISION, compile_attachment, sign_attachment
 
 
 def stage_fixture(archive, root):
@@ -73,7 +74,19 @@ def prepare_deployment(args, root, original):
     payload = prior_signed[:-(length + 12 + len(marker))]
     if hashlib.sha256(payload).hexdigest() != prior["native_provider_sha256"]:
         raise ValueError("prior signed provider does not contain the reviewed ELF")
-    driver.write_bytes(payload)
+    # Keep the original adapter for the independent signed-offline SDK test.
+    # The managed process only consumes an approved, pre-recorded sample.
+    if digest(args.sdk_archive) != ARCHIVE_SHA256:
+        raise ValueError("unexpected Unitree SDK source archive")
+    sdk_dir = args.output / "sdk"
+    sdk_dir.mkdir()
+    with tarfile.open(args.sdk_archive, "r:gz") as archive:
+        archive.extractall(sdk_dir, filter="data")
+    sdk = sdk_dir / ("unitree_sdk2-" + REVISION)
+    binary = args.output / "recorded-provider"
+    compile_attachment(args, sdk, binary, ["-DWROS_UNITREE_RECORDED_SAMPLE"])
+    shutil.copyfile(binary, driver)
+    payload = driver.read_bytes()
     sign_attachment(args, root, args.module)
     (bundle / "unsigned").write_bytes(payload)
     modified = bytearray(driver.read_bytes())
@@ -138,7 +151,7 @@ def main():
     """@brief Verify source lineage, boot the kernel, and retain exact test outcomes."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("output", "base", "base-receipt", "module", "vm", "vm-source",
-                 "deployer", "cosign", "sign-file", "signing-scratch", "kernel", "bios",
+                 "deployer", "cosign", "sign-file", "signing-scratch", "sdk-archive", "openssl-root", "kernel", "bios",
                  "firmware-directory"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(), required=True)
     parser.add_argument("--qemu", type=lambda value: Path(value).absolute(), required=True)
@@ -186,7 +199,9 @@ def main():
             "-kernel", args.kernel, "-initrd", initrd,
             "-append", "console=ttyS0 quiet panic=-1 rdinit=/init cgroup_no_v1=all"]
     inputs = [args.base_receipt, args.module, args.vm, args.cosign, args.sign_file,
-              args.deployer, args.kernel, entry, contract, helper, review_terminal]
+              args.deployer, args.kernel, entry, contract, helper, review_terminal,
+              args.sdk_archive, args.output / "recorded-provider", args.openssl_root / "libssl.a",
+              args.openssl_root / "libcrypto.a", Path(__file__).with_name("support") / "unitree_attachment.cpp"]
     receipt = {"inputs": {str(path): digest(path) for path in inputs},
                "deployment_binary_sha256": digest(root / "bin/wros-deployer"),
                "initramfs_sha256": digest(initrd), "cgroup": str(group), "argv": list(map(str, argv))}
@@ -195,7 +210,7 @@ def main():
         result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=110)
     transcript = serial.read_text(errors="replace")
     receipt["cases"] = re.findall(r"^CASE ([-a-z]+) PASS$", transcript, re.MULTILINE)
-    expected = {"rejects-unsigned-by-default", "rejects-invalid-by-default",
+    expected = {"original-sdk-recorded-sample", "rejects-unsigned-by-default", "rejects-invalid-by-default",
                 "rejects-wrong-exception-id", "rejects-wrong-exception-digest",
                 "rejects-wrong-exception-kind", "requires-per-driver-permission",
                 "withdrawn-signer-denied-before-exec", "rejects-noninteractive-review",

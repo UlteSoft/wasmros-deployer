@@ -10,6 +10,31 @@ pub enum ImportAssessment {
     Unassessed { reason: &'static str },
 }
 
+/// Workload declarations in runtime-owned namespaces must use the public guest
+/// ABI. A business library can independently export fields named "debug" or
+/// "control". Only the namespace owner determines whether a field is a host API.
+pub fn check_host_import(namespace: &str, field: &str) -> Result<()> {
+    let refused = match namespace {
+        "uwvm_ros_v2" => !crate::manifest::known_interface(field),
+        "uwvm_ros1_v1" | "uwvm_ros2_v1" => field != "abi_version",
+        "wasi_snapshot_preview1" | "wasi_unstable" => field.starts_with("sock_"),
+        "wros_deployer" | "wros.deployer" => true,
+        name => name.starts_with("uwvm_") || name.starts_with("uwvm:")
+            || name.starts_with("wros:") || name.starts_with("wasi:sockets/"),
+    };
+    if refused {
+        return Err(format!("forbidden workload host import {namespace:?}.{field:?}; managed IPC requires a provisioned business attachment"));
+    }
+    Ok(())
+}
+
+pub fn require_complete(assessment: ImportAssessment) -> Result<ImportAssessment> {
+    match assessment {
+        ImportAssessment::Unassessed { reason } => Err(format!("workload admission requires a complete import inventory: {reason}")),
+        complete => Ok(complete),
+    }
+}
+
 /// Inventory a pinned guest image without disturbing its file offset.
 ///
 /// The caller establishes identity and digest. This scan does not grant an
@@ -97,6 +122,7 @@ fn scan(
                 Ok(entry) => entry,
                 Err(_) => return unassessed("malformed Wasm import declaration"),
             };
+            check_host_import(entry.module, entry.name)?;
             name_bytes += entry.module.len() + entry.name.len();
             if imports.len() == MAX_IMPORTS || name_bytes > MAX_NAME_BYTES {
                 return unassessed("Wasm import inventory exceeds the display budget");
@@ -121,6 +147,20 @@ mod tests {
             Ok(())
         })
         .unwrap()
+    }
+
+    #[test]
+    fn managed_host_imports_cannot_request_external_endpoints() {
+        for (module, name) in [("uwvm_ros_v2", "driver.direct-connect"), ("uwvm_ros_v2", "vm.dump"),
+            ("uwvm_debug", "attach"), ("uwvm:update", "commit"), ("wros_deployer", "status"),
+            ("wasi_snapshot_preview1", "sock_recv"), ("wasi:sockets/tcp@0.2.0", "start-connect")] {
+            assert!(check_host_import(module, name).is_err(), "{module}.{name}");
+        }
+        for (module, name) in [("uwvm_ros_v2", "driver.connect"), ("uwvm_ros_v2", "control.result"),
+            ("telemetry", "debug"), ("update_model", "control")] {
+            check_host_import(module, name).unwrap();
+        }
+        assert!(require_complete(ImportAssessment::Unassessed { reason: "incomplete" }).is_err());
     }
 
     #[test]

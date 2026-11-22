@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+set -o pipefail
 exec </dev/console >/dev/console 2>&1
 ulimit -c 0
 b=/bin/busybox
@@ -7,6 +8,8 @@ trap 'for log in /run/*.log /run/*.sensor; do test ! -f "$log" || $b tail -n 40 
 $b mount -t proc proc /proc
 $b mount -t sysfs sysfs /sys
 $b mount -t cgroup2 none /sys/fs/cgroup
+$b mknod -m 0444 /dev/zero c 1 5
+$b mknod -m 0444 /dev/random c 1 8
 $b mknod -m 0444 /dev/urandom c 1 9
 $b mknod -m 0666 /dev/ptmx c 5 2
 $b mkdir /dev/pts
@@ -32,13 +35,15 @@ $b chmod 644 /trust/vm.policy
 $b chown -R 24101:24101 /run/vm
 
 elf_check=/bin/uwvm2-ros
+# The PTY relay exits just after the deployer. Reading the pipe through EOF
+# makes subsequent log checks deterministic and pipefail preserves its status.
 command() {
     manifest=$1
     shift
     "$@" /bin/wros-deployer run "/bundle/$manifest.xml" --policy-root /trust \
         --runtime /bin/uwvm2-ros --cosign /bin/cosign --scratch-directory /run/scratch \
         --elf-verifier "$elf_check" --driver-root /sandboxes \
-        --cgroup-parent "$g/workloads" --accept-recommendations
+        --cgroup-parent "$g/workloads" --accept-recommendations-through-risk --risk-accept-threshold 10 2>&1 | "$b" cat
 }
 run() {
     manifest=$1
@@ -46,7 +51,7 @@ run() {
     /bin/review-terminal /bin/wros-deployer run "/bundle/$manifest.xml" --policy-root /trust \
         --runtime /bin/uwvm2-ros --cosign /bin/cosign --scratch-directory /run/scratch \
         --elf-verifier "$elf_check" --driver-root /sandboxes \
-        --cgroup-parent "$g/workloads" --accept-recommendations "$@"
+        --cgroup-parent "$g/workloads" --accept-recommendations-through-risk --risk-accept-threshold 10 "$@" 2>&1 | "$b" cat
 }
 
 # Failure precedes any native process or deployment cgroup creation.
@@ -88,6 +93,24 @@ test ! -e "$g/workloads/wros-unitree"
 echo 'CASE withdrawn-signer-denied-before-exec PASS'
 elf_check=/bin/uwvm2-ros
 
+# The offline fixture owns the original SDK network. Capture an authentic sample
+# before starting the managed provider, whose work uses only the assigned carrier.
+$b ip link set lo up
+(
+    echo 0 > "$g/sensor/cgroup.procs"
+    export LD_LIBRARY_PATH=/opt/unitree
+    exec "$b" su -s /bin/sh -c 'LD_LIBRARY_PATH=/opt/unitree exec /bin/low-state publish' writer
+) > /run/official-publisher.log 2>&1 &
+publisher=$!
+(
+    echo 0 > "$g/sensor/cgroup.procs"
+    exec "$b" su -s /bin/sh -c 'LD_LIBRARY_PATH=/opt/unitree exec /bin/low-state read' writer
+) > /run/official-reader.log
+wait "$publisher"
+$b grep -x 'Go2 LowState tick=41347 position=0.125' /run/official-reader.log > /sandboxes/go2/telemetry.txt
+$b chmod 0444 /sandboxes/go2/telemetry.txt
+echo 'CASE original-sdk-recorded-sample PASS'
+
 exercise() {
     label=$1
     shift
@@ -109,33 +132,39 @@ exercise() {
         $b cat "/run/$label.log"
         exit 1
     fi
-    # Inject read-only telemetry from an independent process only into the
-    # test namespace. The production deployer supplies no host network.
-    (
-        echo 0 > "$g/sensor/cgroup.procs"
-        export LD_LIBRARY_PATH=/opt/unitree
-        exec $b nsenter --net="/proc/$driver/ns/net" "$b" su -s /bin/sh \
-            -c 'LD_LIBRARY_PATH=/opt/unitree exec /bin/low-state publish' writer
-    ) >"/run/$label.sensor" 2>&1 &
-    sensor=$!
-    for _ in $($b seq 100); do
-        test ! -f "$vm_group/cgroup.procs" || vm=$($b head -n 1 "$vm_group/cgroup.procs")
-        test -z "${vm:-}" || break
+    # Cgroup membership is assigned before chroot and namespace setup. Inspect
+    # the settled workload identities and both live namespace links together.
+    confined=false
+    for _ in $($b seq 150); do
+        vm=$($b head -n 1 "$vm_group/cgroup.procs" 2>/dev/null || true)
+        if test -n "$vm"; then
+            driver_net=$($b readlink "/proc/$driver/ns/net" || true)
+            vm_net=$($b readlink "/proc/$vm/ns/net" || true)
+            driver_root=$($b readlink "/proc/$driver/root" || true)
+            if test -n "$driver_net" && test -n "$vm_net" && test "$driver_net" != "$vm_net" &&
+               test "$driver_root" = /sandboxes/go2 &&
+               $b grep -Eq '^Uid:[[:space:]]+24101[[:space:]]+24101[[:space:]]' "/proc/$vm/status"; then
+                confined=true
+                break
+            fi
+        fi
         $b sleep 0.02
     done
-    test -n "${vm:-}"
-    test "$($b readlink "/proc/$driver/ns/net")" != "$($b readlink "/proc/$vm/ns/net")"
-    test "$($b readlink "/proc/$driver/root")" = "/sandboxes/go2"
-    if ! wait "$manager"; then
-        $b cat "/run/$label.log" "/run/$label.sensor"
+    if test "$confined" != true; then
+        echo "No settled workload namespace observation for $label"
+        $b cat "/run/$label.log"
         exit 1
     fi
-    wait "$sensor"
+    if ! wait "$manager"; then
+        $b cat "/run/$label.log"
+        exit 1
+    fi
     $b cat "/run/$label.log"
     $b grep -F 'Driver "unitree" passed launch signature policy' "/run/$label.log"
+    $b grep -F 'Managed driver endpoint creation denied' "/run/$label.log"
     $b grep -F 'Go2 LowState over TLS tick=41347 position=0.125' "/run/$label.log"
     $b grep -F 'Review effective decisions for VM "main"' "/run/$label.log"
-    $b grep -F 'adopting parsed recommendations without per-VM edits' "/run/$label.log"
+    $b grep -F 'adopting scored recommendations at or below 10/10' "/run/$label.log"
     if test "$label" = signed; then
         $b grep -F 'Risk report deployment configuration (threshold >=5/10)' "/run/$label.log"
         $b grep -F 'read-only sandbox "go2": 7/10 (high)' "/run/$label.log"

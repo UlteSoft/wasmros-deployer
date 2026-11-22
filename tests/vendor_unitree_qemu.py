@@ -236,6 +236,27 @@ def sign_attachment(args, root, wasm):
         shutil.copyfile(signed_elf, root / "bundle/unitree-provider")
 
 
+def compile_attachment(args, sdk, binary, extra_flags=()):
+    """@brief Build the telemetry adapter against the selected original SDK and static TLS libraries."""
+    support = Path(__file__).with_name("support")
+    source = [support / "unitree_low_state.cpp", support / "unitree_attachment.cpp"]
+    libraries = sdk / "thirdparty/lib/x86_64"
+    ssl = args.openssl_root
+    ssl_inputs = [ssl / "libssl.a", ssl / "libcrypto.a"]
+    compile_provider = [
+        "/usr/bin/clang++-22", "-std=c++23", "-O3", "-g", "-Wall", "-Wextra", "-Werror", "-pthread",
+        "-DWROS_UNITREE_ATTACHMENT", "-DUWVM_ROS_ATTACHMENT_OPENSSL", *extra_flags,
+        "-I", args.vm_source / "src", "-isystem", args.vm_source / "third-parties/fast_io/include",
+        "-isystem", ssl / "include", "-isystem", sdk / "include",
+        "-isystem", sdk / "thirdparty/include", "-isystem", sdk / "thirdparty/include/ddscxx",
+        *source, sdk / "lib/x86_64/libunitree_sdk2.a", *ssl_inputs, "-L", libraries,
+        "-lddscxx", "-lddsc", "-ldl", "-Wl,-rpath,/opt/unitree", "-o", binary,
+    ]
+    with (args.output / "attachment-build.log").open("wb") as log:
+        run(compile_provider, stdout=log, stderr=subprocess.STDOUT)
+    return compile_provider, source, ssl_inputs
+
+
 def build_attachment(args, root):
     """@brief Stage the original SDK, its read-only adapter and the signed Wasm guest."""
     tests = Path(__file__).resolve().parent
@@ -244,20 +265,7 @@ def build_attachment(args, root):
     sdk = out / "unitree" / ("unitree_sdk2-" + REVISION)
     libraries = sdk / "thirdparty/lib/x86_64"
     binary = out / "unitree-provider"
-    source = [support / "unitree_low_state.cpp", support / "unitree_attachment.cpp"]
-    ssl = args.openssl_root
-    ssl_inputs = [ssl / "libssl.a", ssl / "libcrypto.a"]
-    compile_provider = [
-        "/usr/bin/clang++-22", "-std=c++23", "-O3", "-g", "-Wall", "-Wextra", "-Werror", "-pthread",
-        "-DWROS_UNITREE_ATTACHMENT", "-DUWVM_ROS_ATTACHMENT_OPENSSL",
-        "-I", args.vm_source / "src", "-isystem", args.vm_source / "third-parties/fast_io/include",
-        "-isystem", ssl / "include", "-isystem", sdk / "include",
-        "-isystem", sdk / "thirdparty/include", "-isystem", sdk / "thirdparty/include/ddscxx",
-        *source, sdk / "lib/x86_64/libunitree_sdk2.a", *ssl_inputs, "-L", libraries,
-        "-lddscxx", "-lddsc", "-ldl", "-Wl,-rpath,/opt/unitree", "-o", binary,
-    ]
-    with (out / "attachment-build.log").open("wb") as log:
-        run(compile_provider, stdout=log, stderr=subprocess.STDOUT)
+    compile_provider, source, ssl_inputs = compile_attachment(args, sdk, binary)
     stage_binary(root, binary, "unitree-provider", libraries)
     for executable, filename in ((args.vm, "uwvm2-ros"), (args.cosign, "cosign"),
                                  (args.deployer, "wros-deployer"), (args.provisioner, "provisioner")):

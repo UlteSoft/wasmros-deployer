@@ -31,7 +31,7 @@
 本机加密接入需要部署器证明双方的时钟域。cgroup 本身不能阻止进程改变时间
 命名空间；VM 还必须验证内核命名空间证据、准确的进程凭据、进程生存期和双向 TLS。
 测试脚本 `tests/qemu_driver_identity.py` 使用不同的非 root 用户验证这些边界。
-生产部署命令仍拒绝原生驱动编排，直到其余生命周期与设备所有权机制实现并验收。
+生产原生驱动仅支持操作员显式启动及部署器预连的只读业务接入；服务自动恢复仅适用于纯 VM 部署。
 
 XML 必须单独声明管理进程预算：
 
@@ -67,7 +67,7 @@ XML 必须单独声明管理进程预算：
   --supervisor-cgroup /sys/fs/cgroup/system.slice/wros-cell.service
 ```
 
-必须通过终端审核。可逐个修改并确认 VM，或使用 `--accept-recommendations` 一步采纳全部建议。两种方式均展示生效权限，并由 `--risk-report` 单独控制风险报告。输入 `authorize 部署ID` 保存审核结果。无签名和错误签名例外仍分别绑定一个 VM 与准确摘要。状态已被其他部署器持有，或服务根还有进程时，`authorize` 拒绝改写授权，不会为替换配置而停止旧部署。
+必须通过终端审核。可逐个修改并确认 VM，或使用 `--accept-recommendations-through-risk --risk-accept-threshold default` 采纳不超过 3/10 的建议并逐项审核其余建议。两种方式均展示生效权限，并由 `--risk-report` 单独控制风险报告。输入 `authorize 部署ID` 保存审核结果。无签名和错误签名例外仍分别绑定一个 VM 与准确摘要。状态已被其他部署器持有，或服务根还有进程时，`authorize` 拒绝改写授权，不会为替换配置而停止旧部署。
 
 审核完成后，以相同路径生成服务文件：
 

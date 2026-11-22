@@ -2,13 +2,15 @@
 
 使用 `cargo build --release --locked --offline` 构建。发布配置启用三级优化、完整调试符号和溢出检查。Rust 依赖源码和许可证在 `third-parties/cargo`。
 
+通过一份 XML 审查工作负载及各 VM 的推荐权限，参见[从一个 XML 入口部署](configuration-dependencies.md)。
+
 [本机加密通道交付约定](attachment-provisioning.md)说明了 Rust 密钥和描述符交付组件及其真实 VM 测试。
 正式 CLI 用这些组件启动经审核的只读原生提供方。
 
 每个部署的 VM 必须启用[内核设备访问控制](device-isolation.md)。该模块同时提供
 确切设备规则和原部署器归属登记；native 驱动生命周期仍需独立联动。
 
-`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 或 `hide permission.report` 后 `confirm`。缺省推荐不授予权限。输入 `show` 可重新查看评分，输入 `cancel` 可退出。使用 `--accept-recommendations` 会直接采纳已读取的建议并显示警告，仍会展示生效权限和按选项生成的风险报告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
+`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME`、`hide abi` 或 `hide permission.report` 后 `confirm`。缺省推荐不授予权限。输入 `show` 可重新查看评分，输入 `cancel` 可退出。同时使用 `--accept-recommendations-through-risk --risk-accept-threshold default` 可采纳评分不超过 3/10 的建议。更高分或未评分的建议仍需逐项确认。也可用 0 至 10 的整数设置采纳上限。生效权限和风险报告独立展示。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
 
 ```xml
 <deployment id="cell">
@@ -62,7 +64,7 @@ sha256sum driver.signed.so
     memory-bytes="268435456" pids="32" cpu-micros="100000"/>
 ```
 
-`run` 增加 `--driver-root /protected/provider-roots` 和 `--elf-verifier /opt/wros/bin/uwvm2-ros`。管理员在 `/protected/provider-roots/go2` 准备已审核的动态加载器、依赖与配置，全部归 root 所有且禁止组和其他用户写入。另需留出空的 `proc` 目录，用于挂载带 `hidepid=2,subset=pid` 的只读进程视图。原厂库可读取自身可执行文件名和时钟命名空间身份。其余目录以只读方式挂载，网络仅有独立回环，实体设备授权为空。原厂共享库通过同一隔离目录中的签名 ELF 适配器接入。
+`run` 增加 `--driver-root /protected/provider-roots` 和 `--elf-verifier /opt/wros/bin/uwvm2-ros`。管理员在 `/protected/provider-roots/go2` 准备已审核的动态加载器、依赖与配置，全部归 root 所有且禁止组和其他用户写入。另需留出空的 `proc` 目录，用于挂载带 `hidepid=2,subset=pid` 的只读进程视图。原厂库可读取自身可执行文件名和时钟命名空间身份。其余目录以只读方式挂载，业务端点由部署器预先连接，实体设备授权为空。原厂共享库通过同一隔离目录中的签名 ELF 适配器接入。
 
 每个 VM 当前可连接一个独立 UID、GID 和 cgroup 的提供方。单独审核 `capability.open`、`driver.connect`、`driver.submit`、`driver.result`、`driver.disconnect` 及资源权限 `driver/joints/buffer.read`。推荐权限可用 `<driver-resource alias="joints" operation="buffer.read" access="allow"/>` 表达。驱动进程通过继承描述符完成身份交付，之后用认证 TLS 处理有界的 `buffer.read`。
 
@@ -96,13 +98,17 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 
 正常签名部署需要两个反回滚状态库。用官方 wasm-cosign 初始化器分别初始化特权准入的 `policy` 和 VM 用户的 `vm-policy`；两份策略的信任根、签名者、算法、版本和限制必须完全一致，只允许 `state_dir` 不同。VM 状态目录及其中初始化文件属于 VM 用户，目录权限 0700、文件权限 0600；策略文件仍归管理员持有，并允许 VM 读取。不能修改策略路径后直接复制旧的反回滚记录，因为记录绑定策略指纹。VM 自己完成第二次校验。
 
-`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。审核在终端进行。默认逐项修改并确认每个 VM。`--accept-recommendations` 会一步采纳全部已读取的建议。两种方式均展示生效权限和完整参数，输入 `deploy 部署ID` 才会启动。关闭终端或未确认会停止启动。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
+`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。审核在终端进行。默认逐项修改并确认每个 VM。按分数采纳需要同时提供启用开关和采纳上限。两种方式均展示生效权限和完整参数，输入 `deploy 部署ID` 才会启动。关闭终端或未确认会停止启动。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
+
+每个受管 VM 使用独立的只读根目录。部署器绑定经核查的只读系统库、确切的 WSEA 策略和信任根、VM 专用的 0700 回滚目录、四种受内核过滤的伪设备，以及只读且过滤 PID 的 procfs。主机共享内存目录、宿主 FIFO 和其他宿主路径都不进入该视图。进程只继承标准流和本角色所需描述符；使用受信任启动脚本时，解释器还需保留脚本自身的描述符。
+
+VM 和驱动均使用私有网络和 IPC 命名空间，并拒绝文件系统事件监听。原生驱动还拒绝共享 inode 上的建议锁和租约；受信 VM 可以锁定自己的 WSEA 防回滚文件。seccomp 永久拒绝新建套接字、io_uring、具名 IPC 对象、跨进程内存读写及描述符复制。已获业务授权的 VM/驱动通过部署器预连的套接字、内核凭据和双向 TLS 收发。需要自行新建 DDS 等套接字的驱动必须改走预置业务传输。部署器固定传入 `--debug-permissions none --debug-dump-force none`，不向工作负载交付调试、转储或在线更新控制器。清单、采纳分数和人工编辑均无法授予这些管理入口。
 
 每个受管 VM 显式使用 `--runtime-memtag-mode sync` 和
 `--runtime-memtag-action crash`。标签不匹配时，VM 在故障点终止。
 编译时关闭 WasmMTE 生成的模块按普通 Wasm 执行，仍执行原有的边界检查。
 
-审核对有明确依据的权限按 0 至 10 分评分。只读时钟为 0 分，有潜在硬件影响的控制项及逐摘要验签例外属于高风险。证据不足的项目显示为 `UNASSESSED`。分数描述授予权限的后果，不授予权限。审核显示重叠的显式 CPU、NUMA 放置及共用的原生驱动沙箱路径，并从与摘要绑定的 Wasm 中列出导入声明。导入名称是链接接口，可能对应宿主服务。当前清单未提供预加载 Wasm 或任意宿主目录挂载授权。
+审核对有明确依据的权限按 0 至 10 分评分。只读时钟为 0 分，有潜在硬件影响的控制项及逐摘要验签例外属于高风险。证据不足的项目显示为 `UNASSESSED`。分数描述授予权限的后果，不授予权限。审核显示重叠的显式 CPU、NUMA 放置及共用的原生驱动沙箱路径，并从与摘要绑定的 Wasm 中列出导入声明。导入名称是链接接口，可能对应宿主服务。预加载 Wasm 库需要声明依赖、固定映像及独立验签策略。清单不授予任意宿主目录挂载权限。
 
 进程内原生库预加载为 10 分，部署器拒绝 `--wasm-register-dl` 及其简写 `-Wdl`。`report/preloaddl` 仅控制已获授权的来宾能否读取 VM 的预加载构建状态。生产 VM 默认不编译原生预加载。独立进程内运行的签名 ELF 驱动按自己的规则准入。
 
@@ -110,6 +116,8 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 `--risk-report 0` 至 `--risk-report 10` 设置最低展示分数，也接受
 `--risk-report '>=7'` 的写法。`--risk-report none` 关闭这份报告。
 手动逐个审核和一键采纳均使用这一独立设置。生效权限、最终部署确认和必须显示的验签或策略诊断仍按原有规则处理。
+
+新绑定的 ROSv2 模块默认可通过 `abi` 只读查询 ABI 主版本，风险为 0/10，不附带资源或业务通道。`deny abi` 保留可链接导入，调用返回权限错误。`hide abi` 使导入在链接时被拒，XML 写作 `<interface name="abi" expose="hidden"/>`。`remove abi` 恢复默认查询权限，冷恢复保留审批中的显式决定。
 
 来宾默认可通过 `permission.report` 只读查询自己的权限，可按权限族或具体函数限制内容。
 `deny permission.report` 保留导入并拒绝调用，`hide permission.report` 隐藏导入。
@@ -155,7 +163,7 @@ wros-deployer resume /protected/bundles/cell/deployment.xml \
   --state-directory /protected/state/cell
 ```
 
-`resume` 要求批准记录匹配，不接受 `--accept-recommendations` 或新的签名例外。它重新验签，正常签名仍由 VM 二次验证；先前批准的签名例外会再次警告，上传摘要仍必须一致。它先检查并清空原先批准的 cgroup 树，再选择新工作；未知子组或嵌套子组会在发出终止操作前拒绝恢复。已有进程不会被当成新部署接管，第二个管理进程也不能取得同一状态锁。
+`resume` 要求批准记录匹配，拒绝采纳开关和新的签名例外，直接使用原审核决定。它重新验签，正常签名仍由 VM 二次验证；先前批准的签名例外会再次警告，上传摘要仍必须一致。它先检查并清空原先批准的 cgroup 树，再选择新工作；未知子组或嵌套子组会在发出终止操作前拒绝恢复。已有进程不会被当成新部署接管，第二个管理进程也不能取得同一状态锁。
 
 同一次内核启动期间，部署器崩溃和 VM 崩溃共用 `restart-limit`。只有中断或故障实例且明确设置 `restart-on-crash="true"` 才能自动重启。正常结束、人工停机或已阻断的部署不会在本次开机内自动恢复。自动冷启动至少等待所选实例中最长的重启间隔，人工停机可取消等待。再次人工审核的 `run` 可以重置次数，但保留递增的代次。
 

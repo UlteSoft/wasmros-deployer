@@ -12,7 +12,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MAX_MODULE: u64 = 256 * 1024 * 1024;
+use crate::manifest::libraries::MAX_IMAGE_BYTES as MAX_MODULE;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Check the operator-supplied roots and the binary before executing any code.
@@ -54,6 +54,15 @@ pub fn policy(root: &Path, relative: &Path, bundle: &Path) -> Result<PathBuf> {
         return Err("policy escaped its protected root".into());
     }
     protected(&file, bundle, false)
+}
+
+/// Resolve the protected CA file independently of the writable rollback store.
+pub fn policy_trust_root(policy: &Path, bundle: &Path) -> Result<PathBuf> {
+    let text = crate::manifest::xml_contents(crate::manifest::open_regular(policy, crate::manifest::MAX_XML)?)?;
+    let mut fields = text.lines().filter_map(|line| line.strip_prefix("trust_root="));
+    let path = fields.next().ok_or("missing WSEA trust root")?;
+    if fields.next().is_some() { return Err("duplicate WSEA trust root".into()); }
+    protected(Path::new(path), bundle, false)
 }
 
 /// Privileged admission and the unprivileged VM keep independent anti-rollback
@@ -225,11 +234,26 @@ pub fn admit(
     digest: &str,
     trust: &Path,
 ) -> Result<Admission> {
+    admit_image(verifier, scratch, bundle, module, digest, trust, None)
+}
+
+/// The named form additionally requires the trusted CLI's authenticated WSEA
+/// identity receipt. Exit success alone can describe a different authorized
+/// publisher/module pair when a policy contains multiple rules.
+pub fn admit_image(
+    verifier: &Path,
+    scratch: &Path,
+    bundle: &Path,
+    module: File,
+    digest: &str,
+    trust: &Path,
+    expected_id: Option<&str>,
+) -> Result<Admission> {
     let verifier = protected(verifier, bundle, false)?;
     let trust = protected(trust, bundle, false)?;
     let scratch = private_scratch(scratch, bundle)?;
     let snapshot = create_snapshot(&scratch, module, digest, "wasm")?;
-    let signature = check_signature(&verifier, &snapshot.0, &trust)?;
+    let signature = check_signature(&verifier, &snapshot.0, &trust, expected_id)?;
     let module = FrozenFile::copy(
         File::open(&snapshot.0).map_err(|e| e.to_string())?,
         MAX_MODULE,
@@ -360,29 +384,64 @@ impl NativeAdmission {
     }
 }
 
-fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path) -> Result<Signature> {
+fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path, expected_id: Option<&str>) -> Result<Signature> {
     let mut cmd = Command::new(verifier);
     cmd.args(["wasm", "secure", "verify"])
         .arg(snapshot)
         .arg("--policy")
         .arg(trust);
-    verify_with(cmd, |status, reason| {
+    verify_with_receipt(cmd, |status, reason| {
         if status.code() == Some(1) {
             Signature::rejected(reason)
         } else {
             None
         }
-    }, true)
+    }, true, expected_id)
 }
 
 fn verify_with(
-    mut cmd: Command,
+    cmd: Command,
     classify: impl Fn(ExitStatus, &[u8]) -> Option<Signature>,
     audit: bool,
 ) -> Result<Signature> {
+    verify_with_receipt(cmd, classify, audit, None)
+}
+
+// This is the canonical stdout record of cosign's wasm secure verify command
+// (Go json.Encoder over its fixed output and wasmsecure.Manifest structs).
+// Match complete fields at the known position. A changed wire format closes
+// admission; arbitrary strings elsewhere in the manifest cannot select an ID.
+fn named_receipt(record: &[u8], id: &str) -> bool {
+    if !crate::manifest::libraries::identifier(id) || !record.ends_with(b"}}\n") { return false; }
+    let Some(record) = record.strip_prefix(br#"{"status":"VERIFIED","manifest":{"embedded":true,"algorithm":""#) else { return false; };
+    let Some(end) = record.iter().position(|&c| c == b'"') else { return false; };
+    if end == 0 || !record[..end].iter().all(u8::is_ascii_alphanumeric) { return false; }
+    let Some(record) = record[end..].strip_prefix(br#"","module_id":""#) else { return false; };
+    record.strip_prefix(id.as_bytes()).is_some_and(|rest| rest.starts_with(br#"","version":"#))
+}
+
+fn read_verifier_pipe(pipe: impl Read + AsRawFd, description: &str) -> Result<Vec<u8>> {
+    // A descendant may retain a pipe after the trusted verifier has exited.
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!("could not bound {description}"));
+    }
+    let mut output = Vec::with_capacity(4097);
+    pipe.take(4097).read_to_end(&mut output).map_err(|e| e.to_string())?;
+    if output.len() > 4096 { return Err(format!("{description} exceeds limit")); }
+    Ok(output)
+}
+
+fn verify_with_receipt(
+    mut cmd: Command,
+    classify: impl Fn(ExitStatus, &[u8]) -> Option<Signature>,
+    audit: bool,
+    expected_id: Option<&str>,
+) -> Result<Signature> {
     cmd.env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if expected_id.is_some() { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped());
     if audit { println!(
         "INFO Executing verifier {:?} {:?}",
@@ -393,25 +452,19 @@ fn verify_with(
     let end = Instant::now() + VERIFY_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(Signature::Verified),
+            Ok(Some(status)) if status.success() => {
+                if let Some(id) = expected_id {
+                    let pipe = child.stdout.take().ok_or("missing named WSEA receipt")?;
+                    let receipt = read_verifier_pipe(pipe, "named WSEA receipt")?;
+                    if !named_receipt(&receipt, id) {
+                        return Err(format!("verified WSEA identity does not match declared module-id {id:?}"));
+                    }
+                }
+                return Ok(Signature::Verified);
+            }
             Ok(Some(status)) => {
-                // The trusted verifier has exited. Bound the diagnostic and refuse
-                // incomplete output if a descendant still holds the writing end.
                 let pipe = child.stderr.take().ok_or("missing verifier diagnostic")?;
-                let fd = pipe.as_raw_fd();
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if flags < 0
-                    || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-                {
-                    return Err("could not bound the verifier diagnostic".into());
-                }
-                let mut reason = Vec::with_capacity(4097);
-                pipe.take(4097)
-                    .read_to_end(&mut reason)
-                    .map_err(|e| e.to_string())?;
-                if reason.len() > 4096 {
-                    return Err("verifier diagnostic exceeds limit".into());
-                }
+                let reason = read_verifier_pipe(pipe, "verifier diagnostic")?;
                 if audit {
                     eprintln!("Verifier rejection: {:?}", String::from_utf8_lossy(&reason));
                 }

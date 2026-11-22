@@ -8,8 +8,12 @@ from pathlib import Path
 import pty
 import select
 import subprocess
+import sys
 import termios
 import time
+
+sys.dont_write_bytecode = True
+from vendor_qualification import qualification_environment
 
 
 def terminal_run(command, answers, timeout=20):
@@ -54,10 +58,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     out = args.output.resolve()
-    assert ".tmp" in out.parts
-    group = Path("/sys/fs/cgroup") / Path("/proc/self/cgroup").read_text().strip().removeprefix("0::/")
-    assert (group/"memory.max").read_text().strip() == "68719476736"
-    assert (group/"memory.swap.max").read_text().strip() == "0"
+    group = qualification_environment(out)
     os.umask(0o077)
     out.mkdir(mode=0o700)
     bundle, trust = out / "bundle", out / "trust"
@@ -120,6 +121,9 @@ def main():
     assert len(previews) == 2
     for id_, argv in zip(("a", "b"), previews, strict=True):
         assert argv[argv.index("--wasm-set-main-module-name") + 1] == id_
+        assert argv[argv.index("--debug-permissions") + 1] == "none"
+        assert argv[argv.index("--debug-dump-force") + 1] == "none"
+        assert not any(word.startswith(("--update-", "--diagnostic-control-", "--debug-jit-control-")) for word in argv)
         assert "wasip1.sock_open" not in argv
         if id_ == "a":
             assert argv[argv.index("control.submit") + 1] == "deny"
@@ -149,12 +153,21 @@ def main():
                                capture_output=True, text=True, timeout=10)
     assert duplicate.returncode != 0 and "duplicate --risk-report" in duplicate.stderr
     cases += ["invalid-thresholds-refused", "duplicate-threshold-refused"]
-    adopt = [str(args.deployer.resolve()), "review", str(manifest), "--policy-root", str(trust), "--accept-recommendations"]
+    review = [str(args.deployer.resolve()), "review", str(manifest), "--policy-root", str(trust)]
+    switch = "--accept-recommendations-through-risk"
+    ceiling = "--risk-accept-threshold"
+    for options in (["--accept-recommendations"], [switch], [ceiling, "default"],
+                    [switch, ceiling, "11"], [switch, ceiling, "-1"], [switch, ceiling, "03"],
+                    [switch, switch, ceiling, "3"], [switch, ceiling, "3", ceiling, "9"]):
+        code, view = terminal_run([*review, *options], b"")
+        assert code != 0 and "Adopted " not in view, options
+    cases.append("retired-incomplete-or-invalid-adoption-options-refused")
+    adopt = [*review, switch, ceiling, "9"]
     for label, setting, threshold in (("default", None, 5), ("explicit-seven", ">=7", 7), ("none", "none", None)):
         argv = adopt if setting is None else [*adopt, f"--risk-report={setting}"]
         code, view = terminal_run(argv, b"")
         (out/f"adopt-{label}.log").write_text(view)
-        assert code == 0 and "without per-VM edits" in view and "[recommended" not in view and " edits [" not in view
+        assert code == 0 and "at or below 9/10" in view and "[recommended" not in view and " edits [" not in view
         assert ("Risk report" in view) == (threshold is not None)
         assert ("  UNASSESSED" in view) == (threshold is not None)
         assert "Review effective decisions for VM" in view and 'allow "control.submit"' in view
@@ -166,6 +179,51 @@ def main():
             assert (": 5/10 (moderate)" in view) == (threshold == 5)
             assert ": 9/10 (high)" in view and ": 7/10 (high)" in view
         cases.append("one-click-"+label)
+    for selected in ("default", "3"):
+        for display in ("none", "10", "0"):
+            code, view = terminal_run([*review, switch, ceiling, selected, "--risk-report", display], b"deny\nconfirm\n")
+            assert code == 0 and "at or below 3/10" in view
+            assert view.count("[recommended") == 1 and '"control.submit" [recommended allow]' in view
+            assert 'Adopted deny "context.open"' in view and 'Adopted allow "wasip1.clock_time_get"' in view
+            assert ('Risk report' in view) == (display != "none")
+            runs = [json.loads(row.removeprefix("VM argv ")) for row in view.splitlines() if row.startswith("VM argv ")]
+            assert runs[0][runs[0].index("control.submit") + 1] == "deny"
+    cases.append("default-three-and-explicit-three-require-the-same-individual-decisions-at-every-display-threshold")
+    rights_path = bundle/"rights.xml"
+    original = rights_path.read_text()
+    for forbidden in ("deployer.control", "vm.debug", "vm.dump", "vm.update", "driver.direct-connect"):
+        rights_path.write_text(f'<recommendations><interface name="{forbidden}" expose="allow"/></recommendations>')
+        code, view = terminal_run([*review, switch, ceiling, "10", "--risk-report=none"], b"")
+        assert code != 0 and "invalid interface" in view and "VM argv" not in view, forbidden
+    rights_path.write_text(original)
+    for flag in ("--debug-jit-control-fd", "--diagnostic-control-fd", "--update-control-fd", "--ros-scene-driver-channel"):
+        code, view = terminal_run([*review, switch, ceiling, "10", flag, "3"], b"")
+        assert code != 0 and "VM argv" not in view, flag
+    cases.append("direct-workload-management-and-peer-endpoints-rejected-even-at-ten")
+    for namespace, name in (("uwvm_ros_v2", "vm.debug"), ("uwvm_update", "publish"),
+                            ("wros_deployer", "control"), ("wasi_snapshot_preview1", "sock_send")):
+        wat = out/"forbidden.wat"
+        image = bundle/"forbidden.wasm"
+        wat.write_text(f'(module (import "{namespace}" "{name}" (func)))')
+        subprocess.run(["/usr/bin/wat2wasm", wat, "-o", image], check=True, timeout=15)
+        digest_forbidden = hashlib.sha256(image.read_bytes()).hexdigest()
+        check = bundle/"forbidden.xml"
+        check.write_text(f'<deployment id="test"><vm id="probe" module="forbidden.wasm" sha256="{digest_forbidden}" policy="staged.policy" memory-bytes="67108864" pids="8"/></deployment>')
+        code, view = terminal_run([review[0], "review", str(check), "--policy-root", str(trust),
+                                   switch, ceiling, "10", "--risk-report=none"], b"")
+        assert code != 0 and "forbidden workload host import" in view and "VM argv" not in view
+    cases.append("forbidden-static-host-imports-refused-before-human-or-threshold-decisions")
+    for desired, command in (("hidden", "hide abi"), ("deny", "deny abi"), (None, "hide abi\nremove abi")):
+        rights_path.write_text('<recommendations><interface name="abi" expose="allow"/></recommendations>')
+        code, view = terminal_run(review, ("allow\n"+command+"\nconfirm\nconfirm\n").encode())
+        vms = [json.loads(row.removeprefix("VM argv ")) for row in view.splitlines() if row.startswith("VM argv ")]
+        assert code == 0 and vms and "default read-only ABI version" in view
+        if desired is None:
+            assert "abi" not in vms[0]
+        else:
+            assert vms[0][vms[0].index("abi")+1] == desired
+    rights_path.write_text(original)
+    cases.append("explicit-ABI-hiding-denial-and-removal-to-default")
     withheld = subprocess.run([*preview, "--risk-report=none", "--wasm-register-dl", "ignored"],
                               capture_output=True, text=True, timeout=10)
     assert withheld.returncode != 0 and "(10/10 high risk)" in withheld.stderr

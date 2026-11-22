@@ -39,9 +39,7 @@ local encrypted attachment. A cgroup does not prevent time-namespace changes.
 The VM accepts only kernel namespace evidence plus the existing exact peer
 credentials, process-lifetime pin and mutual TLS binding. The test-only
 `tests/qemu_driver_identity.py` exercises these checks under different non-root
-identities. Native driver orchestration is still refused by the production
-deployment command until its remaining lifecycle and ownership requirements
-are implemented and qualified.
+identities. Production native drivers require an explicit operator run and a preconnected read-only business attachment. Service recovery supports VM-only deployments.
 
 The XML must explicitly budget the manager:
 
@@ -77,7 +75,7 @@ Install protected runtime, verifier and deployer binaries separately from the su
   --supervisor-cgroup /sys/fs/cgroup/system.slice/wros-cell.service
 ```
 
-Review and approval require a terminal. Confirm each VM in the editor or use `--accept-recommendations` to adopt all parsed recommendations in one step. The effective decisions and independent risk report remain visible according to `--risk-report`. In either mode, type `authorize DEPLOYMENT_ID` to persist the reviewed authorization. Signature exceptions, if required, are individually bound to the VM and exact module digest. `authorize` refuses a populated service root or a concurrently owned state directory. It does not stop an existing deployment to replace its approval.
+Review and approval require a terminal. Confirm each VM in the editor or use `--accept-recommendations-through-risk --risk-accept-threshold default` to adopt scores through 3/10 and explicitly review the remaining recommendations. The effective decisions and independent risk report remain visible according to `--risk-report`. In either mode, type `authorize DEPLOYMENT_ID` to persist the reviewed authorization. Signature exceptions, if required, are individually bound to the VM and exact module digest. `authorize` refuses a populated service root or a concurrently owned state directory. It does not stop an existing deployment to replace its approval.
 
 After review, render the unit with the same paths:
 
@@ -93,7 +91,7 @@ After review, render the unit with the same paths:
 
 An administrator reviews and installs that file as `wros-cell.service`, reloads systemd and starts it. Enabling the service for boot does not grant VM startup: `start-on-boot` in the reviewed XML still controls that behavior. The unit uses complete CLI option names and no shell. Argument escaping preserves spaces, dollar signs and literal systemd percent specifiers. A modified manifest, executable, trust policy, state location or cgroup path invalidates the saved binding and requires fresh review.
 
-The initial activation is valid once in the same kernel boot. It does not consume a crash retry and it cannot survive a manager failure during activation as an unlimited retry. On a later machine boot, only the explicit boot grant permits startup. An ordinary manual service stop persists stopped intent. If termination is forced before durable storage can acknowledge the stop, persisted state may still describe an interrupted generation; the outer service manager must keep it stopped until an operator resolves that uncertainty. A boot grant intentionally permits a new cold start after a later boot, even after a previous-boot stop. No path restores actuator state or motion authority.
+The initial activation is valid once in the same kernel boot. It does not consume a crash retry and it cannot survive a manager failure during activation as an unlimited retry. On a later machine boot, only the explicit boot grant permits startup. An ordinary manual service stop persists stopped intent against the current boot, including a stop during admission before the first cold launch. If termination is forced before durable storage can acknowledge the stop, persisted state may still describe an interrupted generation; the outer service manager must keep it stopped until an operator resolves that uncertainty. A boot grant intentionally permits a new cold start after a later boot, even after a previous-boot stop. No path restores actuator state or motion authority.
 
 Do not use `--cgroup-parent` together with `--supervisor-cgroup`. The former remains available for a manually supervised external workload subtree; it does not apply a manager budget. Specifying a supervisor XML budget without the managed mode is rejected rather than silently ignored.
 

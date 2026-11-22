@@ -16,6 +16,7 @@ pub mod state;
 pub mod supervisor;
 pub mod verdict;
 pub mod verification;
+mod workload_fs;
 
 // A fork duplicates the other libtest threads' live flock descriptors until
 // its child exits. Keep tests that fork or verify final-close semantics apart.

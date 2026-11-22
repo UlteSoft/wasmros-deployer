@@ -10,6 +10,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+from vendor_qualification import qualification_environment
 
 
 def main():
@@ -18,19 +22,17 @@ def main():
         parser.add_argument('--'+option,type=Path,required=True)
     args=parser.parse_args()
     root=Path(__file__).resolve().parents[1]
-    group=Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
-    assert Path('/proc/self/cgroup').read_text().strip()=='0::/'+str(group.relative_to('/sys/fs/cgroup'))
-    assert (group/'memory.max').read_text().strip()=='68719476736'
-    assert (group/'memory.swap.max').read_text().strip()=='0'
-    args.output=args.output.resolve();assert '.tmp' in args.output.parts
+    args.output=args.output.resolve()
+    group=qualification_environment(args.output)
     args.output.mkdir(parents=True,exist_ok=False)
     (args.output/'test-data').mkdir()
     def digest(path):
         with path.open('rb') as stream:
             return hashlib.file_digest(stream,'sha256').hexdigest()
-    inputs=[*sorted((root/'src').glob('*.rs')),root/'tests/configuration.rs',
+    integration=sorted((root/'tests').glob('*.rs'))
+    inputs=[*sorted((root/'src').glob('*.rs')),*integration,
             root/'Cargo.toml',root/'Cargo.lock',root/'.cargo/config.toml',
-            root/'protocol/ros-interfaces.txt',Path(__file__).resolve()]
+            root/'protocol/ros-interfaces.txt',root/'tests/vendor_qualification.py',Path(__file__).resolve()]
     results={'complete':False,'scope':'five Linux userspace ABIs; privileged supervision requires full-kernel qualification',
              'inputs':{str(path):digest(path) for path in inputs},
              'cgroup':str(group),'events_before':(group/'memory.events').read_text(),'cases':[]}
@@ -71,7 +73,7 @@ def main():
             item=json.loads(line)
             if item.get('reason')=='compiler-artifact' and item.get('executable') and item.get('profile',{}).get('test'):
                 executables.append(Path(item['executable']))
-        assert len(executables)==3
+        assert len(executables)==2+len(integration)
         for index,exe in enumerate(executables):
             with exe.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
             run=[exe,'--test-threads=1']

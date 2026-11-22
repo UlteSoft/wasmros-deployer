@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
@@ -44,12 +45,14 @@ int main(int argc,char **argv) {
     setvbuf(stdout,NULL,_IONBF,0);
     if(argc<3 || getuid()==0 || getgid()==0 || prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)!=1) return 71;
     errno=0;int ownership=open("/run/wros-ownership",O_RDONLY|O_DIRECTORY);
-    if(ownership>=0||errno!=EACCES)return 102;
+    if(ownership>=0||errno!=ENOENT)return 102;
+    if(access("/dev/shm",F_OK)==0||errno!=ENOENT)return 107;
+    errno=0;if(socket(AF_INET,SOCK_DGRAM,0)!=-1||errno!=EPERM)return 108;
     if(prctl(PR_GET_SECCOMP,0,0,0,0)!=2)return 95;
     int device=open("/dev/null",O_RDWR|O_CLOEXEC);if(device<0)return 103;close(device);
     device=open("/dev/zero",O_RDONLY|O_CLOEXEC);if(device<0)return 104;close(device);
     errno=0;device=open("/dev/zero",O_WRONLY|O_CLOEXEC);if(device>=0||errno!=EPERM)return 105;
-    errno=0;device=open("/dev/full",O_RDONLY|O_CLOEXEC);if(device>=0||errno!=EPERM)return 106;
+    errno=0;device=open("/dev/full",O_RDONLY|O_CLOEXEC);if(device>=0||errno!=ENOENT)return 106;
     errno=0;if(unshare(0)!=-1||errno!=EPERM)return 96;
     errno=0;if(setns(-1,0)!=-1||errno!=EPERM)return 97;
     errno=0;if(syscall(SYS_clone3,NULL,0)!=-1||errno!=ENOSYS)return 98;

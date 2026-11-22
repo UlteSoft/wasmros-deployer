@@ -11,11 +11,24 @@ use std::os::unix::{
 };
 use std::path::{Component, Path, PathBuf};
 
+#[path = "manifest_bundle.rs"]
+pub mod bundle;
+#[path = "wasm_libraries.rs"]
+pub mod libraries;
+
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_XML: u64 = 256 * 1024;
 pub const MAX_PERMISSIONS: usize = 256;
 pub const SELF_REPORT: &str = "permission.report";
 pub const HIDE_SELF_REPORT: &str = "hide/permission.report";
+pub const HIDE_ABI: &str = "hide/abi";
+pub fn hidden_key(interface: &str) -> Option<&'static str> {
+    match interface {
+        "abi" => Some(HIDE_ABI),
+        SELF_REPORT => Some(HIDE_SELF_REPORT),
+        _ => None,
+    }
+}
 pub const NATIVE_PRELOAD_REFUSED: &str =
     "in-process native preload is unsupported (10/10 high risk); isolated ELF drivers use individual admission";
 
@@ -49,6 +62,8 @@ pub struct Process {
     pub digest: String,
     pub policy: PathBuf,
     pub vm_policy: Option<PathBuf>,
+    pub libraries: libraries::Libraries,
+    pub module_id: Option<String>,
     pub boot_start: bool,
     pub crash_restart: bool,
     pub recommendations: Option<PathBuf>,
@@ -195,6 +210,7 @@ pub fn known_interface(key: &str) -> bool {
 pub enum Permission<'a> {
     RosInterface(&'a str),
     HideSelfReport,
+    HideAbi,
     LegacyRosAbi { host: &'static str, interface: &'static str },
     ClockInterface(&'a str),
     ClockGrant(&'a str),
@@ -242,6 +258,7 @@ impl<'a> Permission<'a> {
     pub fn from_key(key: &'a str) -> Option<Self> {
         match key {
             HIDE_SELF_REPORT => return Some(Self::HideSelfReport),
+            HIDE_ABI => return Some(Self::HideAbi),
             "uwvm_ros1_v1.abi_version" => return Some(Self::LegacyRosAbi {
                 host: "ros1", interface: "uwvm_ros1_v1.abi_version",
             }),
@@ -304,9 +321,9 @@ pub fn reviewed_grants(rights: &BTreeMap<String, bool>) -> Result<BTreeMap<&str,
     if rights.len() > MAX_PERMISSIONS {
         return Err("permission count exceeds budget".into());
     }
-    if let Some(hidden) = rights.get(HIDE_SELF_REPORT) {
-        if !hidden || rights.contains_key(SELF_REPORT) {
-            return Err("conflicting permission.report decisions".into());
+    for (interface, key) in [(SELF_REPORT, HIDE_SELF_REPORT), ("abi", HIDE_ABI)] {
+        if rights.get(key).is_some_and(|hidden| !hidden || rights.contains_key(interface)) {
+            return Err(format!("conflicting {interface} decisions"));
         }
     }
     let mut aliases = BTreeMap::new();
@@ -328,6 +345,7 @@ pub fn reviewed_grants(rights: &BTreeMap<String, bool>) -> Result<BTreeMap<&str,
 fn id(s: &str) -> bool {
     s.len() <= 128
         && !s.is_empty()
+        && !s.starts_with('-')
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
@@ -504,6 +522,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
             "vm",
             &[
                 "id",
+                "module-id",
                 "module",
                 "sha256",
                 "policy",
@@ -526,8 +545,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
         )?;
         let name = attr(node, "id")?;
         let digest = attr(node, "sha256")?;
-        if node.children().any(|n| n.is_element())
-            || processes.len() >= 128
+        if processes.len() >= 128
             || !id(name)
             || !ids.insert(name)
             || digest.len() != 64
@@ -592,11 +610,22 @@ pub fn deployment(s: &str) -> Result<Deployment> {
             (Engine::Aot, Some("max")) => Some("max"),
             _ => return Err("unknown deployment AOT policy".into()),
         };
+        let module = path(attr(node, "module")?)?;
+        let libraries = libraries::Libraries::parse(node, name, &module)?;
+        let module_id = node.attribute("module-id");
+        if module_id.is_some_and(|id| !libraries::identifier(id))
+            || !libraries.ordered.is_empty() && (module_id.is_none()
+                || libraries.ordered.iter().any(|lib| Some(lib.module_id.as_str()) == module_id))
+        {
+            return Err("a Wasm library graph requires a distinct explicit main module-id".into());
+        }
         processes.push(Process {
             id: name.into(),
             engine,
             aot_policy,
-            module: path(attr(node, "module")?)?,
+            module,
+            libraries,
+            module_id: module_id.map(str::to_owned),
             digest: digest.into(),
             policy: path(attr(node, "policy")?)?,
             boot_start: flag(node, "start-on-boot")?,
@@ -698,8 +727,8 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
         let (key, enabled) = match decision {
             "allow" => (key, true),
             "deny" => (key, false),
-            "hidden" if key == SELF_REPORT => (HIDE_SELF_REPORT.into(), true),
-            _ => return Err("permission must be allow or deny; only permission.report also supports hidden".into()),
+            "hidden" => (hidden_key(&key).ok_or("only abi and permission.report support explicit hiding")?.into(), true),
+            _ => return Err("permission must be allow or deny; abi and permission.report also support hidden".into()),
         };
         if grants.insert(key, enabled).is_some() {
             return Err("duplicate interface".into());

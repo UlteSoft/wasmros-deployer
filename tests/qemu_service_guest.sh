@@ -27,7 +27,7 @@ command() {
     "$@" --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch \
         --runtime "$runtime" --state-directory "$state" --supervisor-cgroup "$cg"
 }
-authorize() { command authorize --accept-recommendations --allow-unsigned "$vmid=$digest" > /$caseid-review.log 2>&1 || { cat /$caseid-review.log; fail authorization; }; }
+authorize() { command authorize --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "$vmid=$digest" > /$caseid-review.log 2>&1 || { cat /$caseid-review.log; fail authorization; }; }
 install() {
     command service > /etc/systemd/system/$unit
     systemctl daemon-reload
@@ -139,6 +139,29 @@ test "$not_exited" = "$child" || fail real-vm-exited
 logs; test "$(grep -c 'generation 1 exit' /$caseid.log || true)" = 0 || fail real-vm-rejected-image
 systemctl stop "$unit"; not_running "$child"
 pass actual-vm-under-systemd
+
+# Authorize a VM reached through nested package and recommendation documents.
+configure graph body false 0 unsigned.wasm /bin/uwvm2-ros
+mkdir -p /bundle/parts
+printf '<deployment id="graph"><supervisor memory-bytes="268435456" pids="64" cpu-micros="50000" cpus="0" memory-nodes="0"/><include file="parts/cell.xml"/></deployment>\n' > "$manifest"
+printf '<deployment-fragment><include file="parts/telemetry.xml"/></deployment-fragment>\n' > /bundle/parts/cell.xml
+printf '<deployment-fragment><vm id="body" module="unsigned.wasm" sha256="%s" policy="body.policy" recommendations="parts/rights.xml" uid="%s" gid="%s" memory-bytes="134217728" pids="8"/></deployment-fragment>\n' "$digest" "$case_uid" "$case_uid" > /bundle/parts/telemetry.xml
+printf '<recommendations><include file="parts/shared-rights.xml"/></recommendations>\n' > /bundle/parts/rights.xml
+printf '<recommendations><interface name="abi" expose="deny"/></recommendations>\n' > /bundle/parts/shared-rights.xml
+authorize; install
+grep -q 'parts/shared-rights.xml' /graph-review.log || fail missing-recommendation-input
+grep -q 'parts/telemetry.xml' /graph-review.log || fail missing-deployment-input
+cp /bundle/parts/telemetry.xml /bundle/parts/original.xml
+echo '<!-- changed after review -->' >> /bundle/parts/telemetry.xml
+systemctl start "$unit" || true; wait_ended; logs
+grep -q 'no matching durable approval' /graph.log || fail changed-fragment-accepted
+test "$(grep -c 'started with PID' /graph.log || true)" = 0 || fail changed-fragment-started
+pass changed-dependency-refused-before-activation
+cp /bundle/parts/original.xml /bundle/parts/telemetry.xml
+systemctl reset-failed "$unit" || true
+systemctl start "$unit"; wait_ended; logs
+grep -q 'generation 1 exit exit status: 0' /graph.log || { cat /graph.log; fail recursive-vm-exit; }
+pass recursively-reviewed-vm-starts-under-systemd
 
 # An incompatible platform layout or reduced outer budget must fail before VM exec.
 configure layout normal false 0

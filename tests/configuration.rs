@@ -19,7 +19,11 @@ fn explicit_hiding_is_distinct_from_default_self_observation_and_call_denial() {
     assert_eq!(hidden.get(HIDE_SELF_REPORT), Some(&true));
     assert!(!hidden.contains_key(SELF_REPORT));
     assert_eq!(recommendations(&explicit("deny")).unwrap().get(SELF_REPORT), Some(&false));
-    assert!(recommendations(r#"<recommendations><interface name="abi" expose="hidden"/></recommendations>"#).is_err());
+    let hidden_abi = recommendations(r#"<recommendations><interface name="abi" expose="hidden"/></recommendations>"#).unwrap();
+    assert_eq!(hidden_abi.get("hide/abi"), Some(&true));
+    assert!(reviewed_grants(&hidden_abi).unwrap().is_empty());
+    assert!(recommendations(r#"<recommendations><interface name="abi" expose="hidden"/><interface name="abi" expose="allow"/></recommendations>"#).is_err());
+    assert!(reviewed_grants(&std::collections::BTreeMap::from([("hide/abi".into(), false)])).is_err());
     let mut conflict = hidden.clone();
     conflict.insert(SELF_REPORT.into(), true);
     assert!(reviewed_grants(&conflict).is_err());

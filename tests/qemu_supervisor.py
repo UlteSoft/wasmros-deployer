@@ -201,7 +201,7 @@ def main():
             result['timeout_seconds']=args.guest_timeout_seconds
     text=(args.output/'serial.log').read_text(errors='replace')
     result.update(exit=code,elapsed_seconds=time.monotonic()-start,cases=re.findall(r'CASE (\S+) PASS',text))
-    expected=41+int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
+    expected=42+2*int(result['signed_sdk_requested'])+2*int(result['clock_fixture_requested'])
     expected += int(result['interface_probe_requested'])
     expected += 2 * int(args.local_scheduling)
     signed_case='signed-sdk-verification-at-deployer-and-vm' in result['cases']

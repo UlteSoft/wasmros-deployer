@@ -7,7 +7,10 @@
 #include <unitree/idl/go2/LowState_.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
 
+#include <sys/socket.h>
+
 #include <bit>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <climits>
@@ -41,6 +44,55 @@ namespace
         float position;
     };
 
+#ifdef WROS_UNITREE_RECORDED_SAMPLE
+    // The independent simulator records one actual SDK sample before deployment.
+    // The admitted adapter reads that immutable fixture and only uses the TLS carrier.
+    std::optional<Snapshot> sample_go2(std::uint64_t deadline)
+    {
+        // Model a bounded sensor acquisition so the guest supervisor can inspect
+        // the running processes. This fixture tests isolation, not sensor latency.
+        auto const now = monotonic_ns();
+        if (now >= deadline || deadline - now < UINT64_C(500000000))
+            return std::nullopt;
+        std::this_thread::sleep_for(500ms);
+        // A normal UDP socket request must be denied in this managed driver.
+        const int socket = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        if (socket >= 0)
+        {
+            ::close(socket);
+            return std::nullopt;
+        }
+        if (errno != EPERM)
+            return std::nullopt;
+        std::puts("Managed driver endpoint creation denied");
+        auto* input = std::fopen("/telemetry.txt", "r");
+        if (!input)
+            return std::nullopt;
+        std::array<char, 128> text{};
+        const auto size = std::fread(text.data(), 1, text.size(), input);
+        const bool complete = !std::ferror(input) && std::feof(input);
+        std::fclose(input);
+        std::string_view remaining(text.data(), size);
+        constexpr std::string_view prefix = "Go2 LowState tick=";
+        constexpr std::string_view separator = " position=";
+        if (!complete || !remaining.starts_with(prefix) || !remaining.ends_with('\n'))
+            return std::nullopt;
+        remaining.remove_prefix(prefix.size());
+        remaining.remove_suffix(1);
+        const auto split = remaining.find(separator);
+        if (split == remaining.npos)
+            return std::nullopt;
+        const auto ticks = remaining.substr(0, split);
+        const auto angle = remaining.substr(split + separator.size());
+        Snapshot sample{};
+        const auto time = std::from_chars(ticks.begin(), ticks.end(), sample.tick);
+        const auto value = std::from_chars(angle.begin(), angle.end(), sample.position);
+        if (time.ec != std::errc{} || time.ptr != ticks.end() ||
+            value.ec != std::errc{} || value.ptr != angle.end() || !std::isfinite(sample.position))
+            return std::nullopt;
+        return sample;
+    }
+#else
     std::optional<Snapshot> sample_go2(std::uint64_t deadline)
     {
         unitree::robot::ChannelFactory::Instance()->Init(74, "lo");
@@ -67,6 +119,8 @@ namespace
         }
         return std::nullopt;
     }
+
+#endif
 
     bool allowed_read(scene::wire::bytes body)
     {

@@ -31,7 +31,7 @@ digest=$(sha256sum /bundle/loop.wasm); digest=${digest%% *}
 printf '<deployment id="boot"><vm id="one" module="loop.wasm" sha256="%s" policy="body.policy" memory-bytes="268435456" pids="16" uid="10001" gid="10001" start-on-boot="true" restart-on-crash="false" restart-delay-ms="100"/><vm id="two" module="loop.wasm" sha256="%s" policy="body.policy" memory-bytes="268435456" pids="16" uid="10002" gid="10002" start-on-boot="false" restart-on-crash="true" restart-delay-ms="100"/></deployment>\n' "$digest" "$digest" > /bundle/boot.xml
 set -- /bundle/boot.xml --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --cgroup-parent /sys/fs/cgroup/delegated --runtime /bin/uwvm2-ros --state-directory /persist/journal
 if test "$phase" = 1; then
-    /bin/review-terminal /bin/wros-deployer run "$@" --accept-recommendations --allow-unsigned "one=$digest" --allow-unsigned "two=$digest" > /run.log 2>&1 & manager=$!
+    /bin/review-terminal /bin/wros-deployer run "$@" --accept-recommendations-through-risk --risk-accept-threshold 10 --allow-unsigned "one=$digest" --allow-unsigned "two=$digest" > /run.log 2>&1 & manager=$!
     expected=2
 else
     /bin/wros-deployer resume "$@" > /run.log 2>&1 & manager=$!
