@@ -82,7 +82,7 @@ fn binding(
 }
 
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--risk-report none|0..10 for plan/review/verify/authorize/run/resume] [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if action == "status" {
@@ -140,11 +140,21 @@ fn run() -> Result<()> {
         .map_err(|e| e.to_string())?;
     let mut options = BTreeMap::new();
     let mut accept = false;
+    let mut risk_report = None;
     let mut exceptions = BTreeMap::new();
     let mut elf_exceptions = BTreeMap::new();
     while let Some(key) = args.next() {
         if manifest::native_preload_request(&key) {
             return Err(manifest::NATIVE_PRELOAD_REFUSED.into());
+        } else if action != "service" && (key == "--risk-report" || key.starts_with("--risk-report=")) {
+            if risk_report.is_some() {
+                return Err("duplicate --risk-report option".into());
+            }
+            let value = match key.strip_prefix("--risk-report=") {
+                Some(value) => value.into(),
+                None => args.next().ok_or("missing --risk-report value")?,
+            };
+            risk_report = Some(review::RiskReport::parse(&value)?);
         } else if matches!(action.as_str(), "review" | "authorize" | "run")
             && key == "--accept-recommendations"
             && !accept
@@ -209,6 +219,7 @@ fn run() -> Result<()> {
             return Err(usage.into());
         }
     }
+    let risk_report = risk_report.unwrap_or_default();
     if let Some(root) = options.get("--supervisor-cgroup") {
         let parent = service::root_path(root)?.join("workloads");
         if options.insert("--cgroup-parent".into(), parent).is_some() {
@@ -336,11 +347,11 @@ fn run() -> Result<()> {
     }
     if accept {
         eprintln!(
-            "WARNING: recommendations pre-filled for this terminal review; decisions remain editable and require explicit confirmation."
+            "WARNING: adopting parsed recommendations without per-VM edits; initial deployment still requires final confirmation."
         )
     }
     println!("deployment {:?}; manifest SHA256 {manifest_digest}", plan.id);
-    review::show_deployment(&plan);
+    review::show_deployment(&plan, risk_report);
     for (id, (digest, _)) in &elf_exceptions {
         if !plan
             .drivers
@@ -355,7 +366,7 @@ fn run() -> Result<()> {
     let mut native_launches = BTreeMap::new();
     for driver in &plan.drivers {
         if let Some((_, kind)) = elf_exceptions.get(&driver.id) {
-            review::show_signature_exception(*kind);
+            review::show_signature_exception(*kind, &driver.id, risk_report);
         }
         if executing {
             let elf = options.get("--elf-verifier").ok_or("run requires --elf-verifier for native drivers")?;
@@ -437,7 +448,7 @@ fn run() -> Result<()> {
             }
             let admission = admission?;
             let result = admission.signature;
-            review::show_imports(&vm.id, guest_imports::inspect(&admission.module.0)?);
+            review::show_imports(&vm.id, guest_imports::inspect(&admission.module.0)?, risk_report);
             if executing {
                 admitted = Some(verification::FrozenFile(supervisor::retained(
                     admission.module.0,
@@ -448,7 +459,7 @@ fn run() -> Result<()> {
                     "WARNING: operator requested {:?} signature exception for VM {:?} at SHA256 {}",
                     kind, vm.id, vm.digest
                 );
-                review::show_signature_exception(*kind);
+                review::show_signature_exception(*kind, &vm.id, risk_report);
             }
             if result == Signature::Verified {
                 println!(
@@ -466,12 +477,14 @@ fn run() -> Result<()> {
             }
         } else {
             let image = verification::snapshot_for_review(file, &vm.digest)?;
-            review::show_imports(&vm.id, guest_imports::inspect(&image.0)?);
+            review::show_imports(&vm.id, guest_imports::inspect(&image.0)?, risk_report);
         }
-        review::show_rights(if action == "resume" { "durable approval" } else { "recommendations" }, &vm.id, &rights);
+        review::show_rights(if action == "resume" { "durable approval" } else { "recommendations" }, &vm.id, &rights, risk_report);
         if interactive {
-            rights = review::approve(&vm.id, rights, accept)?;
-            review::show_rights("effective decisions", &vm.id, &rights);
+            if !accept {
+                rights = review::approve(&vm.id, rights, risk_report)?;
+            }
+            review::show_rights("effective decisions", &vm.id, &rights, risk_report);
         }
         let driver = native_launches.remove(&vm.id);
         if let Some(provider) = &driver {
@@ -537,12 +550,6 @@ fn run() -> Result<()> {
         if rights.is_empty() {
             println!("INFO VM {:?} has no reviewed interface or resource permissions.", vm.id);
         }
-        if !rights.contains_key("permission.report") {
-            // The standalone VM exposes self-reporting after scene binding.
-            // Managed deployments expose only interfaces the operator reviews.
-            argv.extend(["--ros-scene-interface".into(), vm.id.clone(),
-                         "permission.report".into(), "hidden".into()]);
-        }
         for (alias, grant) in manifest::reviewed_grants(&rights)? {
             argv.extend(["--ros-scene-grant".into(), vm.id.clone(), alias.into(), grant.kind.into(),
                          grant.target.into(), grant.binding.into(), grant.operations.join(",")]);
@@ -558,6 +565,11 @@ fn run() -> Result<()> {
             }
             let decision = if enabled { "allow" } else { "deny" };
             match permission {
+                Permission::HideSelfReport => {
+                    println!("INFO VM {:?} ROSv2 interface permission.report: hidden", vm.id);
+                    argv.extend(["--ros-scene-interface".into(), vm.id.clone(),
+                                 manifest::SELF_REPORT.into(), "hidden".into()]);
+                }
                 Permission::RosInterface(name) => {
                     println!("INFO VM {:?} ROSv2 interface {}: {}", vm.id, name, decision);
                     argv.extend([

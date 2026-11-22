@@ -79,14 +79,22 @@ def main():
         <interface name="context.open" expose="deny"/>
         </recommendations>\n""")
     manifest = bundle / "deployment.xml"
+    driver = bundle / "preview.elf"
+    driver.write_bytes(b"non-executed native risk preview")
+    driver_digest = hashlib.sha256(driver.read_bytes()).hexdigest()
     manifest.write_text(f"""<deployment id="test">
         <vm id="a" module="guest.wasm" sha256="{digest}" policy="staged.policy" recommendations="rights.xml"
             cpus="0-2" memory-bytes="67108864" pids="8"/>
         <vm id="b" module="guest.wasm" sha256="{digest}" policy="staged.policy"
             cpus="2-3" memory-bytes="67108864" pids="8"/>
+        <driver id="driver" file="preview.elf" sha256="{driver_digest}"
+            vendor-version="preview" kind="executable" hardware-id="diagnostic-fixture" elf-signer="staged.policy">
+          <attachment vm="a" alias="diagnostic" contract-sha256="{"1"*64}" sandbox="diagnostic"
+             uid="14001" gid="14001" memory-bytes="67108864" pids="8" cpu-micros="100000"/>
+        </driver>
         </deployment>\n""")
     command = [str(args.deployer.resolve()), "review", str(manifest),
-               "--policy-root", str(trust), "--accept-recommendations"]
+               "--policy-root", str(trust), "--risk-report", "0"]
     pipe = subprocess.run(command, input="confirm\n", text=True, capture_output=True, timeout=10)
     (out/"nonterminal.log").write_text(pipe.stdout + pipe.stderr)
     assert pipe.returncode != 0 and "same terminal" in pipe.stderr
@@ -101,7 +109,7 @@ def main():
     status, log = terminal_run(command, b"cancel\n")
     (out/"cancelled.log").write_text(log)
     assert status != 0 and "operator cancelled review" in log and "VM argv" not in log
-    status, log = terminal_run(command, b"deny control.submit\nallow wasip1.sock_open\nshow\nconfirm\nallow clock.read\nconfirm\n")
+    status, log = terminal_run(command, b"deny\nallow\nallow\nallow\ndeny control.submit\nallow wasip1.sock_open\nshow\nconfirm\nallow clock.read\nconfirm\n")
     (out/"review.log").write_text(log)
     assert status == 0, log
     for line in ['VM "b" and "a" use overlapping CPUs', '0/10 (informational)', '9/10 (high)',
@@ -118,11 +126,51 @@ def main():
         else:
             assert argv[argv.index("clock.read") + 1] == "allow"
             assert "control.submit" not in argv
+    preview = [str(args.deployer.resolve()), "plan", str(manifest), "--policy-root", str(trust)]
+    cases = []
+    for threshold in range(11):
+        for spelling in (str(threshold), ">="+str(threshold)):
+            run = subprocess.run([*preview, "--risk-report", spelling], capture_output=True, text=True, timeout=10)
+            assert run.returncode == 0, run.stderr
+            assert f"(threshold >={threshold}/10)" in run.stdout and "  UNASSESSED" in run.stdout
+            for score in (0, 2, 4, 5, 7, 9):
+                assert (f": {score}/10 (" in run.stdout) == (score >= threshold), (threshold, score)
+            cases.append("threshold-"+spelling)
+    default = subprocess.run(preview, capture_output=True, text=True, timeout=10)
+    assert default.returncode == 0 and "(threshold >=7/10)" in default.stdout
+    assert ": 7/10 (high)" in default.stdout and ": 9/10 (high)" in default.stdout
+    assert ": 5/10 (" not in default.stdout and "  UNASSESSED" in default.stdout
+    cases.append("default-high-with-unassessed")
+    for invalid in ("", "11", "-1", "00", "07", ">=11", ">", "NONE", "true", " 7"):
+        run = subprocess.run([*preview, f"--risk-report={invalid}"], capture_output=True, text=True, timeout=10)
+        assert run.returncode != 0 and "invalid --risk-report value" in run.stderr
+    duplicate = subprocess.run([*preview, "--risk-report", "none", "--risk-report=7"],
+                               capture_output=True, text=True, timeout=10)
+    assert duplicate.returncode != 0 and "duplicate --risk-report" in duplicate.stderr
+    cases += ["invalid-thresholds-refused", "duplicate-threshold-refused"]
+    adopt = [str(args.deployer.resolve()), "review", str(manifest), "--policy-root", str(trust), "--accept-recommendations"]
+    for setting in (None, "none"):
+        code, view = terminal_run([*adopt, *([] if setting is None else ["--risk-report=none"])], b"")
+        (out/f"adopt-{setting or 'default'}.log").write_text(view)
+        assert code == 0 and "without per-VM edits" in view and "[recommended" not in view and " edits [" not in view
+        assert ("Risk report" in view) == (setting is None)
+        assert ("  UNASSESSED" in view) == (setting is None)
+        assert "Review effective decisions for VM" in view and 'allow "control.submit"' in view
+        assert 'default read-only self observation via "permission.report"' in view
+        if setting is None:
+            assert ": 9/10 (high)" in view and ": 7/10 (high)" in view
+        else:
+            assert "/10 (" not in view
+        cases.append("one-click-"+(setting or "default"))
+    withheld = subprocess.run([*preview, "--risk-report=none", "--wasm-register-dl", "ignored"],
+                              capture_output=True, text=True, timeout=10)
+    assert withheld.returncode != 0 and "(10/10 high risk)" in withheld.stderr
+    cases.append("reject-native-even-with-summary-none")
     (out/"results.json").write_text(json.dumps({
         "cgroup": str(group), "module_sha256": digest,
         "deployer_sha256": hashlib.sha256(args.deployer.read_bytes()).hexdigest(),
         "cases": ["nonterminal-refused", "hidden-output-refused", "cancelled",
-                  "edited-and-confirmed", "cross-vm-placement", "exact-declared-imports", "unregistered-edit-refused"],
+                  "edited-and-confirmed", "cross-vm-placement", "exact-declared-imports", "unregistered-edit-refused", *cases],
         "complete": True,
     }, indent=2) + "\n")
 

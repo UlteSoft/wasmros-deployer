@@ -8,7 +8,7 @@
 每个部署的 VM 必须启用[内核设备访问控制](device-isolation.md)。该模块同时提供
 确切设备规则和原部署器归属登记；native 驱动生命周期仍需独立联动。
 
-`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。输入 `show` 可重新查看评分，输入 `cancel` 可退出。使用 `--accept-recommendations` 会预填建议并显示警告，每个 VM 仍须确认。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
+`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 或 `hide permission.report` 后 `confirm`。缺省推荐不授予权限。输入 `show` 可重新查看评分，输入 `cancel` 可退出。使用 `--accept-recommendations` 会直接采纳已读取的建议并显示警告，仍会展示生效权限和按选项生成的风险报告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
 
 ```xml
 <deployment id="cell">
@@ -96,7 +96,7 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 
 正常签名部署需要两个反回滚状态库。用官方 wasm-cosign 初始化器分别初始化特权准入的 `policy` 和 VM 用户的 `vm-policy`；两份策略的信任根、签名者、算法、版本和限制必须完全一致，只允许 `state_dir` 不同。VM 状态目录及其中初始化文件属于 VM 用户，目录权限 0700、文件权限 0600；策略文件仍归管理员持有，并允许 VM 读取。不能修改策略路径后直接复制旧的反回滚记录，因为记录绑定策略指纹。VM 自己完成第二次校验。
 
-`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。审核在终端进行。`--accept-recommendations` 预填建议，仍可逐项修改。确认每个 VM 并检查完整参数后，输入 `deploy 部署ID` 才会启动。关闭终端或未确认会停止启动。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
+`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。审核在终端进行。默认逐项修改并确认每个 VM。`--accept-recommendations` 会一步采纳全部已读取的建议。两种方式均展示生效权限和完整参数，输入 `deploy 部署ID` 才会启动。关闭终端或未确认会停止启动。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
 
 每个受管 VM 显式使用 `--runtime-memtag-mode sync` 和
 `--runtime-memtag-action crash`。标签不匹配时，VM 在故障点终止。
@@ -106,7 +106,15 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 
 进程内原生库预加载为 10 分，部署器拒绝 `--wasm-register-dl` 及其简写 `-Wdl`。`report/preloaddl` 仅控制已获授权的来宾能否读取 VM 的预加载构建状态。生产 VM 默认不编译原生预加载。独立进程内运行的签名 ELF 驱动按自己的规则准入。
 
-部署器默认隐藏 `permission.report`。操作员必须显式批准该接口，来宾才能查询自己的权限。缺少推荐文件或在审核中移除这项接口时均保持隐藏。接口开启后，还可以按权限族或函数单独限制报告内容。
+部署器默认展示分数达到 7/10 的项目，未评估项目单独列出。可用
+`--risk-report 0` 至 `--risk-report 10` 设置最低展示分数，也接受
+`--risk-report '>=7'` 的写法。`--risk-report none` 关闭这份报告。
+手动逐个审核和一键采纳均使用这一独立设置。生效权限、最终部署确认和必须显示的验签或策略诊断仍按原有规则处理。
+
+来宾默认可通过 `permission.report` 只读查询自己的权限，可按权限族或具体函数限制内容。
+`deny permission.report` 保留导入并拒绝调用，`hide permission.report` 隐藏导入。
+XML 使用 `<interface name="permission.report" expose="hidden"/>` 建议隐藏。
+移除整接口的显式决定会恢复默认只读查询。查询其他模块或 VM 的元数据仍需要各自的接口和目标授权。
 
 已弃用的 `uwvm_ros1_v1.abi_version` 和 `uwvm_ros2_v1.abi_version` 权限分别仅开放对应的版本查询，需要显式编译相应 legacy ABI 的 VM。缺少该 ABI 时，VM 拒绝启动参数。这些权限不提供网关、数据访问或其他 legacy 接口。
 

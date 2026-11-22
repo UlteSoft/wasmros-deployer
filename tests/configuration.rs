@@ -12,6 +12,21 @@ fn zero_implicit_grants() {
 }
 
 #[test]
+fn explicit_hiding_is_distinct_from_default_self_observation_and_call_denial() {
+    use wros_deployer::manifest::{reviewed_grants, HIDE_SELF_REPORT, SELF_REPORT};
+    let explicit = |decision| format!(r#"<recommendations><interface name="{SELF_REPORT}" expose="{decision}"/></recommendations>"#);
+    let hidden = recommendations(&explicit("hidden")).unwrap();
+    assert_eq!(hidden.get(HIDE_SELF_REPORT), Some(&true));
+    assert!(!hidden.contains_key(SELF_REPORT));
+    assert_eq!(recommendations(&explicit("deny")).unwrap().get(SELF_REPORT), Some(&false));
+    assert!(recommendations(r#"<recommendations><interface name="abi" expose="hidden"/></recommendations>"#).is_err());
+    let mut conflict = hidden.clone();
+    conflict.insert(SELF_REPORT.into(), true);
+    assert!(reviewed_grants(&conflict).is_err());
+    assert!(reviewed_grants(&std::collections::BTreeMap::from([(HIDE_SELF_REPORT.into(), false)])).is_err());
+}
+
+#[test]
 fn legacy_version_queries_and_native_build_status_remain_distinct() {
     use wros_deployer::manifest::{native_preload_request, recommendations, Permission};
     let rights = recommendations(r#"<recommendations>

@@ -43,7 +43,7 @@ def fixture(families, mask, policies):
 def status_fixture(interface, visible):
     query = struct.pack("<Q", 9) + b"preloaddl" + struct.pack("<QQ", 0, 0)
     escaped = "".join(f"\\{byte:02x}" for byte in query)
-    expected = 95 if interface == "allow" and visible else 13
+    expected = 95 if interface in ("allow", "default") and visible else 13
     values = (0, 0) if expected == 95 else (-1, -1)
     length_check = "i64.const 40 i64.lt_u" if expected == 95 else "i64.const -1 i64.ne"
     return f'''(module
@@ -94,8 +94,7 @@ def check_argv(argv, identity, decisions, legacy_key):
             assert not found, argv
         else:
             assert len(found) == 1 and argv[found[0]+1:found[0]+4] == [prefix, function, decision], argv
-    report = [i for i in occurrences("--ros-scene-interface") if argv[i+2] == "permission.report"]
-    assert len(report) == 1 and argv[report[0]+1:report[0]+4] == [identity, "permission.report", HIDDEN]
+    assert "permission.report" not in argv
     for switch in ("--wasip1-single-create", "--wasip1-single-enable"):
         assert bool(occurrences(switch)) == (wasi != HIDDEN)
     for mode in ("allow", "deny"):
@@ -135,7 +134,8 @@ def main():
         folder.mkdir()
     (trust/"review-preview.policy").write_text("test preview never executes a signature policy\n")
     manifest = bundle/"deployment.xml"
-    review = [deployer, "review", manifest, "--policy-root", trust, "--accept-recommendations"]
+    review = [deployer, "review", manifest, "--policy-root", trust]
+    adopt = [*review, "--accept-recommendations"]
     aggregates = Counter()
     built = {}
     outcomes = (out/"matrix.jsonl").open("w", buffering=1)
@@ -158,6 +158,7 @@ def main():
         for identity, mask, decisions in zip(("left", "right"), masks, policies, strict=True):
             wasm, signature = artifact(fixture(families, mask, decisions))
             rec = ET.Element("recommendations")
+            recommended, changes = {}, []
             for bit in (0, 1, 2):
                 if bit == 1 and not optional:
                     continue
@@ -166,10 +167,14 @@ def main():
                 # Use a deliberately different default to require visible edits.
                 default = "deny" if effective == "allow" else "allow"
                 interface_xml(rec, key, default)
+                recommended[key] = default
                 verb = "remove" if effective == HIDDEN else effective
-                answers.append(f"{verb} {key}")
+                changes.append(f"{verb} {key}")
                 if bit == 0:
-                    answers.append(f"{verb} wasip1.clock.monotonic-clock")
+                    recommended["wasip1.clock.monotonic-clock"] = default
+                    changes.append(f"{verb} wasip1.clock.monotonic-clock")
+            answers.extend(recommended[key] for key in sorted(recommended))
+            answers.extend(changes)
             if mask & 8:
                 answers.append(f"allow {NATIVE[2]}")
             if mask & 2 and not optional:
@@ -196,7 +201,7 @@ def main():
         previews = [json.loads(line.removeprefix("VM argv ")) for line in log.splitlines() if line.startswith("VM argv ")]
         assert len(previews) == 2
         assert ("enter a registered interface" in log) == bool(not optional and any(mask & 2 for mask in masks))
-        assert log.count(PRELOAD_REFUSED) == 1+sum(bool(mask & 8) for mask in masks)
+        assert log.count(PRELOAD_REFUSED) == sum(bool(mask & 8) for mask in masks)
         for index, (identity, decision, argv) in enumerate(zip(("left", "right"), policies, previews, strict=True)):
             check_argv(argv, identity, decision, legacy[2] if optional else None)
             security = argv.index("--secure")
@@ -226,10 +231,15 @@ def main():
         for identity, (interface, visible) in zip(("left", "right"), states, strict=True):
             wasm, signature = artifact(status_fixture(interface, visible))
             rec = ET.Element("recommendations")
-            interface_xml(rec, "permission.report", "deny" if interface == "allow" else "allow")
-            ET.SubElement(rec, "self-report", selector="preloaddl", access="deny" if visible else "allow")
+            report_default = "deny" if interface == "allow" else "allow"
+            visibility_default = "deny" if visible else "allow"
+            interface_xml(rec, "permission.report", report_default)
+            ET.SubElement(rec, "self-report", selector="preloaddl", access=visibility_default)
+            operation = {"default": "remove", HIDDEN: "hide"}.get(interface, interface)
             answers += [
-                f"{'remove' if interface == HIDDEN else interface} permission.report",
+                report_default,
+                visibility_default,
+                f"{operation} permission.report",
                 f"{'allow' if visible else 'deny'} report/preloaddl",
                 "confirm",
             ]
@@ -242,15 +252,18 @@ def main():
             })
         ET.ElementTree(deployment).write(manifest, encoding="utf-8")
         code, log = terminal_run(list(map(str, review)), ("\n".join(answers)+"\n").encode())
-        if code or 'read-only native preload build status' not in log:
+        if code or 'report/preloaddl' not in log:
             (out/"failure-status-review.log").write_text(log)
             raise RuntimeError("read-only native status review failed")
         previews = [json.loads(line.removeprefix("VM argv ")) for line in log.splitlines() if line.startswith("VM argv ")]
         checked = []
         for identity, (interface, visible), argv in zip(("left", "right"), states, previews, strict=True):
             assert "--wasm-register-dl" not in argv
-            offset = argv.index("--ros-scene-interface")
-            assert argv[offset+1:offset+4] == [identity, "permission.report", interface]
+            if interface == "default":
+                assert "permission.report" not in [argv[i+2] for i, token in enumerate(argv) if token == "--ros-scene-interface"]
+            else:
+                offset = argv.index("--ros-scene-interface")
+                assert argv[offset+1:offset+4] == [identity, "permission.report", interface]
             if not visible:
                 offset = argv.index("--ros-scene")
                 assert argv[offset+1:offset+5] == [identity, "permission.report", "preloaddl", "deny"]
@@ -295,7 +308,7 @@ def main():
                 pair("all-supported-policy-pairs", version, engine, (full, full), pair_of_decisions)
 
     for engine, states in product(args.engines,
-                                  product(product(("allow", "deny", HIDDEN), (True, False)), repeat=2)):
+                                  product(product(("allow", "deny", HIDDEN, "default"), (True, False)), repeat=2)):
         status_pair(engine, states)
 
     for flag in ("--wasm-register-dl", "-Wdl"):
@@ -322,7 +335,7 @@ def main():
             "memory-bytes": "134217728", "pids": "8",
         })
         ET.ElementTree(deployment).write(manifest, encoding="utf-8")
-        code, log = terminal_run(list(map(str, review)), b"confirm\n")
+        code, log = terminal_run(list(map(str, adopt)), b"")
         assert code == 0 and "requires the separately compiled" in log
         line, = [line for line in log.splitlines() if line.startswith("VM argv ")]
         argv = json.loads(line.removeprefix("VM argv "))

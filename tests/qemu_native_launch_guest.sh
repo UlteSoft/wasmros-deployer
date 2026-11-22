@@ -55,7 +55,7 @@ $b grep -F 'interactive review requires stdin, stdout and stderr on the same ter
 test ! -e "$g/workloads/wros-unitree"
 echo 'CASE rejects-noninteractive-review PASS'
 if command signed /bin/review-terminal --fixture-cancel >/run/cancelled.log 2>&1; then exit 1; fi
-$b grep -F 'operator cancelled review' /run/cancelled.log
+$b grep -F 'deployment was not confirmed' /run/cancelled.log
 test ! -e "$g/workloads/wros-unitree"
 echo 'CASE cancelled-review-does-not-start PASS'
 if run unsigned >/run/unsigned.log 2>&1; then exit 1; fi
@@ -134,12 +134,20 @@ exercise() {
     $b cat "/run/$label.log"
     $b grep -F 'Driver "unitree" passed launch signature policy' "/run/$label.log"
     $b grep -F 'Go2 LowState over TLS tick=41347 position=0.125' "/run/$label.log"
+    $b grep -F 'Review effective decisions for VM "main"' "/run/$label.log"
+    $b grep -F 'adopting parsed recommendations without per-VM edits' "/run/$label.log"
+    if test "$label" = signed; then
+        $b grep -F 'Risk report deployment configuration (threshold >=7/10)' "/run/$label.log"
+        $b grep -F 'read-only sandbox "go2": 7/10 (high)' "/run/$label.log"
+    elif test "$label" = signed-int; then
+        if $b grep -F 'Risk report' "/run/$label.log"; then exit 1; fi
+    fi
     test ! -e "$g/workloads/wros-unitree"
     echo "CASE production-$label PASS"
 }
 
 exercise signed
-exercise signed-int
+exercise signed-int --risk-report none
 exercise unsigned --allow-unsigned-elf "unitree=$($b cat /bundle/unsigned.sha)"
 exercise invalid --allow-invalid-elf-signature "unitree=$($b cat /bundle/invalid.sha)"
 elf_check=/bin/test-elf-verifier

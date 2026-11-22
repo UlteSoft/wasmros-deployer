@@ -10,7 +10,7 @@ Every deployed VM requires [kernel device access control](device-isolation.md).
 The module also supplies exact-device rules and original-owner reservations for
 trusted external provisioners. Native lifecycle integration remains separate.
 
-Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. Use `show` to see updated scores and `cancel` to leave the review. The `--accept-recommendations` option pre-fills the editor and emits a warning. Each VM still needs confirmation. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
+Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` or `hide permission.report`, then `confirm`. An absent recommendation file starts with no recommended grants. Use `show` to see updated scores and `cancel` to leave the review. The `--accept-recommendations` option adopts the recommendations directly and emits a warning. The effective decisions and configured risk report are still displayed. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
 
 ```xml
 <deployment id="cell">
@@ -105,7 +105,7 @@ Every child first joins its assigned group, creates network, IPC, UTS, mount and
 
 Normal signed runs use two rollback stores. Initialize `policy` for privileged admission and `vm-policy` for the dedicated VM user, using the official wasm-cosign policy initializer. The policies must have identical trust roots, signer rules, algorithm allowlists, versions and limits; only `state_dir` may differ. Provision the VM state directory and its initialized files with the VM's ownership, directory mode 0700 and file mode 0600. Keep both policy files administrator-owned and readable by the VM. Do not copy a rollback record after changing its policy paths: records bind the policy fingerprint. A fresh deployment needs correctly initialized stores for its actual paths. The VM performs the second verification itself.
 
-The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. The terminal editor shows the available decisions for every VM. `--accept-recommendations` pre-fills those decisions and retains the editor and confirmation. After confirming each VM and seeing the exact arguments, type `deploy DEPLOYMENT_ID` to start. A closed terminal or missing confirmation stops the launch. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
+The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. The terminal editor shows the available decisions for every VM. By default, confirm each VM after editing its permissions. `--accept-recommendations` adopts all parsed recommendations in one step. In either mode, review the effective decisions and exact arguments, then type `deploy DEPLOYMENT_ID` to start. A closed terminal or missing confirmation stops the launch. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
 
 Each managed VM starts with `--runtime-memtag-mode sync` and
 `--runtime-memtag-action crash`. A detected tag mismatch terminates the VM at
@@ -264,13 +264,22 @@ Use `allow local/guard/signal/guard.create` at the review prompt to add an opera
 
 ### Reviewing permission reports and metadata
 
-A deployed VM can report its own permissions after explicit approval of the
-`permission.report` interface. With no decision for that interface, the
-deployer hides it, including when an operator removes a recommendation. This
-preserves the empty deployment permission baseline. After allowing the
-interface, limit information with family or exact function decisions. To read
-another module's declarations or VM runtime metadata, review both the
-interface and a grant for the exact target.
+The operator's risk report displays scores of 7/10 and above by default, with
+unassessed items listed separately. Use `--risk-report 0` through
+`--risk-report 10` to display scores at or above a different threshold. The
+quoting form `--risk-report '>=7'` is also accepted. `--risk-report none`
+turns off this report. The threshold applies equally to manual review and
+`--accept-recommendations`. Effective permissions, final launch confirmation
+and required signature or policy diagnostics are still shown when applicable.
+
+A VM can read its own permission state through `permission.report` by
+default. Limit the report by family or exact function. Use
+`deny permission.report` to refuse calls while keeping the import linkable,
+or `hide permission.report` to remove the import. In XML, set
+`<interface name="permission.report" expose="hidden"/>` to recommend hiding.
+Removing a whole-interface decision restores default read-only self
+observation. Reading another module's declarations or VM runtime metadata
+requires both the corresponding interface and a grant for the exact target.
 
 ```xml
 <recommendations>

@@ -49,9 +49,14 @@ int main(int argc, char **argv) {
     for (char *i = identity; i < last; ++i) {
         if (!(isalnum((unsigned char)*i) || *i == '-' || *i == '_')) die("validate fixture ID");
     }
-    size_t count = 0;
-    for (char *vm = last; (vm = strstr(vm, "<vm ")) != NULL; ++vm) ++count;
-    if (count == 0 || count > 128) die("count fixture VMs");
+    int one_click = 0;
+    for (int i = 4; i < argc; ++i) {
+        if (strcmp(argv[i], "--accept-recommendations") == 0) one_click = 1;
+    }
+    if (!one_click) {
+        fputs("review-terminal requires the fixture's one-click recommendation option\n", stderr);
+        return 125;
+    }
     char final[160];
     int length = snprintf(final, sizeof(final), "%s %.*s\n",
                           strcmp(argv[2], "run") == 0 ? "deploy" : "authorize", (int)(last - identity), identity);
@@ -74,7 +79,6 @@ int main(int argc, char **argv) {
         if (cancel) {
             full_write(master, "cancel\n", 7);
         } else {
-            for (size_t i = 0; i < count; ++i) full_write(master, "confirm\n", 8);
             full_write(master, final, (size_t)length);
         }
         char data[4096];

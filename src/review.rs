@@ -1,5 +1,5 @@
 //! Deployment-specific assessments and the operator's final confirmation.
-use wros_deployer::manifest::{Deployment, Permission, Result};
+use wros_deployer::manifest::{Deployment, Permission, Result, HIDE_SELF_REPORT, SELF_REPORT};
 use wros_deployer::guest_imports::ImportAssessment;
 use wros_deployer::verdict::Signature;
 use std::collections::BTreeMap;
@@ -26,6 +26,55 @@ impl fmt::Display for Risk {
                 write!(f, "{score}/10 ({class}) — {reason}")
             }
             Self::Unassessed(reason) => write!(f, "UNASSESSED — {reason}"),
+        }
+    }
+}
+
+/// Operator output filter. No display mode modifies permission decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RiskReport {
+    None,
+    AtLeast(u8),
+}
+
+impl Default for RiskReport {
+    fn default() -> Self { Self::AtLeast(7) }
+}
+
+impl RiskReport {
+    pub fn parse(value: &str) -> Result<Self> {
+        if value == "none" { return Ok(Self::None); }
+        let grade = value.strip_prefix(">=").unwrap_or(value);
+        match grade.as_bytes() {
+            [n @ b'0'..=b'9'] => Ok(Self::AtLeast(n - b'0')),
+            b"10" => Ok(Self::AtLeast(10)),
+            _ => Err("invalid --risk-report value; use none or a threshold from 0 through 10, optionally prefixed with >=".into()),
+        }
+    }
+
+    fn show(self, label: &str, items: impl IntoIterator<Item = (String, Risk)>) {
+        let Self::AtLeast(minimum) = self else { return };
+        let mut unknown = Vec::new();
+        let mut shown = false;
+        println!("Risk report {label} (threshold >={minimum}/10)");
+        for (subject, risk) in items {
+            match risk {
+                Risk::Scored(score, _) if score >= minimum => {
+                    println!("  {subject}: {risk}");
+                    shown = true;
+                }
+                Risk::Unassessed(reason) => unknown.push((subject, reason)),
+                _ => {}
+            }
+        }
+        if !shown {
+            println!("  no scored items at this threshold");
+        }
+        if !unknown.is_empty() {
+            println!("  UNASSESSED");
+            for (subject, reason) in unknown {
+                println!("    {subject}: {reason}");
+            }
         }
     }
 }
@@ -91,6 +140,8 @@ fn permission_risk(name: &str) -> Risk {
             Risk::Scored(0, "read-only WASIp1 clock or resolution; interface and source grant are independent"),
         Some(Permission::LegacyRosAbi { .. }) =>
             Risk::Scored(0, "legacy ABI version only; requires an explicit legacy VM build and provides no ROS data or gateway rights"),
+        Some(Permission::HideSelfReport) =>
+            Risk::Scored(0, "hides the guest's read-only self report"),
         Some(Permission::RosInterface(operation) | Permission::LocalOperation { operation, .. }) =>
             operation_risk(operation),
         Some(Permission::Metadata { .. }) =>
@@ -138,19 +189,22 @@ pub fn require_terminal() -> Result<()> {
     }
 }
 
-pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>) {
+pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>, report: RiskReport) {
     println!("Review {phase} for VM {vm:?}");
     if rights.is_empty() {
         println!("  no explicit interface or resource decisions");
     }
-    if !rights.contains_key("permission.report") {
-        println!("  hidden \"permission.report\" by default; an explicit decision is required to expose it");
+    if !rights.contains_key(SELF_REPORT) && !rights.contains_key(HIDE_SELF_REPORT) {
+        println!("  default read-only self observation via {SELF_REPORT:?}");
     }
     for (name, enabled) in rights {
-        let risk = permission_risk(name);
-        let access = if *enabled { "allow" } else { "deny" };
-        println!("  {access} {name:?}; risk if allowed {risk}");
+        let (name, access) = decision(name, *enabled);
+        println!("  {access} {name:?}");
     }
+    report.show(&format!("VM {vm:?} {phase}"), rights.iter().map(|(key, enabled)| {
+        let (name, access) = decision(key, *enabled);
+        (format!("{access} {name:?} (risk if allowed)"), permission_risk(key))
+    }));
     let wasip1 = rights.iter().filter(|(_, enabled)| **enabled).filter_map(|(key, _)| Permission::from_key(key));
     let (mut time, mut res, mut time_grant, mut res_grant) = (false, false, false, false);
     for key in wasip1 {
@@ -167,110 +221,141 @@ pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>) {
     }
 }
 
-pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, prefill: bool) -> Result<BTreeMap<String, bool>> {
+fn decision(name: &str, enabled: bool) -> (&str, &str) {
+    if name == HIDE_SELF_REPORT {
+        (SELF_REPORT, "hidden")
+    } else {
+        (name, if enabled { "allow" } else { "deny" })
+    }
+}
+
+fn edit(rights: &mut BTreeMap<String, bool>, name: &str, action: &str) -> Result<()> {
+    let replacing_self = name == SELF_REPORT && (rights.contains_key(SELF_REPORT) || rights.contains_key(HIDE_SELF_REPORT));
+    if action != "remove" && rights.len() >= wros_deployer::manifest::MAX_PERMISSIONS
+        && !rights.contains_key(name) && !replacing_self {
+        return Err("permission count exceeds budget; remove a decision before adding another".into());
+    }
+    if name == SELF_REPORT {
+        rights.remove(HIDE_SELF_REPORT);
+        rights.remove(SELF_REPORT);
+    }
+    match action {
+        "allow" | "deny" => { rights.insert(name.into(), action == "allow"); }
+        "hide" => { rights.insert(HIDE_SELF_REPORT.into(), true); }
+        "remove" => { rights.remove(name); }
+        _ => unreachable!("validated edit"),
+    }
+    Ok(())
+}
+
+pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport) -> Result<BTreeMap<String, bool>> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    if !prefill {
-        for (name, enabled) in &mut rights {
-            loop {
-                eprint!(
-                    "VM {vm:?} {name:?} [recommended {}] allow or deny? ",
-                    if *enabled { "allow" } else { "deny" }
-                );
-                io::stderr().flush().map_err(|e| e.to_string())?;
-                let answer = read_answer(&mut input)?.ok_or("review cancelled")?;
-                match answer.trim() {
-                    "allow" => { *enabled = true; break; }
-                    "deny" => { *enabled = false; break; }
-                    "cancel" => return Err("operator cancelled review".into()),
-                    _ => {}
+    for (key, enabled) in rights.clone() {
+        let (name, recommendation) = decision(&key, enabled);
+        let choices = if name == SELF_REPORT { "allow, deny or hide" } else { "allow or deny" };
+        loop {
+            eprint!(
+                "VM {vm:?} {name:?} [recommended {recommendation}] review detail {}. {choices}? ",
+                permission_risk(&key)
+            );
+            io::stderr().flush().map_err(|e| e.to_string())?;
+            let answer = read_answer(&mut input)?.ok_or("review cancelled")?;
+            match answer.trim() {
+                action if matches!(action, "allow" | "deny") || (action == "hide" && name == SELF_REPORT) => {
+                    edit(&mut rights, name, action)?;
+                    break;
                 }
+                "cancel" => return Err("operator cancelled review".into()),
+                _ => {}
             }
         }
     }
     loop {
-        eprint!("VM {vm:?} edits [allow NAME | deny NAME | remove NAME | show | confirm | cancel]: ");
+        eprint!("VM {vm:?} edits [allow NAME | deny NAME | hide permission.report | remove NAME | show | confirm | cancel]: ");
         io::stderr().flush().map_err(|e| e.to_string())?;
         let line = read_answer(&mut input)?.ok_or("review cancelled")?;
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["cancel"] => return Err("operator cancelled review".into()),
-            ["show"] => show_rights("pending", vm, &rights),
+            ["show"] => show_rights("pending", vm, &rights, report),
             ["confirm"] => match wros_deployer::manifest::reviewed_grants(&rights) {
                 Ok(_) => return Ok(rights),
                 Err(error) => eprintln!("{error}"),
             },
             [_, name] if wros_deployer::manifest::native_preload_request(name) =>
                 eprintln!("{}", wros_deployer::manifest::NATIVE_PRELOAD_REFUSED),
-            [action, name] if Permission::from_key(name).is_some() => match *action {
-                "allow" | "deny" => {
-                    if rights.len() >= wros_deployer::manifest::MAX_PERMISSIONS && !rights.contains_key(*name) {
-                        eprintln!("permission count exceeds budget; remove a decision before adding another");
-                    } else {
-                        println!("  input {name:?}; risk if allowed {}", permission_risk(name));
-                        rights.insert(name.to_string(), *action == "allow");
-                    }
+            [action, name] if *name != HIDE_SELF_REPORT && Permission::from_key(name).is_some()
+                && (matches!(*action, "allow" | "deny" | "remove") || (*action == "hide" && *name == SELF_REPORT)) => {
+                if let Err(error) = edit(&mut rights, name, action) {
+                    eprintln!("{error}");
+                } else if matches!(*action, "allow" | "deny") {
+                    println!("  input {name:?}; review detail {}", permission_risk(name));
                 }
-                "remove" => { rights.remove(*name); }
-                _ => eprintln!("unknown action"),
-            },
+            }
             _ => eprintln!("enter a registered interface, a clock read permission or a local/, metadata/, report/ or driver/ decision, or confirm"),
         }
     }
 }
 
-pub fn show_deployment(plan: &Deployment) {
+pub fn show_deployment(plan: &Deployment, report: RiskReport) {
     println!("Deployment assessment: VM filesystem mounts, host folder access and guest sockets are unsupported by this manifest schema.");
     println!("Deployment assessment: legacy ROS is limited to the two independently reviewed ABI-version queries; production VMs omit legacy modules by default.");
-    println!("Deployment assessment: {}. The optional read-only report/preloaddl filter controls status visibility only.", wros_deployer::manifest::NATIVE_PRELOAD_REFUSED);
-    println!("Deployment assessment: cross-VM DDS topic conflicts and independent motion interlocks are UNASSESSED; this deployment format does not configure their endpoints.");
+    println!("Deployment assessment: in-process native preload is unavailable through this deployer; report/preloaddl controls read-only build-status visibility.");
+    let mut items = vec![(
+        "cross-VM DDS topic conflicts and independent motion interlocks".into(),
+        Risk::Unassessed("this deployment format does not configure their endpoints"),
+    )];
     for (i, a) in plan.processes.iter().enumerate() {
-        println!("  VM {:?} engine {:?}, AOT tuning {:?}: {}; placement and resource budgets: {}",
-            a.id, a.engine, a.aot_policy,
-            Risk::Scored(2, "engine and compiler tuning can affect startup time and compute budgets"),
-            Risk::Scored(4, "CPU, memory and task caps can delay or stop the workload; platform timing needs verification"));
-        println!("  VM {:?} automatic cold start at boot {}: {}; crash restart {}: {}",
-            a.id, a.boot_start, Risk::Scored(if a.boot_start {6} else {0}, "cold start grants no retained actuator authority"),
-            a.crash_restart, Risk::Scored(if a.crash_restart {5} else {0}, "configured cold restart can repeat initialization after a fault"));
+        items.push((format!("VM {:?} engine {:?}, AOT tuning {:?}", a.id, a.engine, a.aot_policy),
+            Risk::Scored(2, "engine and compiler tuning can affect startup time and compute budgets")));
+        items.push((format!("VM {:?} placement and resource budgets", a.id),
+            Risk::Scored(4, "CPU, memory and task caps can delay or stop the workload; platform timing needs verification")));
+        items.push((format!("VM {:?} automatic cold start at boot {}", a.id, a.boot_start),
+            Risk::Scored(if a.boot_start {6} else {0}, "cold start grants no retained actuator authority")));
+        items.push((format!("VM {:?} authorized crash restart {}", a.id, a.crash_restart),
+            Risk::Scored(if a.crash_restart {5} else {0}, "configured cold restart can repeat initialization after a fault")));
         for b in &plan.processes[..i] {
             if let (Some(a_set), Some(b_set)) = (&a.cpus, &b.cpus) {
                 if a_set.overlaps(b_set) {
-                    println!("  WARNING VM {:?} and {:?} use overlapping CPUs: {}", a.id, b.id,
-                        Risk::Scored(5, "CPU contention can delay either workload"));
+                    items.push((format!("VM {:?} and {:?} use overlapping CPUs", a.id, b.id),
+                        Risk::Scored(5, "CPU contention can delay either workload")));
                 }
             }
             if let (Some(a_set), Some(b_set)) = (&a.memory_nodes, &b.memory_nodes) {
                 if a_set.overlaps(b_set) {
-                    println!("  WARNING VM {:?} and {:?} use overlapping NUMA nodes: {}", a.id, b.id,
-                        Risk::Scored(4, "memory traffic can contend even when process memory is isolated"));
+                    items.push((format!("VM {:?} and {:?} use overlapping NUMA nodes", a.id, b.id),
+                        Risk::Scored(4, "memory traffic can contend even when process memory is isolated")));
                 }
             }
         }
     }
     for (i, driver) in plan.drivers.iter().enumerate() {
         let Some(attachment) = &driver.attachment else { continue };
-        println!("  Driver {:?} for VM {:?}, read-only sandbox {:?}: {}", driver.id, attachment.vm,
-            attachment.sandbox, Risk::Scored(7, "executes a signed native process with a separate identity, isolated network and no physical device access"));
+        items.push((format!("Driver {:?} for VM {:?}, read-only sandbox {:?}", driver.id, attachment.vm, attachment.sandbox),
+            Risk::Scored(7, "can execute a native process after admission with a separate identity, isolated network and no physical device access")));
         for other in &plan.drivers[..i] {
             if let Some(peer) = &other.attachment {
                 if attachment.sandbox.starts_with(&peer.sandbox) || peer.sandbox.starts_with(&attachment.sandbox) {
-                    println!("  WARNING driver sandboxes {:?} and {:?} overlap: {}", driver.id, other.id,
-                        Risk::Scored(5, "providers may read common files from the operator's read-only driver root"));
+                    items.push((format!("driver sandboxes {:?} and {:?} overlap", driver.id, other.id),
+                        Risk::Scored(5, "providers may read common files from the operator's read-only driver root")));
                 }
             }
         }
     }
+    report.show("deployment configuration", items);
 }
 
-pub fn show_signature_exception(kind: Signature) {
+pub fn show_signature_exception(kind: Signature, id: &str, report: RiskReport) {
     let risk = match kind {
         Signature::Unsigned => Risk::Scored(9, "missing signature; the requested exception is bound to this artifact digest"),
         Signature::Invalid => Risk::Scored(10, "invalid signature; the requested exception is bound to this artifact digest"),
         Signature::Verified => return,
     };
-    println!("  Signature exception: {risk}");
+    report.show("requested signature exception", [(format!("artifact {id:?}"), risk)]);
 }
 
-pub fn show_imports(vm: &str, result: ImportAssessment) {
+pub fn show_imports(vm: &str, result: ImportAssessment, report: RiskReport) {
+    let mut unknown = Vec::new();
     match result {
         ImportAssessment::Complete { imports } => {
             println!("  VM {vm:?} has {} declared Wasm imports.", imports.len());
@@ -283,14 +368,22 @@ pub fn show_imports(vm: &str, result: ImportAssessment) {
                         "WASIp1 host namespace; only reviewed clock declarations are supported",
                     "wasi" if name == "thread-spawn" =>
                         "WASI Threads host namespace; this manifest cannot grant thread-spawn",
-                    _ => "UNASSESSED provider or host interface; resolution requires VM admission",
+                    _ => {
+                        let reason = "provider or host interface resolution requires VM admission";
+                        unknown.push((format!("import {namespace:?} {name:?}"), Risk::Unassessed(reason)));
+                        reason
+                    }
                 };
                 println!("    imports {namespace:?} {name:?} — {status}");
             }
         }
         ImportAssessment::Unassessed { reason } => {
-            println!("  VM {vm:?} Wasm imports: {}", Risk::Unassessed(reason));
+            println!("  VM {vm:?} Wasm imports unavailable: {reason}");
+            unknown.push(("declared imports".into(), Risk::Unassessed(reason)));
         }
+    }
+    if !unknown.is_empty() {
+        report.show(&format!("VM {vm:?} imports"), unknown);
     }
     println!("  Preloaded Wasm dependencies are not specified by this manifest format. Import declarations do not resolve dependency paths.");
 }

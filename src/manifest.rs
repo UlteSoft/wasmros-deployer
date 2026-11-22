@@ -14,6 +14,8 @@ use std::path::{Component, Path, PathBuf};
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_XML: u64 = 256 * 1024;
 pub const MAX_PERMISSIONS: usize = 256;
+pub const SELF_REPORT: &str = "permission.report";
+pub const HIDE_SELF_REPORT: &str = "hide/permission.report";
 pub const NATIVE_PRELOAD_REFUSED: &str =
     "in-process native preload is unsupported (10/10 high risk); isolated ELF drivers use individual admission";
 
@@ -192,6 +194,7 @@ pub fn known_interface(key: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Permission<'a> {
     RosInterface(&'a str),
+    HideSelfReport,
     LegacyRosAbi { host: &'static str, interface: &'static str },
     ClockInterface(&'a str),
     ClockGrant(&'a str),
@@ -238,6 +241,7 @@ impl<'a> Permission<'a> {
 
     pub fn from_key(key: &'a str) -> Option<Self> {
         match key {
+            HIDE_SELF_REPORT => return Some(Self::HideSelfReport),
             "uwvm_ros1_v1.abi_version" => return Some(Self::LegacyRosAbi {
                 host: "ros1", interface: "uwvm_ros1_v1.abi_version",
             }),
@@ -299,6 +303,11 @@ pub struct ReviewedGrant<'a> {
 pub fn reviewed_grants(rights: &BTreeMap<String, bool>) -> Result<BTreeMap<&str, ReviewedGrant<'_>>> {
     if rights.len() > MAX_PERMISSIONS {
         return Err("permission count exceeds budget".into());
+    }
+    if let Some(hidden) = rights.get(HIDE_SELF_REPORT) {
+        if !hidden || rights.contains_key(SELF_REPORT) {
+            return Err("conflicting permission.report decisions".into());
+        }
     }
     let mut aliases = BTreeMap::new();
     for (key, allow) in rights {
@@ -686,10 +695,11 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
         if grants.len() >= MAX_PERMISSIONS || n.children().any(|x| x.is_element()) {
             return Err("invalid permission count or nested recommendation".into());
         }
-        let enabled = match decision {
-            "allow" => true,
-            "deny" => false,
-            _ => return Err("permission must be allow or deny".into()),
+        let (key, enabled) = match decision {
+            "allow" => (key, true),
+            "deny" => (key, false),
+            "hidden" if key == SELF_REPORT => (HIDE_SELF_REPORT.into(), true),
+            _ => return Err("permission must be allow or deny; only permission.report also supports hidden".into()),
         };
         if grants.insert(key, enabled).is_some() {
             return Err("duplicate interface".into());
