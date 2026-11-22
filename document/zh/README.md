@@ -68,6 +68,9 @@ sha256sum driver.signed.so
 
 每个 VM 当前可连接一个独立 UID、GID 和 cgroup 的提供方。单独审核 `capability.open`、`driver.connect`、`driver.submit`、`driver.result`、`driver.disconnect` 及资源权限 `driver/joints/buffer.read`。推荐权限可用 `<driver-resource alias="joints" operation="buffer.read" access="allow"/>` 表达。驱动进程通过继承描述符完成身份交付，之后用认证 TLS 处理有界的 `buffer.read`。
 
+每个 `<attachment>` 可分别设置 `request-bytes` 和 `response-bytes`，缺省方向各为 32 字节。线协议每个方向最多接受 65,536 字节载荷，另有 176 字节报头。`buffer.read` 请求有三个 64 位字段，结果以八字节长度开头，例如 4,096 字节响应预算可容纳 4,088 字节传感器数据。部署器显示双向上限。任一方向超过 32 字节时评分为 6/10，可逐 attachment 确认，也可使用成对的风险开关按 6 或更高阈值采纳。部署的最终人工确认覆盖整份清单。审批清单摘要覆盖这两个值，VM 通道配置和提供方认证引导收到相同限值。
+
+
 部署器先核对完整 ELF 摘要并密封映像，预检和启动前分别验签，随后用 `execveat` 执行同一 inode。两次验签结果须一致。签名者在启动前被撤下或发生变化时，启动会失败。原生驱动目前要求操作员显式运行，自动启动、自动重启和服务模式仍用于纯 VM 部署。
 
 ## 运行已审核的 VM

@@ -109,6 +109,11 @@ fn native_attachment_requires_distinct_identity_and_read_review() {
     assert_eq!(native.vm, "body");
     assert_eq!(native.identity, (24002, 24002));
     assert_eq!(native.request_millis, 2000);
+    assert_eq!((native.request_bytes, native.response_bytes), (32, 32));
+    let custom = xml.replace(r#"sandbox="go2""#, r#"sandbox="go2" request-bytes="24" response-bytes="4096""#);
+    let selection = deployment(&custom).unwrap();
+    let selected = selection.drivers[0].attachment.as_ref().unwrap();
+    assert_eq!((selected.request_bytes, selected.response_bytes), (24, 4096));
     for invalid in [
         xml.replace(r#"uid="24002""#, r#"uid="24001""#),
         xml.replace(r#"gid="24002""#, r#"gid="0""#),
@@ -116,6 +121,10 @@ fn native_attachment_requires_distinct_identity_and_read_review() {
         xml.replace(r#"sandbox="go2""#, r#"sandbox="../go2""#),
         xml.replace(r#"kind="executable""#, r#"kind="shared-library""#),
         xml.replace(r#"sandbox="go2""#, r#"sandbox="go2" request-millis="180001""#),
+        custom.replace("4096", "65537"),
+        custom.replace("4096", "7"),
+        custom.replace(r#"request-bytes="24""#, r#"request-bytes="0""#),
+        custom.replace(r#"memory-bytes="134217728""#, r#"memory-bytes="4096""#),
     ] {
         assert!(deployment(&invalid).is_err(), "{invalid}");
     }

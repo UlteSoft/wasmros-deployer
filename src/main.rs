@@ -542,6 +542,11 @@ fn run() -> Result<()> {
     for (vm, module, policy, mut rights, admitted, secondary_verification, libraries) in prepared {
         if interactive {
             rights = review::approve(&vm.id, rights, risk_report, accept_threshold)?;
+            for driver in &plan.drivers {
+                if let Some(a) = driver.attachment.as_ref().filter(|a| a.vm == vm.id) {
+                    review::approve_payload(&driver.id, &vm.id, a.request_bytes, a.response_bytes, accept_threshold)?;
+                }
+            }
             review::show_rights("effective decisions", &vm.id, &rights, risk_report);
         }
         let driver = native_launches.remove(&vm.id);

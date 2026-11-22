@@ -346,6 +346,23 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport,
     }
 }
 
+fn payload_risk(request: u32, response: u32) -> u8 {
+    if request > 32 || response > 32 { 6 } else { 3 }
+}
+
+pub fn approve_payload(driver: &str, vm: &str, request: u32, response: u32, threshold: Option<u8>) -> Result<()> {
+    let risk = payload_risk(request, response);
+    if request <= 32 && response <= 32 || threshold.is_some_and(|maximum| risk <= maximum) {
+        return Ok(());
+    }
+    eprint!("Approve driver {driver:?} for VM {vm:?} with {request} request bytes and {response} response bytes (risk {risk}/10) [confirm or cancel]? ");
+    io::stderr().flush().map_err(|e| e.to_string())?;
+    match read_answer(&mut io::stdin().lock())?.as_deref().map(str::trim) {
+        Some("confirm") => Ok(()),
+        _ => Err("operator did not approve the larger driver message budgets".into()),
+    }
+}
+
 pub fn show_deployment(plan: &Deployment, report: RiskReport) {
     println!("Deployment assessment: VM filesystem mounts, host folder access and guest sockets are unsupported by this manifest schema.");
     println!("Deployment assessment: workloads cannot open deployment management, debugger, dump, update or direct driver endpoints. The deployer may hand each approved VM/driver pair a connected read-only business attachment.");
@@ -383,6 +400,11 @@ pub fn show_deployment(plan: &Deployment, report: RiskReport) {
         let Some(attachment) = &driver.attachment else { continue };
         items.push((format!("Driver {:?} for VM {:?}, read-only sandbox {:?}", driver.id, attachment.vm, attachment.sandbox),
             Risk::Scored(7, "can execute a native process after admission with a separate identity, isolated network and no physical device access")));
+        println!("INFO Driver {:?} for VM {:?}, contract-bounded buffer.read payload ceilings: request {} bytes, response {} bytes, request deadline {} ms.",
+            driver.id, attachment.vm, attachment.request_bytes, attachment.response_bytes, attachment.request_millis);
+        items.push((format!("Driver {:?} request {} bytes, response {} bytes", driver.id, attachment.request_bytes, attachment.response_bytes),
+            Risk::Scored(payload_risk(attachment.request_bytes, attachment.response_bytes),
+                "a larger authenticated frame can disclose more telemetry and reserve more memory at each endpoint")));
         for other in &plan.drivers[..i] {
             if let Some(peer) = &other.attachment {
                 if attachment.sandbox.starts_with(&peer.sandbox) || peer.sandbox.starts_with(&attachment.sandbox) {

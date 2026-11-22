@@ -165,6 +165,8 @@ impl Binding {
         Ok(())
     }
 }
+pub const MAX_PAYLOAD_BYTES: u64 = 65_536;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub request_bytes: u64,
@@ -175,9 +177,9 @@ pub struct Limits {
 impl Limits {
     fn check(&self) -> Result<()> {
         if self.request_bytes == 0
-            || self.request_bytes > 65536
+            || self.request_bytes > MAX_PAYLOAD_BYTES
             || self.response_bytes == 0
-            || self.response_bytes > 65536
+            || self.response_bytes > MAX_PAYLOAD_BYTES
             || self.request_ns == 0
             || self.request_ns > i64::MAX as u64
             || self.session_until_ns <= monotonic_ns()?

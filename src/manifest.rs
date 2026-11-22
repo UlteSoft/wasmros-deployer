@@ -98,6 +98,8 @@ pub struct DriverAttachment {
     pub pids: u32,
     pub cpu_micros: u32,
     pub request_millis: u32,
+    pub request_bytes: u32,
+    pub response_bytes: u32,
 }
 #[derive(Debug)]
 pub struct Deployment {
@@ -365,7 +367,7 @@ fn path(s: &str) -> Result<PathBuf> {
 
 fn driver_attachment(node: Node) -> Result<DriverAttachment> {
     attributes(node, "attachment", &[
-        "vm", "alias", "contract-sha256", "sandbox", "uid", "gid", "memory-bytes", "pids", "cpu-micros", "request-millis",
+        "vm", "alias", "contract-sha256", "sandbox", "uid", "gid", "memory-bytes", "pids", "cpu-micros", "request-millis", "request-bytes", "response-bytes",
     ])?;
     let vm = attr(node, "vm")?;
     let alias = attr(node, "alias")?;
@@ -396,6 +398,15 @@ fn driver_attachment(node: Node) -> Result<DriverAttachment> {
     {
         return Err("driver requires a non-root identity and bounded resources".into());
     }
+    let payload = |name: &'static str, minimum: u32| -> Result<u32> {
+        let size = if node.attribute(name).is_some() { number(name)? } else { 32 };
+        if size < minimum || u64::from(size) > crate::attachment::MAX_PAYLOAD_BYTES {
+            return Err(format!("invalid attachment {name}: expected {minimum} through 65536"));
+        }
+        Ok(size)
+    };
+    let request_bytes = payload("request-bytes", 24)?;
+    let response_bytes = payload("response-bytes", 8)?;
     let digest = attr(node, "contract-sha256")?;
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return Err("invalid driver contract digest".into());
@@ -410,7 +421,7 @@ fn driver_attachment(node: Node) -> Result<DriverAttachment> {
     }
     Ok(DriverAttachment {
         vm: vm.into(), alias: alias.into(), socket_contract, sandbox: path(attr(node, "sandbox")?)?,
-        identity, memory_bytes, pids, cpu_micros, request_millis,
+        identity, memory_bytes, pids, cpu_micros, request_millis, request_bytes, response_bytes,
     })
 }
 pub fn deployment(s: &str) -> Result<Deployment> {
@@ -655,11 +666,22 @@ pub fn deployment(s: &str) -> Result<Deployment> {
     let mut uids = processes.iter().filter_map(|p| p.identity.map(|(uid, _)| uid)).collect::<BTreeSet<_>>();
     let mut gids = processes.iter().filter_map(|p| p.identity.map(|(_, gid)| gid)).collect::<BTreeSet<_>>();
     for attachment in drivers.iter().filter_map(|driver| driver.attachment.as_ref()) {
-        if !processes.iter().any(|p| p.id == attachment.vm)
-            || !attached_vms.insert(&attachment.vm)
+        let vm = processes.iter().find(|p| p.id == attachment.vm)
+            .ok_or("driver attachment requires an existing dedicated VM")?;
+        if !attached_vms.insert(&attachment.vm)
             || !uids.insert(attachment.identity.0) || !gids.insert(attachment.identity.1)
         {
             return Err("driver attachment requires an existing dedicated VM and distinct host identities".into());
+        }
+        // Minimum storage already charged by the VM driver session and TLS.
+        // The VM enforces the exact entry size for its ABI when binding the channel.
+        let req = u64::from(attachment.request_bytes);
+        let res = u64::from(attachment.response_bytes);
+        let frame = 176 + req.max(res);
+        let tls = 262144 + 3 * (frame + 2048).max(8192) + frame + 4;
+        let vm_buffers = tls + 176 + req + 2 * res + 16;
+        if vm_buffers > 1_048_576 || vm.memory_bytes < vm_buffers || attachment.memory_bytes < tls + frame {
+            return Err("attachment message buffers exceed the VM, provider or transport memory budget".into());
         }
     }
     Ok(Deployment {

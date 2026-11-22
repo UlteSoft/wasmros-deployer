@@ -95,7 +95,7 @@ pub(crate) fn start(launch: &Launch, enrollment: File) -> Result<((Child, File),
         attachment::identifier()?, config.socket_contract,
     )?;
     let limits = Limits {
-        request_bytes: 32, response_bytes: 32, request_ns: u64::from(config.request_millis) * 1_000_000,
+        request_bytes: config.request_bytes.into(), response_bytes: config.response_bytes.into(), request_ns: u64::from(config.request_millis) * 1_000_000,
         session_until_ns: attachment::monotonic_ns()?.checked_add(3_600_000_000_000)
             .ok_or("attachment deadline overflow")?,
     };
