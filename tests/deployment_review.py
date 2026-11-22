@@ -66,13 +66,16 @@ def main():
     trust.mkdir()
     (trust/"staged.policy").write_text("preview only\n")
     (out/"guest.wat").write_text("""(module
-        (import "wasi_snapshot_preview1" "clock_time_get" (func))
-        (import "uwvm_ros_v2" "abi" (func))
-        (import "peer" "provide" (func))
+        (import "wasi_snapshot_preview1" "clock_time_get" (func (param i32 i64 i32) (result i32)))
+        (import "uwvm_ros_v2" "abi" (func (result i32)))
         (func (export "_start")))\n""")
     guest = bundle / "guest.wasm"
     subprocess.run(["/usr/bin/wat2wasm", out/"guest.wat", "-o", guest], check=True, timeout=20)
     digest = hashlib.sha256(guest.read_bytes()).hexdigest()
+    standalone = bundle/"standalone.wasm"
+    (out/"standalone.wat").write_text('(module (func (export "_start")))\n')
+    subprocess.run(["/usr/bin/wat2wasm", out/"standalone.wat", "-o", standalone], check=True, timeout=20)
+    standalone_hash = hashlib.sha256(standalone.read_bytes()).hexdigest()
     (bundle/"rights.xml").write_text("""<recommendations>
         <interface name="control.submit" expose="allow"/>
         <interface name="wasip1.clock_time_get" expose="allow"/>
@@ -86,7 +89,7 @@ def main():
     manifest.write_text(f"""<deployment id="test">
         <vm id="a" module="guest.wasm" sha256="{digest}" policy="staged.policy" recommendations="rights.xml"
             cpus="0-2" memory-bytes="67108864" pids="8"/>
-        <vm id="b" module="guest.wasm" sha256="{digest}" policy="staged.policy"
+        <vm id="b" module="standalone.wasm" sha256="{standalone_hash}" policy="staged.policy"
             cpus="2-3" memory-bytes="67108864" pids="8"/>
         <driver id="driver" file="preview.elf" sha256="{driver_digest}"
             vendor-version="preview" kind="executable" hardware-id="diagnostic-fixture" elf-signer="staged.policy">
@@ -114,7 +117,7 @@ def main():
     (out/"review.log").write_text(log)
     assert status == 0, log
     for line in ['VM "b" and "a" use overlapping CPUs', '0/10 (informational)', '9/10 (high)',
-                 'UNASSESSED', 'enter a registered interface', 'imports "peer" "provide"',
+                 'UNASSESSED', 'enter a registered interface', 'imports "uwvm_ros_v2" "abi"',
                  'review effective decisions for VM "b"']:
         assert line.casefold() in log.casefold(), line
     previews = [json.loads(line.removeprefix("VM argv ")) for line in log.splitlines() if line.startswith("VM argv ")]
@@ -189,6 +192,20 @@ def main():
             runs = [json.loads(row.removeprefix("VM argv ")) for row in view.splitlines() if row.startswith("VM argv ")]
             assert runs[0][runs[0].index("control.submit") + 1] == "deny"
     cases.append("default-three-and-explicit-three-require-the-same-individual-decisions-at-every-display-threshold")
+    for recommendations in [None, "empty.xml"]:
+        (bundle/"empty.xml").write_text("<recommendations/>")
+        extra = "" if recommendations is None else ' recommendations="empty.xml"'
+        candidate = bundle/"manual-interface.xml"
+        candidate.write_text(f'<deployment id="manual"><vm id="reader" module="guest.wasm" sha256="{digest}" policy="staged.policy" memory-bytes="67108864" pids="8"{extra}/></deployment>')
+        args1 = [review[0], "review", str(candidate), "--policy-root", str(trust), switch, ceiling, "10", "--risk-report=none"]
+        code, view = terminal_run(args1, b"confirm\ncancel\n")
+        assert code != 0 and "no recommended decisions" in view and "VM argv " not in view
+        assert 'allow wasip1.clock_time_get' in view and 'pending edits' in view
+        code, view = terminal_run(args1, b"deny wasip1.clock_time_get\nconfirm\n")
+        assert code == 0 and "calls are explicitly denied" in view
+        argv, = [json.loads(line.removeprefix("VM argv ")) for line in view.splitlines() if line.startswith("VM argv ")]
+        assert "--wasip1-single-grant" not in argv and argv[argv.index("clock_time_get")+1] == "deny"
+    cases.append("missing-and-empty-recommendations-require-explicit-binding-with-automatic-adoption")
     rights_path = bundle/"rights.xml"
     original = rights_path.read_text()
     for forbidden in ("deployer.control", "vm.debug", "vm.dump", "vm.update", "driver.direct-connect"):
@@ -215,7 +232,12 @@ def main():
     cases.append("forbidden-static-host-imports-refused-before-human-or-threshold-decisions")
     for desired, command in (("hidden", "hide abi"), ("deny", "deny abi"), (None, "hide abi\nremove abi")):
         rights_path.write_text('<recommendations><interface name="abi" expose="allow"/></recommendations>')
-        code, view = terminal_run(review, ("allow\n"+command+"\nconfirm\nconfirm\n").encode())
+        answers = "allow\n" + command + "\ndeny wasip1.clock_time_get\nconfirm\n"
+        if desired == "hidden":
+            code, view = terminal_run(review, (answers + "cancel\n").encode())
+            assert code != 0 and 'STARTUP BLOCKED for VM "a"' in view and "VM argv " not in view
+            continue
+        code, view = terminal_run(review, (answers+"confirm\n").encode())
         vms = [json.loads(row.removeprefix("VM argv ")) for row in view.splitlines() if row.startswith("VM argv ")]
         assert code == 0 and vms and "default read-only ABI version" in view
         if desired is None:

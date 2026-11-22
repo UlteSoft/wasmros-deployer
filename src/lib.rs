@@ -5,10 +5,12 @@ pub mod containment;
 pub mod devices;
 pub mod driver;
 pub mod guest_imports;
+pub mod import_permissions;
 pub mod manifest;
 pub mod ownership;
 pub mod placement;
 pub mod recovery;
+pub mod runtime_features;
 #[cfg(feature = "recovery-preflight")]
 pub mod recovery_module;
 pub mod service;

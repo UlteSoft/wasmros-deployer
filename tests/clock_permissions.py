@@ -136,7 +136,11 @@ def main():
             ET.ElementTree(plan).write(manifest)
             label = f"{engine}-{bits}"
             base = [manifest, "--policy-root", policies, "--cosign", a.cosign, "--scratch-directory", scratch]
-            stdout, _ = run(label + "-verify", [a.deployer, "verify", *base])
+            stdout, problems = run(label + "-verify", [a.deployer, "verify", *base], expected=False)
+            for mode in ("hidden", "unknown"):
+                if f'STARTUP BLOCKED for VM "{mode}{bits}"' not in problems:
+                    raise ValueError(f"deployer did not reject {mode} before launch")
+            # Use the dry-run vectors below to exercise the real VM's independent gate.
             previews = [json.loads(line[len("VM argv "):]) for line in stdout.splitlines() if line.startswith("VM argv ")]
             if len(previews) != len(expected):
                 raise ValueError("missing per-VM launch plan")
@@ -176,7 +180,7 @@ def main():
     command = list(map(str, (a.deployer, "review", manifest, "--policy-root", policies)))
     code, log = terminal_run(command, b"allow wasip1.clock_time_get\nallow wasip1.clock.monotonic-clock\n"
                              b"allow wasip1.clock.realtime-clock\ndeny wasip1.clock.realtime-clock\n"
-                             b"remove wasip1.clock.realtime-clock\nallow wasip1.sock_open\nconfirm\n")
+                             b"remove wasip1.clock.realtime-clock\nallow wasip1.sock_open\ndeny wasip1.clock_res_get\nconfirm\n")
     (out / "manual.log").write_text(log)
     commands.append({"label": "manual", "argv": command, "exit": code})
     if code or "registered interface" not in log:
@@ -186,6 +190,7 @@ def main():
     start = argv.index("--wasip1-single-create")
     expected = ["--wasip1-single-create", "manual", "--wasip1-single-enable", "manual",
                 "--wasip1-single-grant", "manual", "monotonic-clock",
+                "--wasip1-single-interface", "manual", "clock_res_get", "deny",
                 "--wasip1-single-interface", "manual", "clock_time_get", "allow"]
     if argv[start:argv.index("--secure")] != expected:
         raise ValueError("manual approval modified unexpected permissions")

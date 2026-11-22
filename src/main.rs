@@ -93,7 +93,7 @@ fn binding(
 }
 
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--risk-report none|0..10 for plan/review/verify/authorize/run/resume] [--accept-recommendations-through-risk --risk-accept-threshold default|0..10 for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ITEM=SHA256 | --allow-invalid-signature ITEM=SHA256 for verify/authorize/run; ITEM is VM or VM/LIBRARY_NAMESPACE] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--risk-report none|0..10 for plan/review/verify/authorize/run/resume] [--accept-recommendations-through-risk --risk-accept-threshold default|0..10 for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ITEM=SHA256 | --allow-invalid-signature ITEM=SHA256 for verify/authorize/run; ITEM is VM or VM/LIBRARY_NAMESPACE] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE optionally for plan/review/verify build checks] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if action == "status" {
@@ -220,7 +220,7 @@ fn run() -> Result<()> {
             {
                 return Err("duplicate signature exception for one ELF driver".into());
             }
-        } else if key == "--policy-root"
+        } else if key == "--policy-root" || key == "--runtime"
             || matches!(action.as_str(), "verify" | "run") && key == "--elf-verifier"
             || action == "run" && key == "--driver-root"
             || matches!(
@@ -230,7 +230,7 @@ fn run() -> Result<()> {
             || matches!(action.as_str(), "authorize" | "service" | "run" | "resume")
                 && matches!(
                     key.as_str(),
-                    "--runtime" | "--cgroup-parent" | "--supervisor-cgroup" | "--state-directory"
+                    "--cgroup-parent" | "--supervisor-cgroup" | "--state-directory"
                 )
         {
             let value = args.next().ok_or(usage)?;
@@ -446,6 +446,9 @@ fn run() -> Result<()> {
         println!("INFO Local driver {:?}, vendor version {:?}, format {:?}, file {:?}, SHA256 {}, exclusive device {:?}, encrypted local attachment required.",
                  driver.id,driver.vendor_version,driver.kind,driver.file,driver.digest,driver.hardware_id);
     }
+    let mut runtime_check = wros_deployer::runtime_features::Check {
+        runtime: options.get("--runtime").map(|p| p.as_path()), bundle: root, features: None,
+    };
     let mut prepared = Vec::with_capacity(plan.processes.len());
     for vm in &plan.processes {
         let module = root.join(&vm.module);
@@ -489,8 +492,6 @@ fn run() -> Result<()> {
             }
             let admission = admission?;
             let result = admission.signature;
-            let imports = guest_imports::require_complete(guest_imports::inspect(&admission.module.0)?)?;
-            review::show_imports(&vm.id, imports, &vm.libraries.requires, risk_report);
             main_image = admission.module;
             if let Some((_, kind)) = exceptions.get(&vm.id) {
                 eprintln!(
@@ -515,10 +516,10 @@ fn run() -> Result<()> {
             }
         } else {
             main_image = verification::snapshot_for_review(file, &vm.digest)?;
-            let imports = guest_imports::inspect(&main_image.0)?;
-            let imports = if interactive { guest_imports::require_complete(imports)? } else { imports };
-            review::show_imports(&vm.id, imports, &vm.libraries.requires, risk_report);
         }
+        let imports = guest_imports::inspect(&main_image.0).map_err(|e| format!("VM {:?}: {e}", vm.id))?;
+        let imports = if interactive || verifier.is_some() { guest_imports::require_complete(imports)? } else { imports };
+        review::show_imports(&vm.id, &imports, &vm.libraries.requires, risk_report);
         let libraries = wasm_library_admission::prepare(vm, &main_image.0, &bundle, root, policies, verifier, executing,
             &exceptions, risk_report)?;
         if executing { admitted = Some(verification::FrozenFile(supervisor::retained(main_image.0)?)); }
@@ -537,18 +538,33 @@ fn run() -> Result<()> {
             policy
         };
         review::show_rights(if action == "resume" { "durable approval" } else { "recommendations" }, &vm.id, &rights, risk_report);
-        prepared.push((vm, module, policy, rights, admitted, secondary_verification, libraries));
+        let assessment = runtime_check.assess(&imports, &vm.libraries.requires, &rights)?;
+        if rights.is_empty() && action != "resume" {
+            println!("INFO VM {:?} has no recommended decisions (recommendations file {:?}). Bound abi and permission.report need no manual exposure. For each hidden interface use its exact edit command.", vm.id, vm.recommendations);
+            if assessment.blocked.is_empty() { println!("INFO VM {:?} needs no manual interface edits to link the declared imports.", vm.id); }
+        }
+        if action != "resume" { assessment.show(&vm.id, "recommendations"); }
+        if interactive && assessment.immutable_blocker { assessment.ensure_linkable(&vm.id)?; }
+        prepared.push((vm, module, policy, rights, imports, admitted, secondary_verification, libraries));
     }
     // No prompt may adopt an earlier VM before admission of its dependencies.
-    for (vm, module, policy, mut rights, admitted, secondary_verification, libraries) in prepared {
+    let mut blocked_previews = Vec::new();
+    for (vm, module, policy, mut rights, imports, admitted, secondary_verification, libraries) in prepared {
         if interactive {
-            rights = review::approve(&vm.id, rights, risk_report, accept_threshold)?;
+            rights = review::approve(&vm.id, rights, risk_report, accept_threshold,
+                |pending| runtime_check.assess(&imports, &vm.libraries.requires, pending))?;
             for driver in &plan.drivers {
                 if let Some(a) = driver.attachment.as_ref().filter(|a| a.vm == vm.id) {
                     review::approve_payload(&driver.id, &vm.id, a.request_bytes, a.response_bytes, accept_threshold)?;
                 }
             }
             review::show_rights("effective decisions", &vm.id, &rights, risk_report);
+        }
+        let effective = runtime_check.assess(&imports, &vm.libraries.requires, &rights)?;
+        if interactive || action == "resume" { effective.show(&vm.id, "effective decisions"); }
+        if let Err(problem) = effective.ensure_linkable(&vm.id) {
+            if executing || authorizing || interactive { return Err(problem); }
+            blocked_previews.push(problem);
         }
         let drivers = native_launches.remove(&vm.id).unwrap_or_default();
         for provider in &drivers {
@@ -712,6 +728,7 @@ fn run() -> Result<()> {
             });
         }
     }
+    if !blocked_previews.is_empty() { return Err(blocked_previews.join("\n")); }
     if let Some((runtime, parent)) = execution {
         if interactive {
             review::confirm_deployment(&action, &plan.id, &manifest_digest)?;

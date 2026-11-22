@@ -31,7 +31,7 @@ pub fn identifier(value: &str) -> bool {
         && value.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
 }
 
-fn host_namespace(name: &str) -> bool {
+pub(crate) fn host_namespace(name: &str) -> bool {
     name == "wasi" || name.starts_with("wasi_") || name.starts_with("wasi:")
         || name.starts_with("uwvm_") || name.starts_with("uwvm:")
         || matches!(name, "wros_deployer" | "wros.deployer") || name.starts_with("wros:")
@@ -156,13 +156,13 @@ pub fn link(main: &File, graph: &Libraries, libraries: &[crate::verification::Fr
                 }
                 continue;
             }
-            let offered = providers.get(namespace).and_then(|exports| exports.get(field));
-            let requested = scalar_fn(entity);
-            if !fields.insert((namespace, field)) || !requires.contains(namespace)
-                || requested.is_none() || requested != offered
-            {
-                return Err(format!("unapproved or incompatible Wasm function import {namespace:?}.{field:?}"));
-            }
+            let problem = |reason: &str| format!("unapproved or incompatible Wasm function import {namespace:?}.{field:?}: {reason}");
+            if !fields.insert((namespace, field)) { return Err(problem("duplicate function import in the scalar library graph")); }
+            if !requires.contains(namespace) { return Err(problem("calling module is missing its direct requires edge")); }
+            let exports = providers.get(namespace).ok_or_else(|| problem("no submitted provider for this namespace"))?;
+            let requested = scalar_fn(entity).ok_or_else(|| problem("requested import is outside the scalar function ABI"))?;
+            let offered = exports.get(field).ok_or_else(|| problem("provider has no scalar function export with this name"))?;
+            if requested != offered { return Err(problem("provider export has a different function signature")); }
             seen.insert(namespace.to_owned());
         }
         if &seen != requires { return Err("Wasm dependency declarations differ from actual static imports".into()); }

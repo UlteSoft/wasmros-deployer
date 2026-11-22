@@ -65,7 +65,7 @@ pub fn prepare(
         println!("INFO Wasm library {item:?}, signed identity {:?}, SHA256 {}, dependencies {:?}, effective host permissions: none; only declared scalar function links.",
                  lib.module_id, lib.digest, lib.requires);
     }
-    libraries::link(main, &vm.libraries, &prepared.images)?;
+    libraries::link(main, &vm.libraries, &prepared.images).map_err(|e| format!("STARTUP BLOCKED for VM {:?}: {e}", vm.id))?;
     println!("INFO VM {:?} Wasm library closure validated against all actual import namespaces, fields and function signatures.", vm.id);
     if !executing { prepared.images.clear(); }
     Ok(prepared)

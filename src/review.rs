@@ -286,7 +286,9 @@ fn edit(rights: &mut BTreeMap<String, bool>, name: &str, action: &str) -> Result
     Ok(())
 }
 
-pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport, threshold: Option<u8>) -> Result<BTreeMap<String, bool>> {
+pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport, threshold: Option<u8>,
+    mut assess: impl FnMut(&BTreeMap<String, bool>) -> Result<wros_deployer::import_permissions::Assessment>,
+) -> Result<BTreeMap<String, bool>> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut manual = threshold.is_none();
@@ -316,7 +318,7 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport,
             }
         }
     }
-    if !manual {
+    if !manual && assess(&rights)?.blocked.is_empty() {
         wros_deployer::manifest::reviewed_grants(&rights)?;
         return Ok(rights);
     }
@@ -326,11 +328,18 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, report: RiskReport,
         let line = read_answer(&mut input)?.ok_or("review cancelled")?;
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["cancel"] => return Err("operator cancelled review".into()),
-            ["show"] => show_rights("pending", vm, &rights, report),
-            ["confirm"] => match wros_deployer::manifest::reviewed_grants(&rights) {
-                Ok(_) => return Ok(rights),
-                Err(error) => eprintln!("{error}"),
-            },
+            ["show"] => {
+                show_rights("pending", vm, &rights, report);
+                assess(&rights)?.show(vm, "pending edits");
+            }
+            ["confirm"] => {
+                let pending = assess(&rights)?;
+                if !pending.blocked.is_empty() { pending.show(vm, "pending edits"); continue; }
+                match wros_deployer::manifest::reviewed_grants(&rights) {
+                    Ok(_) => return Ok(rights),
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
             [_, name] if wros_deployer::manifest::native_preload_request(name) =>
                 eprintln!("{}", wros_deployer::manifest::NATIVE_PRELOAD_REFUSED),
             [action, name] if !name.starts_with("hide/") && Permission::from_key(name).is_some()
@@ -431,7 +440,7 @@ pub fn show_signature_exception(kind: Signature, id: &str, report: RiskReport) {
     report.show("requested signature exception", [(format!("artifact {id:?}"), risk)]);
 }
 
-pub fn show_imports(vm: &str, result: ImportAssessment, requires: &std::collections::BTreeSet<String>, report: RiskReport) {
+pub fn show_imports(vm: &str, result: &ImportAssessment, requires: &std::collections::BTreeSet<String>, report: RiskReport) {
     let mut unknown = Vec::new();
     match result {
         ImportAssessment::Complete { imports } => {
@@ -442,12 +451,12 @@ pub fn show_imports(vm: &str, result: ImportAssessment, requires: &std::collecti
                     "uwvm_ros_v2" => "ROSv2 host namespace; individual interface and resource decisions apply",
                     "uwvm_ros1_v1" | "uwvm_ros2_v1" if name == "abi_version" =>
                         "deprecated legacy ABI-version query; both an exact permission and a legacy-enabled VM build are required",
-                    "wasi_snapshot_preview1" | "wasi_unstable" =>
-                        "WASIp1 host namespace; only reviewed clock declarations are supported",
+                    "wasi_snapshot_preview1" => "WASIp1 host namespace; only reviewed clock declarations are supported",
+                    "wasi_unstable" => "no provider for this namespace in the managed profile",
                     "wasi" if name == "thread-spawn" =>
                         "WASI Threads host namespace; this manifest cannot grant thread-spawn",
                     _ => {
-                        let reason = "provider or host interface resolution requires VM admission";
+                        let reason = "the managed launch needs a matching provider declaration";
                         unknown.push((format!("import {namespace:?} {name:?}"), Risk::Unassessed(reason)));
                         reason
                     }

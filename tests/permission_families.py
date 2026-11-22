@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import shutil
 import struct
 import subprocess
 import sys
@@ -149,6 +150,12 @@ def main():
             built[key] = (wasm, digest(wasm))
         return built[key]
 
+    def rejected_preview():
+        plan = subprocess.run([deployer, "plan", manifest, "--policy-root", trust, "--risk-report", "none"],
+                              capture_output=True, text=True, timeout=30)
+        assert plan.returncode != 0 and "STARTUP BLOCKED" in plan.stderr, plan.stderr
+        return plan.stdout
+
     def pair(test, version, engine, masks, policies):
         legacy = (f"uwvm_{version}_v1", "abi_version", f"uwvm_{version}_v1.abi_version")
         optional = version in args.legacy_abi
@@ -193,15 +200,28 @@ def main():
                 expected_class.append("hidden")
             else:
                 expected_class.append("success")
+            if expected_class[-1] != "success":
+                answers.append("cancel")  # Attempt an invalid final confirmation before leaving the editor.
         ET.ElementTree(deployment).write(manifest, encoding="utf-8")
         result, log = terminal_run(list(map(str, review)), ("\n".join(answers)+"\n").encode(), timeout=25)
-        if result:
+        blocked = any(value != "success" for value in expected_class)
+        if (result != 0) != blocked or blocked and "STARTUP BLOCKED" not in log:
             (out/"failure-review.log").write_text(log)
-            raise RuntimeError("terminal review failed")
-        previews = [json.loads(line.removeprefix("VM argv ")) for line in log.splitlines() if line.startswith("VM argv ")]
+            raise RuntimeError("unexpected deployment review result")
+        preview = log
+        if blocked:
+            # Materialize the attempted final edits for an independent, nonexecuting
+            # preview. This gives the direct VM the exact policy refused by review.
+            for identity, decisions in zip(("left", "right"), policies, strict=True):
+                candidate = ET.Element("recommendations")
+                for bit, (_, _, key) in enumerate(families[:3]):
+                    if bit == 1 and not optional: continue
+                    if decisions[bit] != HIDDEN or key == "abi":
+                        interface_xml(candidate, key, decisions[bit])
+                ET.ElementTree(candidate).write(bundle/f"{identity}.xml", encoding="utf-8")
+            preview = rejected_preview()
+        previews = [json.loads(line.removeprefix("VM argv ")) for line in preview.splitlines() if line.startswith("VM argv ")]
         assert len(previews) == 2
-        assert ("enter a registered interface" in log) == bool(not optional and any(mask & 2 for mask in masks))
-        assert log.count(PRELOAD_REFUSED) == sum(bool(mask & 8) for mask in masks)
         for index, (identity, decision, argv) in enumerate(zip(("left", "right"), policies, previews, strict=True)):
             check_argv(argv, identity, decision, legacy[2] if optional else None)
             security = argv.index("--secure")
@@ -243,6 +263,7 @@ def main():
                 f"{'allow' if visible else 'deny'} report/preloaddl",
                 "confirm",
             ]
+            if interface == HIDDEN: answers.append("cancel")
             rights = f"{identity}-report.xml"
             ET.ElementTree(rec).write(bundle/rights, encoding="utf-8")
             ET.SubElement(deployment, "vm", {
@@ -252,10 +273,19 @@ def main():
             })
         ET.ElementTree(deployment).write(manifest, encoding="utf-8")
         code, log = terminal_run(list(map(str, review)), ("\n".join(answers)+"\n").encode())
-        if code or 'report/preloaddl' not in log:
+        blocked = any(interface == HIDDEN for interface, _ in states)
+        if (code != 0) != blocked or 'report/preloaddl' not in log or blocked and "STARTUP BLOCKED" not in log:
             (out/"failure-status-review.log").write_text(log)
             raise RuntimeError("read-only native status review failed")
-        previews = [json.loads(line.removeprefix("VM argv ")) for line in log.splitlines() if line.startswith("VM argv ")]
+        preview = log
+        if blocked:
+            for identity, (interface, visible) in zip(("left", "right"), states, strict=True):
+                candidate = ET.Element("recommendations")
+                if interface != "default": interface_xml(candidate, "permission.report", interface)
+                ET.SubElement(candidate, "self-report", selector="preloaddl", access="allow" if visible else "deny")
+                ET.ElementTree(candidate).write(bundle/f"{identity}-report.xml", encoding="utf-8")
+            preview = rejected_preview()
+        previews = [json.loads(line.removeprefix("VM argv ")) for line in preview.splitlines() if line.startswith("VM argv ")]
         checked = []
         for identity, (interface, visible), argv in zip(("left", "right"), states, previews, strict=True):
             assert "--wasm-register-dl" not in argv
@@ -320,7 +350,15 @@ def main():
 
     # If an operator explicitly reviews a version query on a build that
     # lacks that legacy ABI, the actual runtime must still refuse to launch.
-    for version in set(("ros1", "ros2")) - set(args.legacy_abi):
+    optional_missing = set(("ros1", "ros2")) - set(args.legacy_abi)
+    if optional_missing:
+        # Protect the selected verifier input even if the compiler's original
+        # executable was group-writable. The same bytes supply both witnesses.
+        selected_runtime = out / "review-runtime"
+        shutil.copyfile(runtime, selected_runtime)
+        selected_runtime.chmod(0o755)
+        assert digest(selected_runtime) == digest(runtime)
+    for version in optional_missing:
         legacy_key = f"uwvm_{version}_v1.abi_version"
         legacy = (f"uwvm_{version}_v1", "abi_version", legacy_key)
         deployment = ET.Element("deployment", id=f"unsupported-{version}")
@@ -337,6 +375,8 @@ def main():
         ET.ElementTree(deployment).write(manifest, encoding="utf-8")
         code, log = terminal_run(list(map(str, adopt)), b"")
         assert code == 0 and "requires the separately compiled" in log
+        blocked, reason = terminal_run([*map(str, adopt), "--runtime", str(selected_runtime)], b"")
+        assert blocked != 0 and "selected VM build lacks the provider" in reason
         line, = [line for line in log.splitlines() if line.startswith("VM argv ")]
         argv = json.loads(line.removeprefix("VM argv "))
         check_argv(argv, "left", (HIDDEN, "allow", HIDDEN, HIDDEN), legacy_key)
