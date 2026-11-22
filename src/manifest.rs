@@ -14,6 +14,15 @@ use std::path::{Component, Path, PathBuf};
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_XML: u64 = 256 * 1024;
 pub const MAX_PERMISSIONS: usize = 256;
+pub const NATIVE_PRELOAD_REFUSED: &str =
+    "in-process native preload is unsupported (10/10 high risk); isolated ELF drivers use individual admission";
+
+/// Distinguish a request to load native code from querying the runtime's
+/// read-only `report/preloaddl` selector.
+pub fn native_preload_request(key: &str) -> bool {
+    matches!(key, "--wasm-register-dl" | "-Wdl" | "preloaddl")
+        || key.starts_with("preloaddl/") || key.starts_with("preloaddl.")
+}
 /// Execution strategy for a reviewed application VM. Both engines enforce
 /// the same guest permissions. This setting grants no compiler threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +192,7 @@ pub fn known_interface(key: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Permission<'a> {
     RosInterface(&'a str),
+    LegacyRosAbi { host: &'static str, interface: &'static str },
     ClockInterface(&'a str),
     ClockGrant(&'a str),
     LocalOperation { kind: &'a str, alias: &'a str, operation: &'a str },
@@ -227,6 +237,15 @@ impl<'a> Permission<'a> {
     }
 
     pub fn from_key(key: &'a str) -> Option<Self> {
+        match key {
+            "uwvm_ros1_v1.abi_version" => return Some(Self::LegacyRosAbi {
+                host: "ros1", interface: "uwvm_ros1_v1.abi_version",
+            }),
+            "uwvm_ros2_v1.abi_version" => return Some(Self::LegacyRosAbi {
+                host: "ros2", interface: "uwvm_ros2_v1.abi_version",
+            }),
+            _ => {}
+        }
         if let Some(alias) = key.strip_prefix("driver/").and_then(|rest| rest.strip_suffix("/buffer.read")) {
             return (id(alias) && !alias.starts_with('-') && key.len() <= 128)
                 .then_some(Self::DriverRead(alias));
@@ -622,7 +641,10 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
             "interface" => {
                 attributes(n, "interface", &["name", "expose"])?;
                 let key = attr(n, "name")?;
-                if !matches!(Permission::from_key(key), Some(Permission::RosInterface(_) | Permission::ClockInterface(_))) {
+                if native_preload_request(key) {
+                    return Err(NATIVE_PRELOAD_REFUSED.into());
+                }
+                if !matches!(Permission::from_key(key), Some(Permission::RosInterface(_) | Permission::LegacyRosAbi { .. } | Permission::ClockInterface(_))) {
                     return Err("invalid interface".into());
                 }
                 (key.to_owned(), attr(n, "expose")?)

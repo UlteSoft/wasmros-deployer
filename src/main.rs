@@ -143,7 +143,9 @@ fn run() -> Result<()> {
     let mut exceptions = BTreeMap::new();
     let mut elf_exceptions = BTreeMap::new();
     while let Some(key) = args.next() {
-        if matches!(action.as_str(), "review" | "authorize" | "run")
+        if manifest::native_preload_request(&key) {
+            return Err(manifest::NATIVE_PRELOAD_REFUSED.into());
+        } else if matches!(action.as_str(), "review" | "authorize" | "run")
             && key == "--accept-recommendations"
             && !accept
         {
@@ -535,6 +537,12 @@ fn run() -> Result<()> {
         if rights.is_empty() {
             println!("INFO VM {:?} has no reviewed interface or resource permissions.", vm.id);
         }
+        if !rights.contains_key("permission.report") {
+            // The standalone VM exposes self-reporting after scene binding.
+            // Managed deployments expose only interfaces the operator reviews.
+            argv.extend(["--ros-scene-interface".into(), vm.id.clone(),
+                         "permission.report".into(), "hidden".into()]);
+        }
         for (alias, grant) in manifest::reviewed_grants(&rights)? {
             argv.extend(["--ros-scene-grant".into(), vm.id.clone(), alias.into(), grant.kind.into(),
                          grant.target.into(), grant.binding.into(), grant.operations.join(",")]);
@@ -555,6 +563,13 @@ fn run() -> Result<()> {
                     argv.extend([
                         "--ros-scene-interface".into(), vm.id.clone(), name.into(), decision.into(),
                     ]);
+                }
+                Permission::LegacyRosAbi { host, interface } => {
+                    println!("INFO VM {:?} deprecated legacy ABI version {interface}: {decision}; requires the separately compiled {host} module", vm.id);
+                    for command in ["create", "enable", "interface"] {
+                        argv.extend([format!("--{host}-single-{command}"), vm.id.clone()]);
+                    }
+                    argv.extend([interface.into(), decision.into()]);
                 }
                 Permission::ClockInterface(name) => {
                     println!("INFO VM {:?} WASIp1 clock interface {}: {}", vm.id, name, decision);

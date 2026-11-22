@@ -89,10 +89,14 @@ fn permission_risk(name: &str) -> Risk {
     match Permission::from_key(name) {
         Some(Permission::ClockInterface(_) | Permission::ClockGrant(_)) =>
             Risk::Scored(0, "read-only WASIp1 clock or resolution; interface and source grant are independent"),
+        Some(Permission::LegacyRosAbi { .. }) =>
+            Risk::Scored(0, "legacy ABI version only; requires an explicit legacy VM build and provides no ROS data or gateway rights"),
         Some(Permission::RosInterface(operation) | Permission::LocalOperation { operation, .. }) =>
             operation_risk(operation),
         Some(Permission::Metadata { .. }) =>
             Risk::Scored(4, "reads metadata from a separately selected module or VM target"),
+        Some(Permission::SelfReport("preloaddl")) =>
+            Risk::Scored(1, "read-only native preload build status; grants no ability to load native code"),
         Some(Permission::SelfReport(_)) =>
             Risk::Scored(1, "leaves the VM's ordinary self-report visibility in place"),
         Some(Permission::DriverRead(_)) =>
@@ -138,6 +142,9 @@ pub fn show_rights(phase: &str, vm: &str, rights: &BTreeMap<String, bool>) {
     println!("Review {phase} for VM {vm:?}");
     if rights.is_empty() {
         println!("  no explicit interface or resource decisions");
+    }
+    if !rights.contains_key("permission.report") {
+        println!("  hidden \"permission.report\" by default; an explicit decision is required to expose it");
     }
     for (name, enabled) in rights {
         let risk = permission_risk(name);
@@ -192,6 +199,8 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, prefill: bool) -> R
                 Ok(_) => return Ok(rights),
                 Err(error) => eprintln!("{error}"),
             },
+            [_, name] if wros_deployer::manifest::native_preload_request(name) =>
+                eprintln!("{}", wros_deployer::manifest::NATIVE_PRELOAD_REFUSED),
             [action, name] if Permission::from_key(name).is_some() => match *action {
                 "allow" | "deny" => {
                     if rights.len() >= wros_deployer::manifest::MAX_PERMISSIONS && !rights.contains_key(*name) {
@@ -210,7 +219,9 @@ pub fn approve(vm: &str, mut rights: BTreeMap<String, bool>, prefill: bool) -> R
 }
 
 pub fn show_deployment(plan: &Deployment) {
-    println!("Deployment assessment: VM filesystem mounts, host folder access, guest sockets and u2rosv1 permissions are unsupported by this manifest schema.");
+    println!("Deployment assessment: VM filesystem mounts, host folder access and guest sockets are unsupported by this manifest schema.");
+    println!("Deployment assessment: legacy ROS is limited to the two independently reviewed ABI-version queries; production VMs omit legacy modules by default.");
+    println!("Deployment assessment: {}. The optional read-only report/preloaddl filter controls status visibility only.", wros_deployer::manifest::NATIVE_PRELOAD_REFUSED);
     println!("Deployment assessment: cross-VM DDS topic conflicts and independent motion interlocks are UNASSESSED; this deployment format does not configure their endpoints.");
     for (i, a) in plan.processes.iter().enumerate() {
         println!("  VM {:?} engine {:?}, AOT tuning {:?}: {}; placement and resource budgets: {}",
@@ -266,6 +277,8 @@ pub fn show_imports(vm: &str, result: ImportAssessment) {
             for (namespace, name) in imports {
                 let status = match namespace.as_str() {
                     "uwvm_ros_v2" => "ROSv2 host namespace; individual interface and resource decisions apply",
+                    "uwvm_ros1_v1" | "uwvm_ros2_v1" if name == "abi_version" =>
+                        "deprecated legacy ABI-version query; both an exact permission and a legacy-enabled VM build are required",
                     "wasi_snapshot_preview1" | "wasi_unstable" =>
                         "WASIp1 host namespace; only reviewed clock declarations are supported",
                     "wasi" if name == "thread-spawn" =>

@@ -122,6 +122,18 @@ digest-bound Wasm. Imported namespaces identify a link interface and may be
 host services. This manifest cannot declare preloaded Wasm or authorize
 arbitrary host mounts or folders.
 
+In-process native preload requests score 10 and are refused, including
+`--wasm-register-dl` and its `-Wdl` alias. The separate `report/preloaddl` decision
+only controls whether an authorized guest can read the VM's native preload
+build status. This decision never loads a library. The production VM omits
+native preload. A signed isolated ELF provider uses separate admission.
+
+The deprecated `uwvm_ros1_v1.abi_version` and `uwvm_ros2_v1.abi_version`
+keys each expose only their named version query. Use them only with a VM
+explicitly built with that version's legacy ABI. If the ABI is absent, the VM
+refuses the resulting launch flags. Neither key supplies a gateway, data
+access, or another legacy interface.
+
 ## CPU and NUMA placement
 
 An individual `vm` may specify `cpus="2-3,8"` and `memory-nodes="1"`. Both are optional. An omitted attribute inherits the delegated parent's allowed set; an empty attribute is invalid. Lists use ascending decimal indices and disjoint ranges, with no whitespace, signs or leading zeros. Each list is limited to 4096 bytes and every index must be below 8192. Adjacent ranges are normalized before comparison and reporting.
@@ -252,7 +264,13 @@ Use `allow local/guard/signal/guard.create` at the review prompt to add an opera
 
 ### Reviewing permission reports and metadata
 
-A bound VM can report its own permissions. Reduce the information visible to that guest with a family name or an exact function in its recommendation file. To read another module's declarations or VM runtime metadata, review both the interface and a grant for the exact target.
+A deployed VM can report its own permissions after explicit approval of the
+`permission.report` interface. With no decision for that interface, the
+deployer hides it, including when an operator removes a recommendation. This
+preserves the empty deployment permission baseline. After allowing the
+interface, limit information with family or exact function decisions. To read
+another module's declarations or VM runtime metadata, review both the
+interface and a grant for the exact target.
 
 ```xml
 <recommendations>

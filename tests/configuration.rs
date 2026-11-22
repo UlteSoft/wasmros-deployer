@@ -10,6 +10,28 @@ fn zero_implicit_grants() {
     let p = deployment(&config()).unwrap();
     assert!(p.processes[0].recommendations.is_none())
 }
+
+#[test]
+fn legacy_version_queries_and_native_build_status_remain_distinct() {
+    use wros_deployer::manifest::{native_preload_request, recommendations, Permission};
+    let rights = recommendations(r#"<recommendations>
+      <interface name="uwvm_ros1_v1.abi_version" expose="allow"/>
+      <interface name="uwvm_ros2_v1.abi_version" expose="deny"/>
+      <self-report selector="preloaddl" access="deny"/>
+    </recommendations>"#).unwrap();
+    assert_eq!(rights.get("uwvm_ros1_v1.abi_version"), Some(&true));
+    assert_eq!(rights.get("uwvm_ros2_v1.abi_version"), Some(&false));
+    assert_eq!(rights.get("report/preloaddl"), Some(&false));
+    assert!(matches!(Permission::from_key("report/preloaddl"), Some(Permission::SelfReport(_))));
+    assert!(Permission::from_key("uwvm_ros1_v1.time_read_ros").is_none());
+    assert!(Permission::from_key("uwvm_ros2_v1.capability_open").is_none());
+    assert!(!native_preload_request("report/preloaddl"));
+    for key in ["preloaddl/native", "--wasm-register-dl", "-Wdl"] {
+        assert!(native_preload_request(key));
+        let xml = format!(r#"<recommendations><interface name="{key}" expose="allow"/></recommendations>"#);
+        assert!(recommendations(&xml).unwrap_err().contains("10/10 high risk"), "{key}");
+    }
+}
 #[test]
 fn reviewed_engine_uses_one_fixed_vm_argument() {
     for (field, expected) in [
