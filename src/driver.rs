@@ -43,7 +43,7 @@ pub(crate) struct Bootstrap {
     limits: Limits,
 }
 
-pub(crate) const IMPORTS: [&str; 4] = [
+pub const IMPORTS: [&str; 4] = [
     "driver.connect", "driver.submit", "driver.result", "driver.disconnect",
 ];
 
@@ -61,9 +61,6 @@ impl Bootstrap {
             self.provider.clock().as_raw_fd(),
         ];
         let mut args = [
-            "--ros-scene-grant", vm, alias, "driver", &launch.artifact.hardware_id,
-            "registered-driver", &IMPORTS.join(","),
-            "--ros-scene-driver-budget", vm, "1", "1048576",
             "--ros-scene-driver-channel", vm, alias, vm,
         ].into_iter().map(str::to_owned).collect::<Vec<_>>();
         args.extend([

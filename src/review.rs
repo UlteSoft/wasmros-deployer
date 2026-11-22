@@ -381,6 +381,11 @@ pub fn show_deployment(plan: &Deployment, report: RiskReport) {
             Risk::Scored(if a.boot_start {6} else {0}, "cold start grants no retained actuator authority")));
         items.push((format!("VM {:?} authorized crash restart {}", a.id, a.crash_restart),
             Risk::Scored(if a.crash_restart {5} else {0}, "configured cold restart can repeat initialization after a fault")));
+        let routes = plan.drivers.iter().filter_map(|d| d.attachment.as_ref()).filter(|d| d.vm == a.id).collect::<Vec<_>>();
+        if !routes.is_empty() {
+            let reserved: u64 = routes.iter().map(|d| d.buffer_bytes().0).sum();
+            println!("INFO VM {:?} driver registry: {} routes, {} reserved bytes, {} byte ceiling.", a.id, routes.len(), reserved, a.driver_budget_bytes);
+        }
         for b in &plan.processes[..i] {
             if let (Some(a_set), Some(b_set)) = (&a.cpus, &b.cpus) {
                 if a_set.overlaps(b_set) {
@@ -400,8 +405,8 @@ pub fn show_deployment(plan: &Deployment, report: RiskReport) {
         let Some(attachment) = &driver.attachment else { continue };
         items.push((format!("Driver {:?} for VM {:?}, read-only sandbox {:?}", driver.id, attachment.vm, attachment.sandbox),
             Risk::Scored(7, "can execute a native process after admission with a separate identity, isolated network and no physical device access")));
-        println!("INFO Driver {:?} for VM {:?}, contract-bounded buffer.read payload ceilings: request {} bytes, response {} bytes, request deadline {} ms.",
-            driver.id, attachment.vm, attachment.request_bytes, attachment.response_bytes, attachment.request_millis);
+        println!("INFO Driver {:?} for VM {:?}, contract-bounded buffer.read payload ceilings: request {} bytes, response {} bytes, request deadline {} ms. Alias {:?}, dedicated UID/GID {:?}.",
+            driver.id, attachment.vm, attachment.request_bytes, attachment.response_bytes, attachment.request_millis, attachment.alias, attachment.identity);
         items.push((format!("Driver {:?} request {} bytes, response {} bytes", driver.id, attachment.request_bytes, attachment.response_bytes),
             Risk::Scored(payload_risk(attachment.request_bytes, attachment.response_bytes),
                 "a larger authenticated frame can disclose more telemetry and reserve more memory at each endpoint")));

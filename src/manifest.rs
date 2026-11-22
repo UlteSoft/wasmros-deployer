@@ -68,6 +68,7 @@ pub struct Process {
     pub crash_restart: bool,
     pub recommendations: Option<PathBuf>,
     pub memory_bytes: u64,
+    pub driver_budget_bytes: u64,
     pub pids: u32,
     pub identity: Option<(u32, u32)>,
     pub cpu_micros: u32,
@@ -100,6 +101,17 @@ pub struct DriverAttachment {
     pub request_millis: u32,
     pub request_bytes: u32,
     pub response_bytes: u32,
+}
+impl DriverAttachment {
+    /// Logical transport reservations from the VM's driver_dispatch and TLS profile.
+    /// Reserve space for the ABI-dependent route object and its three bounded names.
+    pub fn buffer_bytes(&self) -> (u64, u64) {
+        let request = u64::from(self.request_bytes);
+        let response = u64::from(self.response_bytes);
+        let frame = 176 + request.max(response);
+        let tls = 262144 + 3 * (frame + 2048).max(8192) + frame + 4;
+        (tls + 176 + request + 2 * response + 16 + 4096, tls + frame)
+    }
 }
 #[derive(Debug)]
 pub struct Deployment {
@@ -542,6 +554,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 "aot-policy",
                 "recommendations",
                 "memory-bytes",
+                "driver-budget-bytes",
                 "pids",
                 "start-on-boot",
                 "restart-on-crash",
@@ -580,6 +593,12 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 .map(|v| v.parse::<u32>().map_err(|_| format!("invalid {key}")))
                 .unwrap_or(Ok(default))
         };
+        let driver_budget_bytes = node.attribute("driver-budget-bytes")
+            .map(|v| v.parse::<u64>().map_err(|_| "invalid VM driver registry budget"))
+            .transpose()?.unwrap_or(1_048_576.min(memory_bytes));
+        if driver_budget_bytes > memory_bytes {
+            return Err("driver registry budget exceeds VM memory".into());
+        }
         let identity = match (node.attribute("uid"), node.attribute("gid")) {
             (None, None) => None,
             (Some(_), Some(_)) => {
@@ -643,6 +662,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
             crash_restart: flag(node, "restart-on-crash")?,
             recommendations: node.attribute("recommendations").map(path).transpose()?,
             memory_bytes,
+            driver_budget_bytes,
             pids,
             vm_policy: node.attribute("vm-policy").map(path).transpose()?,
             identity,
@@ -662,26 +682,30 @@ pub fn deployment(s: &str) -> Result<Deployment> {
     if processes.is_empty() {
         return Err("empty deployment".into());
     }
-    let mut attached_vms = BTreeSet::new();
     let mut uids = processes.iter().filter_map(|p| p.identity.map(|(uid, _)| uid)).collect::<BTreeSet<_>>();
     let mut gids = processes.iter().filter_map(|p| p.identity.map(|(_, gid)| gid)).collect::<BTreeSet<_>>();
+    let mut routes = BTreeSet::new();
+    let mut sandboxes = Vec::<(&str, &Path)>::new();
+    let mut reservations = BTreeMap::<&str, u64>::new();
     for attachment in drivers.iter().filter_map(|driver| driver.attachment.as_ref()) {
         let vm = processes.iter().find(|p| p.id == attachment.vm)
-            .ok_or("driver attachment requires an existing dedicated VM")?;
-        if !attached_vms.insert(&attachment.vm)
-            || !uids.insert(attachment.identity.0) || !gids.insert(attachment.identity.1)
-        {
-            return Err("driver attachment requires an existing dedicated VM and distinct host identities".into());
+            .ok_or("driver attachment requires an existing VM")?;
+        if !uids.insert(attachment.identity.0) || !gids.insert(attachment.identity.1) {
+            return Err("each VM and driver requires distinct host identities".into());
         }
-        // Minimum storage already charged by the VM driver session and TLS.
-        // The VM enforces the exact entry size for its ABI when binding the channel.
-        let req = u64::from(attachment.request_bytes);
-        let res = u64::from(attachment.response_bytes);
-        let frame = 176 + req.max(res);
-        let tls = 262144 + 3 * (frame + 2048).max(8192) + frame + 4;
-        let vm_buffers = tls + 176 + req + 2 * res + 16;
-        if vm_buffers > 1_048_576 || vm.memory_bytes < vm_buffers || attachment.memory_bytes < tls + frame {
-            return Err("attachment message buffers exceed the VM, provider or transport memory budget".into());
+        if !routes.insert((&attachment.vm, &attachment.alias)) {
+            return Err("duplicate driver attachment alias in one VM".into());
+        }
+        if sandboxes.iter().any(|&(target, path)| target == vm.id &&
+            (path.starts_with(&attachment.sandbox) || attachment.sandbox.starts_with(path))) {
+            return Err("drivers attached to the same VM require disjoint sandboxes".into());
+        }
+        sandboxes.push((&vm.id, &attachment.sandbox));
+        let (vm_bytes, provider_bytes) = attachment.buffer_bytes();
+        let total = reservations.entry(&vm.id).or_default();
+        *total = total.checked_add(vm_bytes).ok_or("driver reservation overflow")?;
+        if *total > vm.driver_budget_bytes || provider_bytes > attachment.memory_bytes {
+            return Err("attachment message buffers exceed the aggregate VM or individual provider memory budget".into());
         }
     }
     Ok(Deployment {

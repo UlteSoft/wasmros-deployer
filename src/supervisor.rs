@@ -84,7 +84,7 @@ pub struct Launch {
     pub module: FrozenFile,
     pub libraries: Vec<FrozenFile>,
     pub arguments: Vec<String>,
-    pub driver: Option<crate::driver::Launch>,
+    pub drivers: Vec<crate::driver::Launch>,
 }
 struct RunningDriver {
     child: Option<Child>,
@@ -102,7 +102,7 @@ struct Running {
     failed: bool,
     output: DiagnosticBudget,
     started: bool,
-    driver: Option<RunningDriver>,
+    drivers: Vec<RunningDriver>,
 }
 struct Session<'a> {
     hierarchy: Hierarchy,
@@ -110,24 +110,12 @@ struct Session<'a> {
     slots: Vec<Running>,
     events: &'a Events,
     journal: Option<&'a mut crate::state::Journal>,
-    driver_groups: Vec<Option<usize>>,
+    driver_groups: Vec<std::ops::Range<usize>>,
     roots: Vec<std::sync::Arc<crate::workload_fs::Root>>,
 }
 impl Drop for Session<'_> {
     fn drop(&mut self) {
-        // Exceptional teardown still signals every group before reaping.
-        // Avoid an unbounded wait when a kernel task cannot exit.
-        if self.hierarchy.kill().is_err() {
-            for slot in &self.slots {
-                if let Some(fd) = &slot.pidfd {
-                    signal(fd, libc::SIGKILL);
-                }
-                if let Some(fd) = slot.driver.as_ref().and_then(|driver| driver.pidfd.as_ref()) {
-                    signal(fd, libc::SIGKILL);
-                }
-            }
-        }
-        let _ = self.reap_exited(false);
+        let _ = self.force_stop();
     }
 }
 fn signal(pidfd: &File, number: i32) {
@@ -154,8 +142,8 @@ fn finish_driver(
     id: &str,
     generation: u64,
     events: &Events,
+    deadline: Instant,
 ) -> Result<()> {
-    let deadline = Instant::now() + DRIVER_CLOSE_GRACE;
     while let Some(child) = &mut driver.child {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             output(child, "Driver", id, generation, &mut driver.output, events);
@@ -565,39 +553,45 @@ impl Session<'_> {
         let enrollment = self.hierarchy.children[index].enrollment()?;
         self.check_start()?;
         let launch = &self.launches[index];
-        let (child, pidfd) = if let Some(driver) = &launch.driver {
-            let group = &self.hierarchy.children[self.driver_groups[index].unwrap()];
-            let ((provider, provider_pidfd), bootstrap) =
-                crate::driver::start(driver, group.enrollment()?)?;
-            self.events.send(format!(
-                "INFO Driver {:?} passed launch signature policy {:?}; PID {} in its dedicated cgroup",
-                driver.artifact.id, driver.admission.verdict(), provider.id(),
-            ));
-            self.slots[index].driver = Some(RunningDriver {
+        let mut bootstraps = Vec::with_capacity(launch.drivers.len());
+        let mut arguments = Vec::new();
+        let mut inherited = Vec::new();
+        for (driver, group) in launch.drivers.iter().zip(self.driver_groups[index].clone()) {
+            self.check_start()?;
+            let group = &self.hierarchy.children[group];
+            group.drain(STOP_SETTLE)?;
+            let ((provider, provider_pidfd), bootstrap) = crate::driver::start(driver, group.enrollment()?)?;
+            let provider_id = provider.id();
+            // Take ownership before any subsequent provider, VM or bootstrap can fail.
+            self.slots[index].drivers.push(RunningDriver {
                 child: Some(provider), pidfd: Some(provider_pidfd), ended: None,
                 output: DiagnosticBudget::default(),
             });
-            let (arguments, inherited) = bootstrap.vm_arguments(driver, &launch.process.id);
-            self.events.send(format!("INFO VM {:?} extra driver CLI {:?}", launch.process.id, arguments));
+            self.events.send(format!(
+                "INFO Driver {:?} passed launch signature policy {:?}; PID {} in its dedicated cgroup",
+                driver.artifact.id, driver.admission.verdict(), provider_id,
+            ));
+            let (route_args, route_fds) = bootstrap.vm_arguments(driver, &launch.process.id);
+            self.events.send(format!("INFO VM {:?} extra driver CLI {:?}", launch.process.id, route_args));
+            arguments.extend(route_args);
+            inherited.extend(route_fds);
+            bootstraps.push(bootstrap);
+        }
+        self.check_start()?;
+        let (child, pidfd) = spawn(runtime, self.roots[index].clone(), launch, enrollment, &arguments, &inherited)?;
+        let child_id = child.id();
+        self.slots[index].child = Some(child);
+        self.slots[index].pidfd = Some(pidfd);
+        for (driver, bootstrap) in launch.drivers.iter().zip(bootstraps) {
             self.check_start()?;
-            let (child, pidfd) = spawn(runtime, self.roots[index].clone(), launch, enrollment, &arguments, &inherited)?;
-            self.slots[index].child = Some(child);
-            self.slots[index].pidfd = Some(pidfd);
             bootstrap.deliver(self.slots[index].child.as_ref().unwrap(), launch.process.identity.unwrap())?;
             self.events.send(format!("INFO Driver {:?} bootstrap delivered for authenticated TLS", driver.artifact.id));
-            (self.slots[index].child.take().unwrap(), self.slots[index].pidfd.take().unwrap())
-        } else {
-            spawn(runtime, self.roots[index].clone(), launch, enrollment, &[], &[])?
-        };
+        }
         self.events.send(format!(
             "INFO VM {:?} generation {} started with PID {}, no motion authority",
-            self.launches[index].process.id,
-            generation,
-            child.id()
+            launch.process.id, generation, child_id
         ));
         let slot = &mut self.slots[index];
-        slot.child = Some(child);
-        slot.pidfd = Some(pidfd);
         slot.generation = generation;
         slot.started = true;
         slot.next = None;
@@ -608,10 +602,10 @@ impl Session<'_> {
     fn reap_exited(&mut self, diagnostics: bool) -> Result<bool> {
         let mut all_reaped = true;
         for (i, slot) in self.slots.iter_mut().enumerate() {
-            if let Some(driver) = &mut slot.driver {
+            for (driver, launch) in slot.drivers.iter_mut().zip(&self.launches[i].drivers) {
                 if let Some(child) = &mut driver.child {
                     if diagnostics {
-                        output(child, "Driver", &self.launches[i].driver.as_ref().unwrap().artifact.id,
+                        output(child, "Driver", &launch.artifact.id,
                                slot.generation, &mut driver.output, self.events);
                     }
                     if child.try_wait().map_err(|e| e.to_string())?.is_some() {
@@ -657,6 +651,21 @@ impl Session<'_> {
         }
     }
 
+    fn force_stop(&mut self) -> Result<()> {
+        let killed = self.hierarchy.kill();
+        if killed.is_err() {
+            for slot in &self.slots {
+                for fd in slot.pidfd.iter().chain(slot.drivers.iter().filter_map(|d| d.pidfd.as_ref())) {
+                    signal(fd, libc::SIGKILL);
+                }
+            }
+        }
+        if !self.wait_for_shutdown(Instant::now() + STOP_SETTLE, true)? {
+            return Err("deployment cgroup or direct children did not settle; supervisor intervention required".into());
+        }
+        killed
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         let grace = Instant::now() + STOP_GRACE;
         for slot in &mut self.slots {
@@ -665,16 +674,12 @@ impl Session<'_> {
             if let Some(fd) = &slot.pidfd {
                 signal(fd, libc::SIGTERM);
             }
-            if let Some(fd) = slot.driver.as_ref().and_then(|driver| driver.pidfd.as_ref()) {
+            for fd in slot.drivers.iter().filter_map(|driver| driver.pidfd.as_ref()) {
                 signal(fd, libc::SIGTERM);
             }
         }
         let graceful = self.wait_for_shutdown(grace, false);
-        let settle = Instant::now() + STOP_SETTLE;
-        self.hierarchy.kill()?;
-        if !self.wait_for_shutdown(settle, true)? {
-            return Err("deployment cgroup or direct children did not settle; supervisor intervention required".into());
-        }
+        self.force_stop()?;
         graceful?;
         Ok(())
     }
@@ -698,7 +703,7 @@ fn identities(launches: &[Launch]) -> Result<Vec<(u32, u32)>> {
     let mut ids = Vec::with_capacity(launches.len() * 2);
     for launch in launches {
         ids.push(launch.process.identity.ok_or("missing VM identity")?);
-        if let Some(driver) = &launch.driver {
+        for driver in &launch.drivers {
             ids.push(driver.artifact.attachment.as_ref().ok_or("missing driver attachment")?.identity);
         }
     }
@@ -720,7 +725,7 @@ pub fn run_reserved(
     identities: &crate::ownership::Reservations,
 ) -> Result<()> {
     identities.check_ids(cgroup, deployment, self::identities(launches)?)?;
-    if launches.iter().any(|l| l.driver.is_some())
+    if launches.iter().any(|l| !l.drivers.is_empty())
         && (journal.is_some() || launches.iter().any(|l| l.process.boot_start || l.process.crash_restart))
     {
         return Err("native driver launch requires explicit supervision without automatic restart".into());
@@ -763,12 +768,11 @@ fn supervise(
     let mut workloads = launches.iter().map(|l| Workload::from(&l.process)).collect::<Vec<_>>();
     let mut driver_groups = Vec::with_capacity(launches.len());
     for launch in launches {
-        if let Some(driver) = &launch.driver {
-            driver_groups.push(Some(workloads.len()));
+        let first = workloads.len();
+        for driver in &launch.drivers {
             workloads.push(Workload::driver(&driver.artifact)?);
-        } else {
-            driver_groups.push(None);
         }
+        driver_groups.push(first..workloads.len());
     }
     let hierarchy = Hierarchy::create_workloads(cgroup, deployment, &workloads)?;
     let slots = launches
@@ -789,7 +793,7 @@ fn supervise(
                 failed: false,
                 output: DiagnosticBudget::default(),
                 started: false,
-                driver: None,
+                drivers: Vec::with_capacity(l.drivers.len()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -802,8 +806,18 @@ fn supervise(
         driver_groups,
         roots,
     };
+    match monitor(&mut session, launches, &runtime, events) {
+        Ok(()) => Ok(()),
+        Err(error) => match session.force_stop() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; deployment cleanup failed: {cleanup}")),
+        },
+    }
+}
+
+fn monitor(session: &mut Session<'_>, launches: &[Launch], runtime: &File, events: &Events) -> Result<()> {
     for i in 0..launches.len() {
-        session.start(i, &runtime)?;
+        session.start(i, runtime)?;
     }
     loop {
         if STOP.load(Ordering::SeqCst) {
@@ -822,9 +836,9 @@ fn supervise(
         }
         for (i, launch) in launches.iter().enumerate() {
             let slot = &mut session.slots[i];
-            if let Some(driver) = &mut slot.driver {
+            for (driver, provider) in slot.drivers.iter_mut().zip(&launch.drivers) {
                 if let Some(child) = &mut driver.child {
-                    let id = &launch.driver.as_ref().unwrap().artifact.id;
+                    let id = &provider.artifact.id;
                     output(child, "Driver", id, slot.generation, &mut driver.output, events);
                     if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                         output(child, "Driver", id, slot.generation, &mut driver.output, events);
@@ -857,21 +871,21 @@ fn supervise(
                     slot.child = None;
                     slot.pidfd = None;
                     session.hierarchy.children[i].drain(Duration::from_secs(2))?;
-                    if let Some(group) = session.driver_groups[i] {
-                        let driver = slot.driver.as_mut().unwrap();
-                        let id = &launch.driver.as_ref().unwrap().artifact.id;
+                    let deadline = Instant::now() + DRIVER_CLOSE_GRACE;
+                    for ((driver, provider), group) in slot.drivers.iter_mut().zip(&launch.drivers).zip(session.driver_groups[i].clone()) {
+                        let id = &provider.artifact.id;
                         if status.success() {
                             // The VM can return immediately after sending RELEASE.
                             // Give the provider a bounded window to close and flush diagnostics.
-                            finish_driver(driver, id, slot.generation, events)?;
+                            finish_driver(driver, id, slot.generation, events, deadline)?;
                         }
                         session.hierarchy.children[group].drain(Duration::from_secs(2))?;
                         if let Some(provider) = &mut driver.child {
                             let _ = provider.wait().map_err(|e| e.to_string())?;
                             output(provider, "Driver", id, slot.generation, &mut driver.output, events);
                         }
-                        slot.driver = None;
                     }
+                    slot.drivers.clear();
                     if status.success() {
                         slot.state.operator_stop();
                     } else {
@@ -898,8 +912,8 @@ fn supervise(
             }
             // An adapter can finish its RELEASE just before the VM returns.
             // A VM that stays live after loss of its provider cannot keep running.
-            if slot.child.is_some() && slot.driver.as_ref().and_then(|d| d.ended)
-                .is_some_and(|end| end.elapsed() >= DRIVER_CLOSE_GRACE)
+            if slot.child.is_some() && slot.drivers.iter().filter_map(|d| d.ended)
+                .any(|end| end.elapsed() >= DRIVER_CLOSE_GRACE)
             {
                 return Err("driver exited while its VM remained active".into());
             }
@@ -907,7 +921,7 @@ fn supervise(
                 .next
                 .is_some_and(|when| Instant::now() >= when)
             {
-                session.start(i, &runtime)?;
+                session.start(i, runtime)?;
             }
         }
         if session

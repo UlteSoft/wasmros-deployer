@@ -348,3 +348,27 @@ fn report_visibility_and_foreign_metadata_are_independent() {
         assert!(recommendations(&bad).is_err());
     }
 }
+
+#[test]
+fn routes_sharing_a_vm_have_independent_ownership_and_a_single_registry_budget() {
+    let route = |n: u32| format!(r#"<driver id="d{n}" file="d{n}" sha256="{}" kind="executable" vendor-version="1" hardware-id="h{n}" elf-signer="d{n}.pem">
+        <attachment vm="body" alias="sensor{n}" sandbox="drivers/d{n}" uid="{n}" gid="{n}" contract-sha256="{}"
+        memory-bytes="1048576" pids="8" cpu-micros="100000" request-bytes="24" response-bytes="4096"/></driver>"#, "c".repeat(64), "d".repeat(64));
+    let xml = config().replace("</deployment>", &format!("{}{}</deployment>", route(101), route(102)));
+    let plan = deployment(&xml).unwrap();
+    assert_eq!(plan.drivers.len(), 2);
+    let per_route = plan.drivers[0].attachment.as_ref().unwrap().buffer_bytes().0;
+    let with_budget = |bytes| xml.replace("module=", &format!(r#"driver-budget-bytes="{bytes}" module="#));
+    assert!(deployment(&with_budget(per_route * 2)).is_ok());
+    assert!(deployment(&with_budget(per_route * 2 - 1)).is_err());
+    for denied in [
+        xml.replace("sensor102", "sensor101"),
+        xml.replace("drivers/d102", "drivers/d101"),
+        xml.replace("drivers/d102", "drivers/d101/inner"),
+        xml.replace(r#"uid="102""#, r#"uid="101""#),
+        xml.replace(r#"gid="102""#, r#"gid="101""#),
+        xml.replace(r#"hardware-id="h102""#, r#"hardware-id="h101""#),
+    ] {
+        assert!(deployment(&denied).is_err());
+    }
+}

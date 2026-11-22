@@ -418,7 +418,8 @@ fn run() -> Result<()> {
                 eprintln!("WARNING: {:?} ELF launch authorized by explicit exception for {:?} at SHA256 {}",
                           admitted.verdict(), driver.id, driver.digest);
             }
-            native_launches.insert(vm, native::Launch::new(driver.clone(), admitted, driver_root, root)?);
+            native_launches.entry(vm).or_insert_with(Vec::new)
+                .push(native::Launch::new(driver.clone(), admitted, driver_root, root)?);
             continue;
         } else if let Some((_, scratch)) = verifier {
             let elf = options
@@ -549,8 +550,8 @@ fn run() -> Result<()> {
             }
             review::show_rights("effective decisions", &vm.id, &rights, risk_report);
         }
-        let driver = native_launches.remove(&vm.id);
-        if let Some(provider) = &driver {
+        let drivers = native_launches.remove(&vm.id).unwrap_or_default();
+        for provider in &drivers {
             let alias = &provider.artifact.attachment.as_ref().unwrap().alias;
             let allowed_imports = ["capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"];
             if rights.get(&format!("driver/{alias}/buffer.read")) != Some(&true)
@@ -607,6 +608,17 @@ fn run() -> Result<()> {
         for (alias, grant) in manifest::reviewed_grants(&rights)? {
             argv.extend(["--ros-scene-grant".into(), vm.id.clone(), alias.into(), grant.kind.into(),
                          grant.target.into(), grant.binding.into(), grant.operations.join(",")]);
+        }
+        // Plan the static routes even before the supervisor creates one-use channels.
+        let routes = plan.drivers.iter().filter_map(|d| d.attachment.as_ref().map(|a| (d, a)))
+            .filter(|(_, a)| a.vm == vm.id && rights.get(&format!("driver/{}/buffer.read", a.alias)) == Some(&true))
+            .collect::<Vec<_>>();
+        if !routes.is_empty() {
+            argv.extend(["--ros-scene-driver-budget".into(), vm.id.clone(), routes.len().to_string(), vm.driver_budget_bytes.to_string()]);
+            for (driver, route) in routes {
+                argv.extend(["--ros-scene-grant".into(), vm.id.clone(), route.alias.clone(), "driver".into(),
+                    driver.hardware_id.clone(), "registered-driver".into(), native::IMPORTS.join(",")]);
+            }
         }
         let mut clock_policy = false;
         for (name, enabled) in rights {
@@ -696,7 +708,7 @@ fn run() -> Result<()> {
                 module,
                 libraries: libraries.images,
                 arguments: argv,
-                driver,
+                drivers,
             });
         }
     }
