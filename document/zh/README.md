@@ -98,6 +98,10 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 
 `run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。`--accept-recommendations` 只跳过本次交互审核，不放宽签名要求。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
 
+每个受管 VM 显式使用 `--runtime-memtag-mode sync` 和
+`--runtime-memtag-action crash`。标签不匹配时，VM 在故障点终止。
+编译时关闭 WasmMTE 生成的模块按普通 Wasm 执行，仍执行原有的边界检查。
+
 ## CPU 与 NUMA 放置
 
 每个 `vm` 可以单独指定 `cpus="2-3,8"` 和 `memory-nodes="1"`，两个属性均可省略。省略时继承委托父组的允许集合；空字符串无效。列表使用升序十进制编号及不重叠区间，禁止空白、正负号和前导零。每个列表最多 4096 字节，编号必须小于 8192。相邻区间会先合并，再进行比较和配置复述。

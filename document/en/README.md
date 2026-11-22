@@ -107,6 +107,11 @@ Normal signed runs use two rollback stores. Initialize `policy` for privileged a
 
 The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. `--accept-recommendations` bypasses interactive edits only for this invocation and emits its own warning. It does not change signature requirements. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
 
+Each managed VM starts with `--runtime-memtag-mode sync` and
+`--runtime-memtag-action crash`. A detected tag mismatch terminates the VM at
+the fault. A guest built without WasmMTE instructions or tag metadata continues
+to run ordinary Wasm with its normal bounds checks.
+
 ## CPU and NUMA placement
 
 An individual `vm` may specify `cpus="2-3,8"` and `memory-nodes="1"`. Both are optional. An omitted attribute inherits the delegated parent's allowed set; an empty attribute is invalid. Lists use ascending decimal indices and disjoint ranges, with no whitespace, signs or leading zeros. Each list is limited to 4096 bytes and every index must be below 8192. Adjacent ranges are normalized before comparison and reporting.
