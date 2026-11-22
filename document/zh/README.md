@@ -106,7 +106,7 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 
 进程内原生库预加载为 10 分，部署器拒绝 `--wasm-register-dl` 及其简写 `-Wdl`。`report/preloaddl` 仅控制已获授权的来宾能否读取 VM 的预加载构建状态。生产 VM 默认不编译原生预加载。独立进程内运行的签名 ELF 驱动按自己的规则准入。
 
-部署器默认展示分数达到 7/10 的项目，未评估项目单独列出。可用
+部署器默认展示 5/10 及以上的项目，未评估项目单独列出。可用
 `--risk-report 0` 至 `--risk-report 10` 设置最低展示分数，也接受
 `--risk-report '>=7'` 的写法。`--risk-report none` 关闭这份报告。
 手动逐个审核和一键采纳均使用这一独立设置。生效权限、最终部署确认和必须显示的验签或策略诊断仍按原有规则处理。

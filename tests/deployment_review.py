@@ -137,10 +137,11 @@ def main():
                 assert (f": {score}/10 (" in run.stdout) == (score >= threshold), (threshold, score)
             cases.append("threshold-"+spelling)
     default = subprocess.run(preview, capture_output=True, text=True, timeout=10)
-    assert default.returncode == 0 and "(threshold >=7/10)" in default.stdout
+    assert default.returncode == 0 and "(threshold >=5/10)" in default.stdout
+    assert 'VM "b" and "a" use overlapping CPUs: 5/10 (moderate)' in default.stdout
     assert ": 7/10 (high)" in default.stdout and ": 9/10 (high)" in default.stdout
-    assert ": 5/10 (" not in default.stdout and "  UNASSESSED" in default.stdout
-    cases.append("default-high-with-unassessed")
+    assert ": 4/10 (" not in default.stdout and "  UNASSESSED" in default.stdout
+    cases.append("default-includes-five-with-unassessed")
     for invalid in ("", "11", "-1", "00", "07", ">=11", ">", "NONE", "true", " 7"):
         run = subprocess.run([*preview, f"--risk-report={invalid}"], capture_output=True, text=True, timeout=10)
         assert run.returncode != 0 and "invalid --risk-report value" in run.stderr
@@ -149,19 +150,22 @@ def main():
     assert duplicate.returncode != 0 and "duplicate --risk-report" in duplicate.stderr
     cases += ["invalid-thresholds-refused", "duplicate-threshold-refused"]
     adopt = [str(args.deployer.resolve()), "review", str(manifest), "--policy-root", str(trust), "--accept-recommendations"]
-    for setting in (None, "none"):
-        code, view = terminal_run([*adopt, *([] if setting is None else ["--risk-report=none"])], b"")
-        (out/f"adopt-{setting or 'default'}.log").write_text(view)
+    for label, setting, threshold in (("default", None, 5), ("explicit-seven", ">=7", 7), ("none", "none", None)):
+        argv = adopt if setting is None else [*adopt, f"--risk-report={setting}"]
+        code, view = terminal_run(argv, b"")
+        (out/f"adopt-{label}.log").write_text(view)
         assert code == 0 and "without per-VM edits" in view and "[recommended" not in view and " edits [" not in view
-        assert ("Risk report" in view) == (setting is None)
-        assert ("  UNASSESSED" in view) == (setting is None)
+        assert ("Risk report" in view) == (threshold is not None)
+        assert ("  UNASSESSED" in view) == (threshold is not None)
         assert "Review effective decisions for VM" in view and 'allow "control.submit"' in view
         assert 'default read-only self observation via "permission.report"' in view
-        if setting is None:
-            assert ": 9/10 (high)" in view and ": 7/10 (high)" in view
-        else:
+        if threshold is None:
             assert "/10 (" not in view
-        cases.append("one-click-"+(setting or "default"))
+        else:
+            assert f"(threshold >={threshold}/10)" in view
+            assert (": 5/10 (moderate)" in view) == (threshold == 5)
+            assert ": 9/10 (high)" in view and ": 7/10 (high)" in view
+        cases.append("one-click-"+label)
     withheld = subprocess.run([*preview, "--risk-report=none", "--wasm-register-dl", "ignored"],
                               capture_output=True, text=True, timeout=10)
     assert withheld.returncode != 0 and "(10/10 high risk)" in withheld.stderr

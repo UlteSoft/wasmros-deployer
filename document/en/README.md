@@ -264,7 +264,7 @@ Use `allow local/guard/signal/guard.create` at the review prompt to add an opera
 
 ### Reviewing permission reports and metadata
 
-The operator's risk report displays scores of 7/10 and above by default, with
+The operator's risk report displays scores of 5/10 and above by default, with
 unassessed items listed separately. Use `--risk-report 0` through
 `--risk-report 10` to display scores at or above a different threshold. The
 quoting form `--risk-report '>=7'` is also accepted. `--risk-report none`

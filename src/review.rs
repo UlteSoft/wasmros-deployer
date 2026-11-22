@@ -38,7 +38,7 @@ pub enum RiskReport {
 }
 
 impl Default for RiskReport {
-    fn default() -> Self { Self::AtLeast(7) }
+    fn default() -> Self { Self::AtLeast(5) }
 }
 
 impl RiskReport {

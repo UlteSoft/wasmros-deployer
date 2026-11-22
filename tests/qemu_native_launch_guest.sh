@@ -137,7 +137,7 @@ exercise() {
     $b grep -F 'Review effective decisions for VM "main"' "/run/$label.log"
     $b grep -F 'adopting parsed recommendations without per-VM edits' "/run/$label.log"
     if test "$label" = signed; then
-        $b grep -F 'Risk report deployment configuration (threshold >=7/10)' "/run/$label.log"
+        $b grep -F 'Risk report deployment configuration (threshold >=5/10)' "/run/$label.log"
         $b grep -F 'read-only sandbox "go2": 7/10 (high)' "/run/$label.log"
     elif test "$label" = signed-int; then
         if $b grep -F 'Risk report' "/run/$label.log"; then exit 1; fi
