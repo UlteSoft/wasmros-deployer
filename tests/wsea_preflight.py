@@ -133,6 +133,13 @@ def main():
             ET.SubElement(root, "driver", driver)
         ET.ElementTree(root).write(deployment)
 
+    def add_instance_alias(tag, alias, **overrides):
+        tree = ET.parse(deployment)
+        root = tree.getroot()
+        original = root.find(tag)
+        ET.SubElement(root, tag, {**original.attrib, "id": alias, **overrides})
+        tree.write(deployment)
+
     verify = [args.deployer, "verify", deployment, "--policy-root", policies,
               "--cosign", args.cosign.resolve(), "--scratch-directory", scratch]
 
@@ -221,6 +228,46 @@ def main():
     link.symlink_to(signed)
     configure(link)
     check("reject-module-symlink", verify, False)
+    for artifact, option, verdict in (
+        (unsigned, "--allow-unsigned", "Unsigned"),
+        (changed, "--allow-invalid-signature", "Invalid"),
+    ):
+        configure(artifact)
+        add_instance_alias("vm", "backup")
+        artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        primary = [*verify, option, "body=" + artifact_digest]
+        check("single-wasm-exception-is-instance-specific-" + verdict, primary, False)
+        assert f'{verdict} signature rejected for "backup"' in results[-1]["stderr"]
+        check("both-wasm-exceptions-explicit-" + verdict, [*primary, option, "backup=" + artifact_digest], True)
+
+    if args.vendor_elf:
+        for image, option, verdict in (
+            (unsigned_elf, "--allow-unsigned-elf", "Unsigned"),
+            (tampered_elf, "--allow-invalid-elf-signature", "Invalid"),
+        ):
+            elf.write_bytes(image)
+            artifact_digest = hashlib.sha256(image).hexdigest()
+            configure(signed, driver={**attrs, "sha256": artifact_digest})
+            add_instance_alias("driver", "standby", **{"hardware-id": "standby-device"})
+            primary = [*trace, option, "vendor=" + artifact_digest]
+            check("single-elf-exception-is-instance-specific-" + verdict, primary, False)
+            assert f'{verdict} ELF signature rejected for "standby"' in results[-1]["stderr"]
+            check("both-elf-exceptions-explicit-" + verdict, [*primary, option, "standby=" + artifact_digest], True)
+        elf.write_bytes(unsigned_elf)
+        elf_digest = hashlib.sha256(unsigned_elf).hexdigest()
+        wasm_digest = hashlib.sha256(unsigned.read_bytes()).hexdigest()
+        configure(unsigned, driver={**attrs, "sha256": elf_digest})
+        add_instance_alias("vm", "backup")
+        add_instance_alias("driver", "standby", **{"hardware-id": "standby-device"})
+        primary = [*trace, "--allow-unsigned-elf", "vendor=" + elf_digest,
+                   "--allow-unsigned", "body=" + wasm_digest]
+        allow_standby = ["--allow-unsigned-elf", "standby=" + elf_digest]
+        allow_backup = ["--allow-unsigned", "backup=" + wasm_digest]
+        check("mixed-wasm-exceptions-leave-second-elf-denied", [*primary, *allow_backup], False)
+        assert 'Unsigned ELF signature rejected for "standby"' in results[-1]["stderr"]
+        check("mixed-elf-exceptions-leave-second-wasm-denied", [*primary, *allow_standby], False)
+        assert 'Unsigned signature rejected for "backup"' in results[-1]["stderr"]
+        check("mixed-bundle-requires-four-explicit-decisions", [*primary, *allow_standby, *allow_backup], True)
     assert not list(scratch.iterdir()), "a verifier snapshot survived the operation"
     print(f"{len(results)} real command outcomes matched; staging empty")
 

@@ -50,7 +50,7 @@ scripts/sign-file sha384 publisher.key publisher.pem driver.so driver.signed.so
 sha256sum driver.signed.so
 ```
 
-默认拒绝无签名和签名错误的 ELF。仅在预检时，可分别用 `--allow-unsigned-elf DRIVER=SHA256` 和 `--allow-invalid-elf-signature DRIVER=SHA256` 放行匹配驱动 ID、完整摘要和拒绝原因的制品，并显示警告。损坏的封装、信任错误和未知验签失败仍会拒绝。Wasm 放行参数只作用于 Wasm。管理员须从固定的 ELF 信任库移除已吊销或失陷的证书。
+默认拒绝无签名和签名错误的 ELF。仅在预检时，可分别用 `--allow-unsigned-elf DRIVER=SHA256` 和 `--allow-invalid-elf-signature DRIVER=SHA256` 放行匹配驱动 ID、完整摘要和拒绝原因的制品，并显示警告。即使文件内容相同，每个驱动 ID 也须单独放行。Wasm 同样按 VM ID 分别放行。损坏的封装、信任错误和未知验签失败仍会拒绝。管理员须从固定的 ELF 信任库移除已吊销或失陷的证书。
 
 ## 运行已审核的 VM
 

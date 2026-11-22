@@ -59,7 +59,7 @@ scripts/sign-file sha384 publisher.key publisher.pem driver.so driver.signed.so
 sha256sum driver.signed.so
 ```
 
-Unsigned and invalidly signed ELFs fail by default. The preflight-only options `--allow-unsigned-elf DRIVER=SHA256` and `--allow-invalid-elf-signature DRIVER=SHA256` are separate, digest-bound exceptions and emit warnings. Malformed envelopes, missing trust and unknown verifier errors fail even with an exception. The Wasm exceptions apply only to Wasm. Administrators must remove revoked or compromised certificates from the pinned ELF trust store.
+Unsigned and invalidly signed ELFs fail by default. The preflight-only options `--allow-unsigned-elf DRIVER=SHA256` and `--allow-invalid-elf-signature DRIVER=SHA256` are separate, digest-bound exceptions and emit warnings. Specify an exception separately for each affected driver ID, even if several drivers use identical bytes. Wasm exceptions likewise require one decision per VM ID. Malformed envelopes, missing trust and unknown verifier errors fail even with an exception. Administrators must remove revoked or compromised certificates from the pinned ELF trust store.
 
 ## Run reviewed VM processes
 
