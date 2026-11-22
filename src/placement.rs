@@ -46,6 +46,21 @@ impl Set {
         requested.0.iter().all(|(first, last)| self.0.iter()
             .any(|(a, b)| a <= first && last <= b))
     }
+    /// Compare explicit normalized CPU/NUMA lists without expanding them.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let mut left = self.0.iter().peekable();
+        let mut right = other.0.iter().peekable();
+        while let (Some(&(a, b)), Some(&(c, d))) = (left.peek().copied(), right.peek().copied()) {
+            if b < c {
+                left.next();
+            } else if d < a {
+                right.next();
+            } else {
+                return true;
+            }
+        }
+        false
+    }
     /// Construct outside pre_exec; the child only borrows these native words.
     /// Linux sched_setaffinity accepts a dynamically sized unsigned-long mask.
     pub fn affinity(&self) -> Vec<libc::c_ulong> {
@@ -91,5 +106,14 @@ mod tests {
             assert_eq!((mask[bit / width] >> (bit % width)) & 1 != 0,
                        bit < 64 || [65, 4095, 8191].contains(&bit));
         }
+    }
+
+    #[test]
+    fn overlap_includes_shared_boundaries_but_not_adjacent_ranges() {
+        let a = Set::parse("0-2,7,10-12").unwrap();
+        let intersects = Set::parse("2-3,13").unwrap();
+        let disjoint = Set::parse("3-6,8-9,13").unwrap();
+        assert!(a.overlaps(&intersects) && intersects.overlaps(&a));
+        assert!(!a.overlaps(&disjoint) && !disjoint.overlaps(&a));
     }
 }

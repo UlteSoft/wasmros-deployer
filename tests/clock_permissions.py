@@ -5,10 +5,10 @@ import hashlib
 import importlib.util
 import json
 import os
-import pty
 from pathlib import Path
 import subprocess
 import xml.etree.ElementTree as ET
+from deployment_review import terminal_run
 
 CLOCKS = ("realtime", "monotonic", "process", "thread")
 
@@ -174,34 +174,22 @@ def main():
                   **{"memory-bytes": "134217728", "pids": "8"})
     ET.ElementTree(plan).write(manifest)
     command = list(map(str, (a.deployer, "review", manifest, "--policy-root", policies)))
-    master, slave = pty.openpty()
-    try:
-        with subprocess.Popen(command, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as review:
-            os.write(master, b"allow wasip1.clock_time_get\nallow wasip1.clock.monotonic-clock\n"
+    code, log = terminal_run(command, b"allow wasip1.clock_time_get\nallow wasip1.clock.monotonic-clock\n"
                              b"allow wasip1.clock.realtime-clock\ndeny wasip1.clock.realtime-clock\n"
                              b"remove wasip1.clock.realtime-clock\nallow wasip1.sock_open\nconfirm\n")
-            try:
-                stdout, stderr = review.communicate(timeout=20)
-            except subprocess.TimeoutExpired:
-                review.kill()
-                review.communicate()
-                raise
-        (out / "manual.log").write_bytes(stdout + stderr)
-        commands.append({"label": "manual", "argv": command, "exit": review.returncode})
-        if review.returncode or b"registered interface" not in stderr:
-            raise ValueError("manual permission review did not reject an unsupported key")
-        line, = [line for line in stdout.decode().splitlines() if line.startswith("VM argv ")]
-        argv = json.loads(line.removeprefix("VM argv "))
-        start = argv.index("--wasip1-single-create")
-        expected = ["--wasip1-single-create", "manual", "--wasip1-single-enable", "manual",
-                    "--wasip1-single-grant", "manual", "monotonic-clock",
-                    "--wasip1-single-interface", "manual", "clock_time_get", "allow"]
-        if argv[start:argv.index("--secure")] != expected:
-            raise ValueError("manual approval modified unexpected permissions")
-        report["manual_review"] = True
-    finally:
-        os.close(slave)
-        os.close(master)
+    (out / "manual.log").write_text(log)
+    commands.append({"label": "manual", "argv": command, "exit": code})
+    if code or "registered interface" not in log:
+        raise ValueError("manual permission review did not reject an unsupported key")
+    line, = [line for line in log.splitlines() if line.startswith("VM argv ")]
+    argv = json.loads(line.removeprefix("VM argv "))
+    start = argv.index("--wasip1-single-create")
+    expected = ["--wasip1-single-create", "manual", "--wasip1-single-enable", "manual",
+                "--wasip1-single-grant", "manual", "monotonic-clock",
+                "--wasip1-single-interface", "manual", "clock_time_get", "allow"]
+    if argv[start:argv.index("--secure")] != expected:
+        raise ValueError("manual approval modified unexpected permissions")
+    report["manual_review"] = True
     report["complete"] = True
     save()
     print(len(cases), "signed per-VM clock cases passed")

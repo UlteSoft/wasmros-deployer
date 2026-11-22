@@ -206,6 +206,12 @@ impl FrozenFile {
         PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
     }
 }
+
+/// Read the exact declared module for a non-executing review without granting
+/// authority. The signature verifier remains required for deployment.
+pub fn snapshot_for_review(file: File, expected: &str) -> Result<FrozenFile> {
+    FrozenFile::copy(file, MAX_MODULE, Some(expected))
+}
 pub struct Admission {
     pub module: FrozenFile,
     pub signature: Signature,

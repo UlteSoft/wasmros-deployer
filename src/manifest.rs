@@ -29,7 +29,7 @@ impl Engine {
         }
     }
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Process {
     pub id: String,
     pub engine: Engine,
@@ -50,7 +50,7 @@ pub struct Process {
     pub cpus: Option<crate::placement::Set>,
     pub memory_nodes: Option<crate::placement::Set>,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DriverArtifact {
     pub id: String,
     pub file: PathBuf,
@@ -61,7 +61,7 @@ pub struct DriverArtifact {
     pub elf_signer: Option<PathBuf>,
     pub attachment: Option<DriverAttachment>,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DriverAttachment {
     pub vm: String,
     pub alias: String,

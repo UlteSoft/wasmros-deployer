@@ -18,7 +18,8 @@ import shutil
 import subprocess
 import tarfile
 import time
-from qemu_supervisor import pack, digest
+from qemu_supervisor import build_review_terminal, pack, digest
+from vendor_qualification import cgroup
 
 
 def main():
@@ -27,14 +28,13 @@ def main():
         p.add_argument('--'+name,type=Path,required=True)
     a=p.parse_args();a.output=a.output.resolve()
     assert '.tmp' in a.output.parts
-    group=Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
-    assert Path('/proc/self/cgroup').read_text().strip()=='0::/'+str(group.relative_to('/sys/fs/cgroup'))
-    assert (group/'memory.max').read_text().strip()=='68719476736' and (group/'memory.swap.max').read_text().strip()=='0'
+    group=cgroup()
     baseline=json.loads((a.baseline/'results.json').read_text());assert baseline['complete']
     a.output.mkdir(exist_ok=False)
     root=a.output/'root';shutil.copytree(a.baseline/'root',root,symlinks=True)
     source=Path(__file__).with_name('qemu_powerloss_guest.sh')
     shutil.copyfile(source,root/'init');(root/'init').chmod(0o755)
+    terminal_source=build_review_terminal(root)
     for app in ('insmod','dd','rm'):
         path=root/'bin'/app
         if not path.exists():path.symlink_to('busybox')
@@ -68,7 +68,7 @@ def main():
     base=[old[0],'-nodefaults','-machine','q35','-accel','tcg,thread=multi','-cpu','max','-smp','2','-m','2048','-display','none','-serial','stdio','-monitor','none','-nic','none','-no-reboot',
           '-bios',value('-bios'),'-L',value('-L'),'-kernel',value('-kernel'),'-initrd',str(image),
           '-drive',f'file={disk},format=raw,if=none,id=state,cache=writeback','-device','virtio-blk-pci,drive=state,serial=wros-test']
-    inputs=[Path(__file__).resolve(),source,Path(__file__).with_name('qemu_supervisor.py'),a.baseline/'results.json',a.kernel_package,a.ext4_package,a.storage_package,
+    inputs=[Path(__file__).resolve(),source,terminal_source,Path(__file__).with_name('qemu_supervisor.py'),a.baseline/'results.json',a.kernel_package,a.ext4_package,a.storage_package,
             root/'bin/wros-deployer',root/'bin/uwvm2-ros',root/'bin/cosign',Path(value('-kernel'))]
     results={'complete':False,'scope':'x86_64 QEMU power loss, kernel boot identity, durable cold starts and ENOSPC; no physical safety or systemd claim',
              'inputs':{str(path.resolve()):digest(path) for path in inputs},'disk_bytes':disk.stat().st_size,'cases':[],

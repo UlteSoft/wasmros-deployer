@@ -15,11 +15,21 @@ import shutil
 import stat
 import subprocess
 import time
+from vendor_qualification import cgroup
 
 
 def digest(path):
     with open(path, "rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def build_review_terminal(root):
+    source = Path(__file__).with_name("support") / "review_terminal.c"
+    binary = root / "bin/review-terminal"
+    subprocess.run(["/usr/bin/cc", "-static", "-O3", "-g", "-Wall", "-Wextra",
+                    "-Werror", source, "-o", binary], check=True, timeout=45)
+    binary.chmod(0o755)
+    return source
 
 
 def pack(root,archive):
@@ -73,10 +83,7 @@ def main():
         p.error('guest time limit must be between 30 and 1800 seconds')
     if not (1 << 20) <= args.sdk_memory_bytes <= (2 << 30):
         p.error('choose an SDK memory budget between 1 MiB and 2 GiB for this 4 GiB test guest')
-    group=Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
-    assert Path('/proc/self/cgroup').read_text().strip()=='0::/'+str(group.relative_to('/sys/fs/cgroup'))
-    assert (group/'memory.max').read_text().strip()=='68719476736'
-    assert (group/'memory.swap.max').read_text().strip()=='0'
+    group=cgroup()
     if args.sdk_aot_policy and args.sdk_engine != 'aot':
         p.error('--sdk-aot-policy requires --sdk-engine aot')
     args.output=args.output.resolve()
@@ -103,6 +110,7 @@ def main():
     for app in ('sh','mount','mkdir','chmod','chown','sha256sum','grep','cat','cut','sleep','poweroff','rmdir','wc','tail','awk','cp','dd','ln','rm'):
         (root/'bin'/app).symlink_to('busybox')
     copy(source/'qemu_supervisor_guest.sh','/init')
+    review_terminal=build_review_terminal(root)
     for name in ('body.wasm','unsigned.wasm'):
         copy(args.admission_fixture/'bundle'/name,'/bundle/'+name,0o644)
     copy(args.sdk_module,'/bundle/sdk.wasm',0o644)
@@ -165,7 +173,7 @@ def main():
           '-kernel',str(args.kernel),'-initrd',str(archive),'-append',
           'console=ttyS0 quiet panic=-1 rdinit=/init cgroup_no_v1=all']
     result={'complete':False,'scope':'x86_64 disposable kernel, no physical robot or systemd recovery qualification',
-            'sdk_memory_bytes':args.sdk_memory_bytes,'sdk_engine':args.sdk_engine,'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',Path(__file__)]}}
+            'sdk_memory_bytes':args.sdk_memory_bytes,'sdk_engine':args.sdk_engine,'argv':argv,'compile':compile_argv,'inputs':{str(path.resolve()):digest(path) for path in [args.kernel,args.bios,args.deployer,args.vm,args.cosign,args.sdk_module,source/'qemu_supervisor_guest.sh',source/'supervisor_peer.c',review_terminal,Path(__file__)]}}
     receipt=args.output/'results.json'
     result['guest_time_limit_seconds'] = args.guest_timeout_seconds
     result['accelerator'] = args.accelerator

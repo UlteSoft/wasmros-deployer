@@ -10,7 +10,7 @@ Every deployed VM requires [kernel device access control](device-isolation.md).
 The module also supplies exact-device rules and original-owner reservations for
 trusted external provisioners. Native lifecycle integration remains separate.
 
-Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. The explicit `--accept-recommendations` option emits a warning. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
+Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. Use `show` to see updated scores and `cancel` to leave the review. The `--accept-recommendations` option pre-fills the editor and emits a warning. Each VM still needs confirmation. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
 
 ```xml
 <deployment id="cell">
@@ -105,12 +105,22 @@ Every child first joins its assigned group, creates network, IPC, UTS, mount and
 
 Normal signed runs use two rollback stores. Initialize `policy` for privileged admission and `vm-policy` for the dedicated VM user, using the official wasm-cosign policy initializer. The policies must have identical trust roots, signer rules, algorithm allowlists, versions and limits; only `state_dir` may differ. Provision the VM state directory and its initialized files with the VM's ownership, directory mode 0700 and file mode 0600. Keep both policy files administrator-owned and readable by the VM. Do not copy a rollback record after changing its policy paths: records bind the policy fingerprint. A fresh deployment needs correctly initialized stores for its actual paths. The VM performs the second verification itself.
 
-The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. `--accept-recommendations` bypasses interactive edits only for this invocation and emits its own warning. It does not change signature requirements. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
+The signature exceptions from `verify` also apply to `run`, with an individual digest-bound warning. The terminal editor shows the available decisions for every VM. `--accept-recommendations` pre-fills those decisions and retains the editor and confirmation. After confirming each VM and seeing the exact arguments, type `deploy DEPLOYMENT_ID` to start. A closed terminal or missing confirmation stops the launch. The command prints configuration and the full VM argument vector; it does not register a boot service even when XML records boot intent.
 
 Each managed VM starts with `--runtime-memtag-mode sync` and
 `--runtime-memtag-action crash`. A detected tag mismatch terminates the VM at
 the fault. A guest built without WasmMTE instructions or tag metadata continues
 to run ordinary Wasm with its normal bounds checks.
+
+The review scores observed permissions from 0 to 10. Read-only clocks score 0,
+while controls with potential hardware effects and digest-bound signature
+exceptions receive high scores. `UNASSESSED` indicates missing assessment
+evidence. Scores describe the effect of granting an operation and confer no
+authority. The review shows overlapping explicit CPU and NUMA placement and
+shared native sandbox paths. It inventories import declarations from the
+digest-bound Wasm. Imported namespaces identify a link interface and may be
+host services. This manifest cannot declare preloaded Wasm or authorize
+arbitrary host mounts or folders.
 
 ## CPU and NUMA placement
 
@@ -136,7 +146,7 @@ For a separately bounded manager and whole-tree service shutdown, use [Independe
 
 Add `--state-directory /protected/state/cell` to an operator-reviewed `run` invocation. The existing directory must be outside the submitted bundle, owned by root, with mode 0700 and protected ancestors. Its regular files have mode 0600 and one hard link. One exclusive lock covers admission, supervision and cleanup. Never share, copy, edit or roll back a live state directory. Each deployment needs its own state directory and delegated workload subtree.
 
-After the complete review and signature checks, the deployer stores the selected import permissions and any exact-digest signature exceptions. This includes decisions accepted through the explicitly warned `--accept-recommendations` option. Automatic invocations reuse that stored decision; they do not reread recommendations or silently accept newly recommended permissions. The binding covers the exact XML bytes, absolute manifest/state/cgroup/policy paths, runtime/verifier/deployer executable hashes and both policy files. Changing those inputs requires a separate operator-reviewed deployment after the previous deployment has safely stopped. This command does not implement live updates.
+After the complete review and signature checks, the deployer stores the selected import permissions and any exact-digest signature exceptions. Automatic invocations reuse that stored decision; they do not reread recommendations or silently accept newly recommended permissions. The binding covers the exact XML bytes, absolute manifest/state/cgroup/policy paths, runtime/verifier/deployer executable hashes and both policy files. Changing those inputs requires a separate operator-reviewed deployment after the previous deployment has safely stopped. This command does not implement live updates.
 
 The ultimate service manager may invoke the following command using the same paths and executables:
 

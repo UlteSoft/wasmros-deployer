@@ -67,7 +67,7 @@ XML 必须单独声明管理进程预算：
   --supervisor-cgroup /sys/fs/cgroup/system.slice/wros-cell.service
 ```
 
-默认必须通过终端逐项审核。显式使用 `--accept-recommendations` 才能直接采纳推荐，并产生警告。无签名和错误签名例外仍分别绑定一个 VM 与准确摘要。状态已被其他部署器持有，或服务根还有进程时，`authorize` 拒绝改写授权，不会为替换配置而停止旧部署。
+必须通过终端审核。`--accept-recommendations` 预填建议并显示警告，操作员仍可逐项修改。确认所有 VM 后，输入 `authorize 部署ID` 保存审核结果。无签名和错误签名例外仍分别绑定一个 VM 与准确摘要。状态已被其他部署器持有，或服务根还有进程时，`authorize` 拒绝改写授权，不会为替换配置而停止旧部署。
 
 审核完成后，以相同路径生成服务文件：
 

@@ -8,6 +8,9 @@ $b mount -t proc proc /proc
 $b mount -t sysfs sysfs /sys
 $b mount -t cgroup2 none /sys/fs/cgroup
 $b mknod -m 0444 /dev/urandom c 1 9
+$b mknod -m 0666 /dev/ptmx c 5 2
+$b mkdir /dev/pts
+$b mount -t devpts devpts /dev/pts
 $b mkdir -m 700 /run/scratch /run/vm
 g=/sys/fs/cgroup
 $b mkdir "$g/manager" "$g/workloads" "$g/sensor"
@@ -29,16 +32,32 @@ $b chmod 644 /trust/vm.policy
 $b chown -R 24101:24101 /run/vm
 
 elf_check=/bin/uwvm2-ros
+command() {
+    manifest=$1
+    shift
+    "$@" /bin/wros-deployer run "/bundle/$manifest.xml" --policy-root /trust \
+        --runtime /bin/uwvm2-ros --cosign /bin/cosign --scratch-directory /run/scratch \
+        --elf-verifier "$elf_check" --driver-root /sandboxes \
+        --cgroup-parent "$g/workloads" --accept-recommendations
+}
 run() {
     manifest=$1
     shift
-    /bin/wros-deployer run "/bundle/$manifest.xml" --policy-root /trust \
+    /bin/review-terminal /bin/wros-deployer run "/bundle/$manifest.xml" --policy-root /trust \
         --runtime /bin/uwvm2-ros --cosign /bin/cosign --scratch-directory /run/scratch \
         --elf-verifier "$elf_check" --driver-root /sandboxes \
         --cgroup-parent "$g/workloads" --accept-recommendations "$@"
 }
 
 # Failure precedes any native process or deployment cgroup creation.
+if command signed </dev/null >/run/no-terminal.log 2>&1; then exit 1; fi
+$b grep -F 'interactive review requires stdin, stdout and stderr on the same terminal' /run/no-terminal.log
+test ! -e "$g/workloads/wros-unitree"
+echo 'CASE rejects-noninteractive-review PASS'
+if command signed /bin/review-terminal --fixture-cancel >/run/cancelled.log 2>&1; then exit 1; fi
+$b grep -F 'operator cancelled review' /run/cancelled.log
+test ! -e "$g/workloads/wros-unitree"
+echo 'CASE cancelled-review-does-not-start PASS'
 if run unsigned >/run/unsigned.log 2>&1; then exit 1; fi
 $b grep -F 'Unsigned ELF signature rejected for "unitree"' /run/unsigned.log
 test ! -e "$g/workloads/wros-unitree"
@@ -64,7 +83,7 @@ elf_check=/bin/test-elf-verifier
 echo test > /run/withdraw-signer
 if run signer-withdrawn >/run/withdrawn.log 2>&1; then exit 1; fi
 $b grep -F 'passed launch signature policy' /run/withdrawn.log && exit 1
-$b grep -F 'launch verification refused before exec' /run/withdrawn.log
+$b grep -F 'could not revalidate the reviewed deployment before launch' /run/withdrawn.log
 test ! -e "$g/workloads/wros-unitree"
 echo 'CASE withdrawn-signer-denied-before-exec PASS'
 elf_check=/bin/uwvm2-ros

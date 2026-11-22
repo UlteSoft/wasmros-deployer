@@ -18,7 +18,14 @@ configure() {
     printf '<deployment id="%s"><supervisor memory-bytes="268435456" pids="64" cpu-micros="50000" cpus="0" memory-nodes="0"/><vm id="%s" module="%s" sha256="%s" policy="body.policy" memory-bytes="134217728" pids="8" uid="%s" gid="%s" restart-on-crash="%s" restart-limit="%s" restart-delay-ms="100" cpus="1" memory-nodes="1"/></deployment>\n' "$caseid" "$vmid" "$image" "$digest" "$case_uid" "$case_uid" "$crash" "$limit" > /bundle/$caseid.xml
 }
 command() {
-    "$program" "$1" "$manifest" --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch --runtime "$runtime" --state-directory "$state" --supervisor-cgroup "$cg" ${2:+"$2"} ${3:+"$3"} ${4:+"$4"}
+    action=$1; shift
+    if test "$action" = authorize; then
+        set -- /bin/review-terminal "$program" "$action" "$manifest" "$@"
+    else
+        set -- "$program" "$action" "$manifest" "$@"
+    fi
+    "$@" --policy-root /trust --cosign /bin/cosign --scratch-directory /scratch \
+        --runtime "$runtime" --state-directory "$state" --supervisor-cgroup "$cg"
 }
 authorize() { command authorize --accept-recommendations --allow-unsigned "$vmid=$digest" > /$caseid-review.log 2>&1 || { cat /$caseid-review.log; fail authorization; }; }
 install() {

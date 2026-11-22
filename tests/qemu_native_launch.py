@@ -158,6 +158,9 @@ def main():
         (root / name).mkdir(parents=True, exist_ok=True)
     stage_fixture(args.base, root)
     (root / "bin/sh").symlink_to("busybox")
+    review_terminal = Path(__file__).with_name("support") / "review_terminal.c"
+    subprocess.run(["/usr/bin/cc", "-O2", "-static", "-Wall", "-Wextra", "-Werror",
+                    review_terminal, "-o", root / "bin/review-terminal"], check=True, timeout=45)
     # The packer writes fresh regular inodes in the guest for these hard links.
     for name, path in (("uwvm2-ros", args.vm), ("cosign", args.cosign)):
         if path.stat().st_mode & 0o022:
@@ -183,7 +186,7 @@ def main():
             "-kernel", args.kernel, "-initrd", initrd,
             "-append", "console=ttyS0 quiet panic=-1 rdinit=/init cgroup_no_v1=all"]
     inputs = [args.base_receipt, args.module, args.vm, args.cosign, args.sign_file,
-              args.deployer, args.kernel, entry, contract, helper]
+              args.deployer, args.kernel, entry, contract, helper, review_terminal]
     receipt = {"inputs": {str(path): digest(path) for path in inputs},
                "deployment_binary_sha256": digest(root / "bin/wros-deployer"),
                "initramfs_sha256": digest(initrd), "cgroup": str(group), "argv": list(map(str, argv))}
@@ -195,7 +198,8 @@ def main():
     expected = {"rejects-unsigned-by-default", "rejects-invalid-by-default",
                 "rejects-wrong-exception-id", "rejects-wrong-exception-digest",
                 "rejects-wrong-exception-kind", "requires-per-driver-permission",
-                "withdrawn-signer-denied-before-exec", "production-signed",
+                "withdrawn-signer-denied-before-exec", "rejects-noninteractive-review",
+                "cancelled-review-does-not-start", "production-signed",
                 "production-signed-int", "production-unsigned", "production-invalid",
                 "production-sealed-replacement"}
     receipt["complete"] = (result.returncode == 0 and "WROS_NATIVE_LAUNCH_PASS" in transcript

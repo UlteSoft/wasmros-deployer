@@ -8,7 +8,7 @@
 每个部署的 VM 必须启用[内核设备访问控制](device-isolation.md)。该模块同时提供
 确切设备规则和原部署器归属登记；native 驱动生命周期仍需独立联动。
 
-`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。显式使用 `--accept-recommendations` 会显示警告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
+`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。输入 `show` 可重新查看评分，输入 `cancel` 可退出。使用 `--accept-recommendations` 会预填建议并显示警告，每个 VM 仍须确认。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
 
 ```xml
 <deployment id="cell">
@@ -96,11 +96,13 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
 
 正常签名部署需要两个反回滚状态库。用官方 wasm-cosign 初始化器分别初始化特权准入的 `policy` 和 VM 用户的 `vm-policy`；两份策略的信任根、签名者、算法、版本和限制必须完全一致，只允许 `state_dir` 不同。VM 状态目录及其中初始化文件属于 VM 用户，目录权限 0700、文件权限 0600；策略文件仍归管理员持有，并允许 VM 读取。不能修改策略路径后直接复制旧的反回滚记录，因为记录绑定策略指纹。VM 自己完成第二次校验。
 
-`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。`--accept-recommendations` 只跳过本次交互审核，不放宽签名要求。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
+`run` 接受与 `verify` 相同的逐映像签名例外，显示独立警告。审核在终端进行。`--accept-recommendations` 预填建议，仍可逐项修改。确认每个 VM 并检查完整参数后，输入 `deploy 部署ID` 才会启动。关闭终端或未确认会停止启动。命令复述配置和完整 VM 参数，但不注册开机服务；XML 中的开机意图还需要后续服务管理集成。
 
 每个受管 VM 显式使用 `--runtime-memtag-mode sync` 和
 `--runtime-memtag-action crash`。标签不匹配时，VM 在故障点终止。
 编译时关闭 WasmMTE 生成的模块按普通 Wasm 执行，仍执行原有的边界检查。
+
+审核对有明确依据的权限按 0 至 10 分评分。只读时钟为 0 分，有潜在硬件影响的控制项及逐摘要验签例外属于高风险。证据不足的项目显示为 `UNASSESSED`。分数描述授予权限的后果，不授予权限。审核显示重叠的显式 CPU、NUMA 放置及共用的原生驱动沙箱路径，并从与摘要绑定的 Wasm 中列出导入声明。导入名称是链接接口，可能对应宿主服务。当前清单未提供预加载 Wasm 或任意宿主目录挂载授权。
 
 ## CPU 与 NUMA 放置
 
@@ -126,7 +128,7 @@ SIGINT、SIGTERM 或 SIGHUP 会停止恢复，通过 pidfd 请求退出，最多
 
 在经过人工审核的 `run` 命令中加入 `--state-directory /protected/state/cell`。目录须已存在，位于提交包之外，属于 root，权限为 0700，祖先路径受保护；记录文件必须为 0600 的普通文件且只有一个硬链接。独占锁覆盖准入、执行和清理全过程。每个部署使用独立状态目录和工作负载子树；运行期间禁止复制、编辑或回滚记录。
 
-全部审核和验签通过后，部署器保存实际选定的接口权限和逐摘要签名例外。显式使用 `--accept-recommendations` 接受的权限也会被保存，后续自动启动复用这份批准，不重新应用推荐文件。绑定内容包括 XML 原始字节、清单／状态／cgroup／策略的绝对路径、部署器／VM／验签器的二进制摘要和两份策略文件。更改这些内容后，必须先安全停止原部署，再重新人工审核新部署；这不是热更新接口。
+全部审核和验签通过后，部署器保存实际选定的接口权限和逐摘要签名例外。后续自动启动复用这份批准，不重新应用推荐文件。绑定内容包括 XML 原始字节、清单／状态／cgroup／策略的绝对路径、部署器／VM／验签器的二进制摘要和两份策略文件。更改这些内容后，必须先安全停止原部署，再重新人工审核新部署；这不是热更新接口。
 
 最终服务管理器可以使用相同路径和程序调用：
 

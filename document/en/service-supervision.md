@@ -77,7 +77,7 @@ Install protected runtime, verifier and deployer binaries separately from the su
   --supervisor-cgroup /sys/fs/cgroup/system.slice/wros-cell.service
 ```
 
-The terminal review is mandatory unless the operator explicitly supplies the warning-producing `--accept-recommendations` option. Signature exceptions, if required, are individually bound to the VM and exact module digest. `authorize` refuses a populated service root or a concurrently owned state directory. It does not stop an existing deployment to replace its approval.
+The terminal review is mandatory. `--accept-recommendations` only pre-fills the editor. Confirm each VM and type `authorize DEPLOYMENT_ID` to persist the reviewed authorization. Signature exceptions, if required, are individually bound to the VM and exact module digest. `authorize` refuses a populated service root or a concurrently owned state directory. It does not stop an existing deployment to replace its approval.
 
 After review, render the unit with the same paths:
 

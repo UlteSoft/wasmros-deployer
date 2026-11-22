@@ -2,9 +2,10 @@
 use manifest::{deployment, local_file, recommendations, sha256, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use wros_deployer::{driver as native, manifest, service, state, supervisor, verdict::Signature, verification};
+use wros_deployer::{driver as native, guest_imports, manifest, service, state, supervisor, verdict::Signature, verification};
+
+mod review;
 
 /// Bind every automatic invocation to the exact reviewed configuration and
 /// executable/trust-policy bytes. Recommendation files are not read on resume:
@@ -21,7 +22,7 @@ fn binding(
         h.update((value.len() as u64).to_le_bytes());
         h.update(value);
     };
-    add(b"wros reviewed local cold start");
+    add(b"wros reviewed local cold start with operator assessment v2");
     add(xml.as_bytes());
     add(manifest.as_os_str().as_encoded_bytes());
     for name in ["--runtime", "--cosign"] {
@@ -32,7 +33,13 @@ fn binding(
     }
     add(sha256(std::fs::File::open("/proc/self/exe").map_err(|e| e.to_string())?)?.as_bytes());
     for name in ["--cgroup-parent", "--policy-root", "--state-directory"] {
-        let p = options.get(name).ok_or("missing deployment path")?;
+        let Some(p) = options.get(name) else {
+            if name == "--state-directory" {
+                add(b"no durable approval");
+                continue;
+            }
+            return Err("missing deployment path".into());
+        };
         if name == "--cgroup-parent" && options.contains_key("--supervisor-cgroup") {
             // The independently managed service does not exist during initial
             // authorization. Bind its exact future name; resume opens and
@@ -58,75 +65,22 @@ fn binding(
             add(sha256(std::fs::File::open(p).map_err(|e| e.to_string())?)?.as_bytes());
         }
     }
+    if !plan.drivers.is_empty() {
+        let verifier = verification::protected(options.get("--elf-verifier").ok_or("missing ELF verifier")?, root, false)?;
+        add(verifier.as_os_str().as_encoded_bytes());
+        add(sha256(std::fs::File::open(verifier).map_err(|e| e.to_string())?)?.as_bytes());
+        let driver_root = verification::protected(options.get("--driver-root").ok_or("missing driver root")?, root, true)?;
+        add(driver_root.as_os_str().as_encoded_bytes());
+        for driver in &plan.drivers {
+            let name = driver.elf_signer.as_ref().ok_or("missing ELF signer policy")?;
+            let signer = verification::policy(&options["--policy-root"], name, root)?;
+            add(signer.as_os_str().as_encoded_bytes());
+            add(sha256(std::fs::File::open(signer).map_err(|e| e.to_string())?)?.as_bytes());
+        }
+    }
     Ok(format!("{:x}", h.finalize()))
 }
 
-fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>> {
-    if !io::stdin().is_terminal() {
-        return Err("interactive review requires a terminal".into());
-    }
-    for (name, enabled) in &mut rights {
-        loop {
-            eprint!(
-                "{name} [recommended {}] allow or deny? ",
-                if *enabled { "allow" } else { "deny" }
-            );
-            io::stderr().flush().map_err(|e| e.to_string())?;
-            let mut answer = String::new();
-            if io::stdin()
-                .read_line(&mut answer)
-                .map_err(|e| e.to_string())?
-                == 0
-            {
-                return Err("review cancelled".into());
-            }
-            match answer.trim() {
-                "allow" => {
-                    *enabled = true;
-                    break;
-                }
-                "deny" => {
-                    *enabled = false;
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-    loop {
-        eprint!("additional edits [allow NAME | deny NAME | remove NAME | confirm]: ");
-        io::stderr().flush().map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        if io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?
-            == 0
-        {
-            return Err("review cancelled".into());
-        }
-        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["confirm"] => match manifest::reviewed_grants(&rights) {
-                Ok(_) => break,
-                Err(error) => eprintln!("{error}"),
-            },
-            [action, name] if manifest::Permission::from_key(name).is_some() => match *action {
-                "allow" | "deny" => {
-                    if rights.len() >= manifest::MAX_PERMISSIONS && !rights.contains_key(*name) {
-                        eprintln!("permission count exceeds budget; remove a decision before adding another");
-                    } else {
-                        rights.insert(name.to_string(), *action == "allow");
-                    }
-                }
-                "remove" => {
-                    rights.remove(*name);
-                }
-                _ => eprintln!("unknown action"),
-            },
-            _ => eprintln!("enter a registered interface, a clock read permission or a local/, metadata/, report/ or driver/ decision, or confirm"),
-        }
-    }
-    Ok(rights)
-}
 fn run() -> Result<()> {
     let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
@@ -297,6 +251,11 @@ fn run() -> Result<()> {
     }
     let executing = matches!(action.as_str(), "run" | "resume");
     let authorizing = action == "authorize";
+    let interactive = matches!(action.as_str(), "review" | "authorize" | "run");
+    if interactive {
+        review::require_terminal()?;
+    }
+    let manifest_digest = format!("{:x}", Sha256::digest(xml.as_bytes()));
     let execution = if executing || authorizing {
         if plan.supervisor.is_some() && !options.contains_key("--supervisor-cgroup") {
             return Err(
@@ -327,10 +286,12 @@ fn run() -> Result<()> {
     if (action == "resume" || authorizing) && journal.is_none() {
         return Err("authorize/resume require a durable state directory".into());
     }
-    let approved_binding = if let Some(j) = &journal {
+    let approved_binding = if executing || authorizing {
         let value = binding(&xml, &manifest, &plan, &options, root)?;
-        if j.existing() || action == "resume" {
-            j.check(&value)?;
+        if let Some(j) = &journal {
+            if j.existing() || action == "resume" {
+                j.check(&value)?;
+            }
         }
         Some(value)
     } else {
@@ -373,10 +334,11 @@ fn run() -> Result<()> {
     }
     if accept {
         eprintln!(
-            "WARNING: accepting recommendations without individual review for this invocation"
+            "WARNING: recommendations pre-filled for this terminal review; decisions remain editable and require explicit confirmation."
         )
     }
-    println!("deployment {:?}", plan.id);
+    println!("deployment {:?}; manifest SHA256 {manifest_digest}", plan.id);
+    review::show_deployment(&plan);
     for (id, (digest, _)) in &elf_exceptions {
         if !plan
             .drivers
@@ -389,7 +351,10 @@ fn run() -> Result<()> {
         }
     }
     let mut native_launches = BTreeMap::new();
-    for driver in plan.drivers {
+    for driver in &plan.drivers {
+        if let Some((_, kind)) = elf_exceptions.get(&driver.id) {
+            review::show_signature_exception(*kind);
+        }
         if executing {
             let elf = options.get("--elf-verifier").ok_or("run requires --elf-verifier for native drivers")?;
             let driver_root = options.get("--driver-root").ok_or("run requires --driver-root for native drivers")?;
@@ -399,20 +364,20 @@ fn run() -> Result<()> {
                      driver.id, vm, attachment.alias, attachment.sandbox, attachment.identity,
                      attachment.memory_bytes, attachment.pids, attachment.cpu_micros, attachment.request_millis);
             let exception = elf_exceptions.get(&driver.id).map(|(_, kind)| *kind);
-            let admitted = verification::NativeAdmission::prepare(elf, root, &bundle, policies, &driver, exception)
+            let admitted = verification::NativeAdmission::prepare(elf, root, &bundle, policies, driver, exception)
                 .map_err(|error| format!("ELF driver {:?}: {error}", driver.id))?;
             println!("INFO Driver {:?} preflight {:?} for SHA256 {}", driver.id, admitted.verdict(), driver.digest);
             if admitted.verdict() != Signature::Verified {
                 eprintln!("WARNING: {:?} ELF launch authorized by explicit exception for {:?} at SHA256 {}",
                           admitted.verdict(), driver.id, driver.digest);
             }
-            native_launches.insert(vm, native::Launch::new(driver, admitted, driver_root, root)?);
+            native_launches.insert(vm, native::Launch::new(driver.clone(), admitted, driver_root, root)?);
             continue;
         } else if let Some((_, scratch)) = verifier {
             let elf = options
                 .get("--elf-verifier")
                 .ok_or("verify requires --elf-verifier for native drivers")?;
-            let verdict = verification::verify_driver(elf, scratch, root, &bundle, policies, &driver)
+            let verdict = verification::verify_driver(elf, scratch, root, &bundle, policies, driver)
                 .map_err(|error| format!("ELF driver {:?}: {error}", driver.id))?;
             if verdict == Signature::Verified {
                 println!("INFO ELF CMS signature verified for driver {:?}", driver.id);
@@ -433,7 +398,7 @@ fn run() -> Result<()> {
         println!("INFO Local driver {:?}, vendor version {:?}, format {:?}, file {:?}, SHA256 {}, exclusive device {:?}, encrypted local attachment required.",
                  driver.id,driver.vendor_version,driver.kind,driver.file,driver.digest,driver.hardware_id);
     }
-    for vm in plan.processes {
+    for vm in &plan.processes {
         let module = root.join(&vm.module);
         let file = local_file(&bundle, &vm.module)?;
         let policy = verification::policy(policies, &vm.policy, root)?;
@@ -470,6 +435,7 @@ fn run() -> Result<()> {
             }
             let admission = admission?;
             let result = admission.signature;
+            review::show_imports(&vm.id, guest_imports::inspect(&admission.module.0)?);
             if executing {
                 admitted = Some(verification::FrozenFile(supervisor::retained(
                     admission.module.0,
@@ -480,6 +446,7 @@ fn run() -> Result<()> {
                     "WARNING: operator requested {:?} signature exception for VM {:?} at SHA256 {}",
                     kind, vm.id, vm.digest
                 );
+                review::show_signature_exception(*kind);
             }
             if result == Signature::Verified {
                 println!(
@@ -495,11 +462,14 @@ fn run() -> Result<()> {
             } else {
                 return Err(format!("{:?} signature rejected for {:?}", result, vm.id));
             }
-        } else if sha256(file)? != vm.digest {
-            return Err(format!("module digest mismatch for {}", vm.id));
+        } else {
+            let image = verification::snapshot_for_review(file, &vm.digest)?;
+            review::show_imports(&vm.id, guest_imports::inspect(&image.0)?);
         }
-        if matches!(action.as_str(), "review" | "authorize" | "run") && !accept {
-            rights = approve(rights)?
+        review::show_rights(if action == "resume" { "durable approval" } else { "recommendations" }, &vm.id, &rights);
+        if interactive {
+            rights = review::approve(&vm.id, rights, accept)?;
+            review::show_rights("effective decisions", &vm.id, &rights);
         }
         let driver = native_launches.remove(&vm.id);
         if let Some(provider) = &driver {
@@ -638,7 +608,7 @@ fn run() -> Result<()> {
         println!("VM argv {:?}", argv);
         if let Some(module) = admitted {
             launches.push(supervisor::Launch {
-                process: vm,
+                process: vm.clone(),
                 module,
                 arguments: argv,
                 driver,
@@ -646,6 +616,17 @@ fn run() -> Result<()> {
         }
     }
     if let Some((runtime, parent)) = execution {
+        if interactive {
+            review::confirm_deployment(&action, &plan.id, &manifest_digest)?;
+        }
+        if supervisor::stopping() {
+            return Err("operator stop cancelled deployment before authorization".into());
+        }
+        let current_binding = binding(&xml, &manifest, &plan, &options, root)
+            .map_err(|error| format!("could not revalidate the reviewed deployment before launch: {error}"))?;
+        if Some(current_binding) != approved_binding {
+            return Err("reviewed executable, trust policy or deployment path changed before launch".into());
+        }
         if authorizing {
             if !options.contains_key("--supervisor-cgroup") {
                 wros_deployer::cgroup::require_inactive(parent)?;

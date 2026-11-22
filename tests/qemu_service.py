@@ -13,7 +13,8 @@ import re
 import shutil
 import subprocess
 import time
-from qemu_supervisor import digest, pack
+from qemu_supervisor import build_review_terminal, digest, pack
+from vendor_qualification import cgroup
 
 
 def main():
@@ -21,10 +22,7 @@ def main():
     for name in ('baseline', 'deployer', 'output'):
         parser.add_argument('--'+name, type=Path, required=True)
     args = parser.parse_args()
-    group = Path('/sys/fs/cgroup/system.slice/docker-af71cb24aa7993383f76ad9c06750b17eb66fd090a2c9ba64b544b19cda9c913.scope')
-    assert Path('/proc/self/cgroup').read_text().strip() == '0::/'+str(group.relative_to('/sys/fs/cgroup'))
-    assert (group/'memory.max').read_text().strip() == '68719476736'
-    assert (group/'memory.swap.max').read_text().strip() == '0'
+    group = cgroup()
     args.output = args.output.resolve()
     assert '.tmp' in args.output.parts
     args.output.mkdir(parents=True, exist_ok=False)
@@ -53,6 +51,8 @@ def main():
     inputs[str(Path(__file__).resolve())] = digest(Path(__file__).resolve())
     copy(source/'qemu_service_init.sh', '/init')
     copy(source/'qemu_service_guest.sh', '/service-test.sh')
+    terminal_source = build_review_terminal(root)
+    inputs[str(terminal_source)] = digest(terminal_source)
     for name in ('run', 'etc/systemd/system', 'var/log/journal', 'var/lib/systemd'):
         (root/name).mkdir(parents=True, exist_ok=True)
     (root/'etc/passwd').write_text('root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\nsystemd-journal:x:190:190:journal:/:/bin/false\n')
