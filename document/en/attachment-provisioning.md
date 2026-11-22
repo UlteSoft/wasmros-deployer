@@ -3,7 +3,7 @@
 The Rust `attachment` module provisions a dedicated channel for one admitted
 VM/provider session. It generates identities, pins already-running process
 incarnations and delivers immutable bootstrap objects. The production `run`
-path provisions one read-only native provider per configured VM. The provider
+path provisions one independently authenticated session per driver executable declaration. Each declaration selects one VM. Multiple providers for that VM use distinct aliases, UIDs, GIDs, cgroups and disjoint sandbox roots. Their VM-side reservations share the VM XML attribute `driver-budget-bytes`. Each provider must also fit its own memory budget. The provider
 receives its ID as argv[0], then the courier FD, manager PID, manager UID,
 manager GID and the literal `read-only`. The separate executable under
 `tests/support/attachment_provisioner.rs` exercises handoff edge cases.

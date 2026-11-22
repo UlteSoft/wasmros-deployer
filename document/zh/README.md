@@ -66,7 +66,7 @@ sha256sum driver.signed.so
 
 `run` 增加 `--driver-root /protected/provider-roots` 和 `--elf-verifier /opt/wros/bin/uwvm2-ros`。管理员在 `/protected/provider-roots/go2` 准备已审核的动态加载器、依赖与配置，全部归 root 所有且禁止组和其他用户写入。另需留出空的 `proc` 目录，用于挂载带 `hidepid=2,subset=pid` 的只读进程视图。原厂库可读取自身可执行文件名和时钟命名空间身份。其余目录以只读方式挂载，业务端点由部署器预先连接，实体设备授权为空。原厂共享库通过同一隔离目录中的签名 ELF 适配器接入。
 
-每个 VM 当前可连接一个独立 UID、GID 和 cgroup 的提供方。单独审核 `capability.open`、`driver.connect`、`driver.submit`、`driver.result`、`driver.disconnect` 及资源权限 `driver/joints/buffer.read`。推荐权限可用 `<driver-resource alias="joints" operation="buffer.read" access="allow"/>` 表达。驱动进程通过继承描述符完成身份交付，之后用认证 TLS 处理有界的 `buffer.read`。
+每个驱动可执行文件声明绑定一个 VM。同一 VM 可接入多个提供方，每个提供方使用独立别名、UID、GID、cgroup 和互不重叠的沙箱根目录。VM 的 XML 属性 `driver-budget-bytes` 限制全部路由预留内存之和，各提供方还须满足自己的内存上限。单独审核 `capability.open`、`driver.connect`、`driver.submit`、`driver.result`、`driver.disconnect` 及每条路由的资源权限，例如 `driver/joints/buffer.read`。推荐权限可用 `<driver-resource alias="joints" operation="buffer.read" access="allow"/>` 表达。驱动进程通过继承描述符完成身份交付，之后用认证 TLS 处理有界的 `buffer.read`。
 
 每个 `<attachment>` 可分别设置 `request-bytes` 和 `response-bytes`，缺省方向各为 32 字节。线协议每个方向最多接受 65,536 字节载荷，另有 176 字节报头。`buffer.read` 请求有三个 64 位字段，结果以八字节长度开头，例如 4,096 字节响应预算可容纳 4,088 字节传感器数据。部署器显示双向上限。任一方向超过 32 字节时评分为 6/10，可逐 attachment 确认，也可使用成对的风险开关按 6 或更高阈值采纳。部署的最终人工确认覆盖整份清单。审批清单摘要覆盖这两个值，VM 通道配置和提供方认证引导收到相同限值。
 
