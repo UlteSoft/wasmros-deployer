@@ -102,8 +102,6 @@ cgroups. It rejects an altered inventory and checks delivery of both sample type
 on guest loopback. Production native driver admission still requires the work
 described below. [Unitree SDK source](https://github.com/unitreerobotics/unitree_sdk2/tree/811bc77cdcffb4691d4b40172f9a57857bf6cffb)
 
-The VM baseline is active in production supervision. Native provider declarations
-remain refused by `run`/`resume`: reviewed resource XML, vendor adapters, physical
-identity, safe stop and native lifecycle admission still require integration.
-These primitives and the [encrypted handoff](attachment-provisioning.md) do not
-qualify arbitrary vendor drivers or establish industrial safety certification.
+The VM baseline applies to both VMs and explicitly launched read-only providers.
+The latter use a separate chroot, process identity and cgroup. Physical device
+leases, safe-stop qualification and native recovery remain separate gates.

@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cgroup;
 pub mod containment;
 pub mod devices;
+pub mod driver;
 pub mod manifest;
 pub mod ownership;
 pub mod placement;

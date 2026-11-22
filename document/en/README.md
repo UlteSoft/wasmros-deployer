@@ -4,13 +4,13 @@ Build with `cargo build --release --locked --offline`. Release builds use optimi
 
 The [encrypted attachment provisioning contract](attachment-provisioning.md)
 describes the Rust key/descriptor handoff primitives and their real-VM tests.
-It does not enable native-provider execution in the production CLI.
+The production CLI uses these primitives for explicitly reviewed read-only native providers.
 
 Every deployed VM requires [kernel device access control](device-isolation.md).
 The module also supplies exact-device rules and original-owner reservations for
 trusted external provisioners. Native lifecycle integration remains separate.
 
-Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. The explicit `--accept-recommendations` option emits a warning. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider provisioning, live update, the independent watchdog and physical safety integration remain unfinished.
+Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to check bundle paths, pinned Wasm and native driver hashes, budgets and permissions. `wros-deployer review deployment.xml --policy-root /protected/policies` opens a terminal review for each VM. At the edit prompt use `allow NAME`, `deny NAME`, `remove NAME` and `confirm`. An absent recommendation file starts with empty permissions. The explicit `--accept-recommendations` option emits a warning. These commands perform local preflight. `run` additionally admits immutable images and supervises isolated VM processes as described below. Native provider recovery, live update, the independent watchdog and physical safety integration remain unfinished.
 
 ```xml
 <deployment id="cell">
@@ -59,11 +59,27 @@ scripts/sign-file sha384 publisher.key publisher.pem driver.so driver.signed.so
 sha256sum driver.signed.so
 ```
 
-Unsigned and invalidly signed ELFs fail by default. The preflight-only options `--allow-unsigned-elf DRIVER=SHA256` and `--allow-invalid-elf-signature DRIVER=SHA256` are separate, digest-bound exceptions and emit warnings. Specify an exception separately for each affected driver ID, even if several drivers use identical bytes. Wasm exceptions likewise require one decision per VM ID. Malformed envelopes, missing trust and unknown verifier errors fail even with an exception. Administrators must remove revoked or compromised certificates from the pinned ELF trust store.
+Unsigned and invalidly signed ELFs fail by default. In `verify` and explicit `run`, `--allow-unsigned-elf DRIVER=SHA256` and `--allow-invalid-elf-signature DRIVER=SHA256` select separate, digest-bound exceptions and emit warnings. Specify an exception separately for each affected driver ID even when drivers use identical bytes. Wasm exceptions likewise require a decision for each VM ID. Malformed envelopes, missing trust and unknown verifier errors fail even with an exception. Administrators must remove revoked or compromised certificates from the pinned ELF trust store.
+
+### Launch a read-only native provider
+
+Add an attachment inside the driver's `<driver kind="executable" ...>` element.
+
+```xml
+<attachment vm="body" alias="joints" sandbox="go2" uid="24002" gid="24002"
+    contract-sha256="REPLACE_WITH_64_LOWERCASE_HEX"
+    memory-bytes="268435456" pids="32" cpu-micros="100000"/>
+```
+
+Supply `--driver-root /protected/provider-roots` and `--elf-verifier /opt/wros/bin/uwvm2-ros` to `run` along with the VM options below. The administrator provisions `/protected/provider-roots/go2` with the reviewed loader, libraries, configuration and an empty `proc` directory for a read-only process view. The mount uses `hidepid=2,subset=pid` and preserves access to the provider's own executable and time namespace. Installation must preserve root ownership and deny group and other write access. The deployer mounts this tree read-only, supplies a private loopback interface and grants zero physical devices. Vendor shared libraries run through a signed executable adapter in that root. Each provider has a distinct non-root UID, GID and cgroup. Its executable implements the inherited descriptor handshake in [attachment provisioning](attachment-provisioning.md).
+
+Review `capability.open`, `driver.connect`, `driver.submit`, `driver.result` and `driver.disconnect` separately from the resource decision `driver/joints/buffer.read`. The recommendation XML can propose the resource decision with `<driver-resource alias="joints" operation="buffer.read" access="allow"/>`. This profile accepts one attached provider per VM and uses the bounded `buffer.read` wire schema.
+
+The deployer hashes and seals the complete signed ELF before initial verification, repeats verification of the same bytes immediately before launch, and executes that inode with `execveat`. The second decision must match the first. A withdrawn or changed signer aborts launch. Native execution requires an explicit operator run. Automatic start, restart and service mode remain for VM-only deployments.
 
 ## Run reviewed VM processes
 
-The `run` command requires a root deployment supervisor and an independently provisioned cgroup v2 subtree. VM instances run as distinct non-root users. The operator reserves those OS users for WROS; the deployer additionally enforces [host-wide identity ownership](host-identities.md) across managers sharing the host registry. It does not allocate OS accounts or restrict unrelated privileged software. Runtime and verifier executables must be protected files outside the submitted bundle. Native driver declarations currently cause `run` to fail before launching any process.
+The `run` command requires a root deployment supervisor and an independently provisioned cgroup v2 subtree. VM instances and providers run with distinct non-root identities. The operator reserves those OS identities for WROS. The deployer enforces [host-wide identity ownership](host-identities.md) across managers sharing the registry. Runtime and verifier executables must be protected files outside the submitted bundle.
 
 ```xml
 <deployment id="cell">
@@ -83,7 +99,7 @@ wros-deployer run deployment.xml --policy-root /protected/policies \
   --cgroup-parent /sys/fs/cgroup/wros.service/workloads
 ```
 
-The parent cgroup must be an empty domain, owned by root without group/other write access, with finite `memory.max`, zero `memory.swap.max`, and `cpu`, `memory` and `pids` enabled in `cgroup.subtree_control`. It remains owned by the service manager. The deployer creates only its exclusive `wros-DEPLOYMENT/vm-INSTANCE` descendants. Without durable state, a pre-existing deployment directory is rejected, including leftovers from a dead supervisor. The separately locked recovery path below can reclaim only the exact previously approved instance set. The total VM memory reservations must fit the supplied parent. Keep the deployer and ultimate supervisor in separate bounded groups with their own memory headroom. Resource accounting for their images, verification buffers and logs is additional to VM reservations. Linux must support `cgroup.kill`, pidfds, `close_range`, memfd seals and the requested namespaces; unsupported isolation fails before guest execution.
+The parent cgroup must be an empty domain, owned by root without group/other write access, with finite `memory.max`, zero `memory.swap.max`, and `cpu`, `memory` and `pids` enabled in `cgroup.subtree_control`. It remains owned by the service manager. The deployer creates its exclusive `wros-DEPLOYMENT` tree with separate VM and driver children. Without durable state, a pre-existing deployment directory is rejected, including leftovers from a dead supervisor. The separately locked recovery path below can reclaim only the exact previously approved instance set. The aggregate VM and driver memory reservations must fit the supplied parent. Keep the deployer and ultimate supervisor in separate bounded groups with their own memory headroom. Resource accounting for their images, verification buffers and logs is additional to VM reservations. Linux must support `cgroup.kill`, pidfds, `close_range`, memfd seals and the requested namespaces; unsupported isolation fails before guest execution.
 
 Every child first joins its assigned group, creates network, IPC, UTS, mount and cgroup namespaces, drops supplementary groups and all real/effective/saved IDs, and enables `no_new_privs`. Immutable bytes from the sealed admission image are copied to `/tmp/wros-admitted.wasm` inside a private tmpfs, then the filesystem becomes read-only before guest execution. The tmpfs limit is 257 MiB and its allocated memory is charged to the child's cgroup. The ordinary VM no-follow loader continues to reject symlinks. The underlying executable and admitted source remain pinned. Log pipes are owned by the final guest identity so the VM can reopen its own diagnostics after dropping privileges. Other inherited descriptors close on exec. This isolates resource accounting and selected OS namespaces; it is not a complete filesystem or syscall sandbox.
 

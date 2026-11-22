@@ -3,12 +3,12 @@
 使用 `cargo build --release --locked --offline` 构建。发布配置启用三级优化、完整调试符号和溢出检查。Rust 依赖源码和许可证在 `third-parties/cargo`。
 
 [本机加密通道交付约定](attachment-provisioning.md)说明了 Rust 密钥和描述符交付组件及其真实 VM 测试。
-这些组件尚未开放正式 CLI 的原生驱动执行入口。
+正式 CLI 用这些组件启动经审核的只读原生提供方。
 
 每个部署的 VM 必须启用[内核设备访问控制](device-isolation.md)。该模块同时提供
 确切设备规则和原部署器归属登记；native 驱动生命周期仍需独立联动。
 
-`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。显式使用 `--accept-recommendations` 会显示警告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的部署、在线更新、独立看门狗和物理安全接入尚未完成。
+`wros-deployer plan deployment.xml --policy-root /protected/policies` 检查本地文件、Wasm 和驱动摘要、进程预算与权限，并输出验签器和 VM 的完整拟用参数。`wros-deployer review deployment.xml --policy-root /protected/policies` 逐个进程审核接口，可以输入 `allow NAME`、`deny NAME`、`remove NAME` 后 `confirm`。缺省推荐为空。显式使用 `--accept-recommendations` 会显示警告。这两个命令执行预检；`run` 进一步执行不可变映像准入和 VM 进程监管。原生提供方的自动恢复、在线更新、独立看门狗和物理安全接入尚未完成。
 
 ```xml
 <deployment id="cell">
@@ -50,11 +50,27 @@ scripts/sign-file sha384 publisher.key publisher.pem driver.so driver.signed.so
 sha256sum driver.signed.so
 ```
 
-默认拒绝无签名和签名错误的 ELF。仅在预检时，可分别用 `--allow-unsigned-elf DRIVER=SHA256` 和 `--allow-invalid-elf-signature DRIVER=SHA256` 放行匹配驱动 ID、完整摘要和拒绝原因的制品，并显示警告。即使文件内容相同，每个驱动 ID 也须单独放行。Wasm 同样按 VM ID 分别放行。损坏的封装、信任错误和未知验签失败仍会拒绝。管理员须从固定的 ELF 信任库移除已吊销或失陷的证书。
+默认拒绝无签名和签名错误的 ELF。`verify` 和显式 `run` 分别用 `--allow-unsigned-elf DRIVER=SHA256` 和 `--allow-invalid-elf-signature DRIVER=SHA256` 放行匹配驱动 ID、完整摘要和拒绝原因的制品，并显示警告。即使文件内容相同，每个驱动 ID 也须单独放行。Wasm 同样按 VM ID 分别放行。损坏的封装、信任错误和未知验签失败仍会拒绝。管理员须从固定的 ELF 信任库移除已吊销或失陷的证书。
+
+### 启动只读原生提供方
+
+在可执行类型的 `<driver kind="executable" ...>` 下声明与 VM 的连接。
+
+```xml
+<attachment vm="body" alias="joints" sandbox="go2" uid="24002" gid="24002"
+    contract-sha256="替换为64个小写十六进制字符"
+    memory-bytes="268435456" pids="32" cpu-micros="100000"/>
+```
+
+`run` 增加 `--driver-root /protected/provider-roots` 和 `--elf-verifier /opt/wros/bin/uwvm2-ros`。管理员在 `/protected/provider-roots/go2` 准备已审核的动态加载器、依赖与配置，全部归 root 所有且禁止组和其他用户写入。另需留出空的 `proc` 目录，用于挂载带 `hidepid=2,subset=pid` 的只读进程视图。原厂库可读取自身可执行文件名和时钟命名空间身份。其余目录以只读方式挂载，网络仅有独立回环，实体设备授权为空。原厂共享库通过同一隔离目录中的签名 ELF 适配器接入。
+
+每个 VM 当前可连接一个独立 UID、GID 和 cgroup 的提供方。单独审核 `capability.open`、`driver.connect`、`driver.submit`、`driver.result`、`driver.disconnect` 及资源权限 `driver/joints/buffer.read`。推荐权限可用 `<driver-resource alias="joints" operation="buffer.read" access="allow"/>` 表达。驱动进程通过继承描述符完成身份交付，之后用认证 TLS 处理有界的 `buffer.read`。
+
+部署器先核对完整 ELF 摘要并密封映像，预检和启动前分别验签，随后用 `execveat` 执行同一 inode。两次验签结果须一致。签名者在启动前被撤下或发生变化时，启动会失败。原生驱动目前要求操作员显式运行，自动启动、自动重启和服务模式仍用于纯 VM 部署。
 
 ## 运行已审核的 VM
 
-`run` 要求部署监管进程具有 root 身份，并使用外部服务管理器预先交付的 cgroup v2 子树。各 VM 使用互不相同的非 root 用户和组。操作员须为 WROS 预留专用系统身份；部署器另外通过[宿主身份所有权登记](host-identities.md)拒绝共享登记目录的管理进程之间发生身份冲突。它不自动分配系统账号，也不能约束非托管特权软件。验签器和 VM 可执行文件必须位于提交包之外的受保护路径。当前 `run` 遇到原生驱动声明会在启动任何进程之前拒绝。
+`run` 要求部署监管进程具有 root 身份，并使用外部服务管理器预先交付的 cgroup v2 子树。各 VM 和原生提供方使用互不相同的非 root 用户和组。操作员为 WROS 预留专用系统身份，部署器通过[宿主身份所有权登记](host-identities.md)拒绝共享登记目录的管理进程之间发生身份冲突。验签器和 VM 可执行文件必须位于提交包之外的受保护路径。
 
 ```xml
 <deployment id="cell">

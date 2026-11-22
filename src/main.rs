@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use wros_deployer::{manifest, service, state, supervisor, verdict::Signature, verification};
+use wros_deployer::{driver as native, manifest, service, state, supervisor, verdict::Signature, verification};
 
 /// Bind every automatic invocation to the exact reviewed configuration and
 /// executable/trust-policy bytes. Recommendation files are not read on resume:
@@ -122,13 +122,13 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
                 }
                 _ => eprintln!("unknown action"),
             },
-            _ => eprintln!("enter a registered interface, a clock read permission or a local/, metadata/ or report/ decision, or confirm"),
+            _ => eprintln!("enter a registered interface, a clock read permission or a local/, metadata/, report/ or driver/ decision, or confirm"),
         }
     }
     Ok(rights)
 }
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify/run with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify/run] [--driver-root DIRECTORY for run with drivers] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if action == "status" {
@@ -213,7 +213,7 @@ fn run() -> Result<()> {
             {
                 return Err("duplicate signature exception for one VM".into());
             }
-        } else if action == "verify"
+        } else if matches!(action.as_str(), "verify" | "run")
             && matches!(key.as_str(), "--allow-unsigned-elf" | "--allow-invalid-elf-signature")
         {
             let value = args.next().ok_or(usage)?;
@@ -230,7 +230,8 @@ fn run() -> Result<()> {
                 return Err("duplicate signature exception for one ELF driver".into());
             }
         } else if key == "--policy-root"
-            || action == "verify" && key == "--elf-verifier"
+            || matches!(action.as_str(), "verify" | "run") && key == "--elf-verifier"
+            || action == "run" && key == "--driver-root"
             || matches!(
                 action.as_str(),
                 "verify" | "authorize" | "service" | "run" | "resume"
@@ -303,11 +304,11 @@ fn run() -> Result<()> {
                     .into(),
             );
         }
-        if !plan.drivers.is_empty() {
-            return Err(
-                "native provider execution is not yet qualified; run refuses driver declarations"
-                    .into(),
-            );
+        if !plan.drivers.is_empty()
+            && (action != "run" || options.contains_key("--state-directory")
+                || plan.processes.iter().any(|vm| vm.boot_start || vm.crash_restart))
+        {
+            return Err("native provider execution requires an explicit run without automatic restart".into());
         }
         if unsafe { libc::geteuid() } != 0 {
             return Err("run requires the privileged deployment supervisor".into());
@@ -387,12 +388,31 @@ fn run() -> Result<()> {
             ));
         }
     }
-    for driver in &plan.drivers {
-        if let Some((_, scratch)) = verifier {
+    let mut native_launches = BTreeMap::new();
+    for driver in plan.drivers {
+        if executing {
+            let elf = options.get("--elf-verifier").ok_or("run requires --elf-verifier for native drivers")?;
+            let driver_root = options.get("--driver-root").ok_or("run requires --driver-root for native drivers")?;
+            let attachment = driver.attachment.as_ref().ok_or("run needs an explicit driver attachment")?;
+            let vm = attachment.vm.clone();
+            println!("INFO Driver {:?} for VM {:?}, alias {:?}, sandbox {:?}, UID/GID {:?}, memory {} bytes, tasks {}, CPU {} per 100000, request deadline budget {}ms, private network and read-only filesystem, buffer.read.",
+                     driver.id, vm, attachment.alias, attachment.sandbox, attachment.identity,
+                     attachment.memory_bytes, attachment.pids, attachment.cpu_micros, attachment.request_millis);
+            let exception = elf_exceptions.get(&driver.id).map(|(_, kind)| *kind);
+            let admitted = verification::NativeAdmission::prepare(elf, root, &bundle, policies, &driver, exception)
+                .map_err(|error| format!("ELF driver {:?}: {error}", driver.id))?;
+            println!("INFO Driver {:?} preflight {:?} for SHA256 {}", driver.id, admitted.verdict(), driver.digest);
+            if admitted.verdict() != Signature::Verified {
+                eprintln!("WARNING: {:?} ELF launch authorized by explicit exception for {:?} at SHA256 {}",
+                          admitted.verdict(), driver.id, driver.digest);
+            }
+            native_launches.insert(vm, native::Launch::new(driver, admitted, driver_root, root)?);
+            continue;
+        } else if let Some((_, scratch)) = verifier {
             let elf = options
                 .get("--elf-verifier")
                 .ok_or("verify requires --elf-verifier for native drivers")?;
-            let verdict = verification::verify_driver(elf, scratch, root, &bundle, policies, driver)
+            let verdict = verification::verify_driver(elf, scratch, root, &bundle, policies, &driver)
                 .map_err(|error| format!("ELF driver {:?}: {error}", driver.id))?;
             if verdict == Signature::Verified {
                 println!("INFO ELF CMS signature verified for driver {:?}", driver.id);
@@ -480,6 +500,17 @@ fn run() -> Result<()> {
         }
         if matches!(action.as_str(), "review" | "authorize" | "run") && !accept {
             rights = approve(rights)?
+        }
+        let driver = native_launches.remove(&vm.id);
+        if let Some(provider) = &driver {
+            let alias = &provider.artifact.attachment.as_ref().unwrap().alias;
+            let allowed_imports = ["capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"];
+            if rights.get(&format!("driver/{alias}/buffer.read")) != Some(&true)
+                || allowed_imports.iter().any(|name| rights.get(*name) != Some(&true))
+                || manifest::reviewed_grants(&rights)?.contains_key(alias.as_str())
+            {
+                return Err(format!("VM {:?} requires separate reviewed driver permission and IPC imports for {alias:?}", vm.id));
+            }
         }
         approved.insert(
             vm.id.clone(),
@@ -573,6 +604,9 @@ fn run() -> Result<()> {
                 Permission::LocalOperation { kind, alias, operation } => {
                     println!("INFO VM {:?} local {} resource {:?} operation {}: {}", vm.id, kind, alias, operation, decision);
                 }
+                Permission::DriverRead(alias) => {
+                    println!("INFO VM {:?} native driver {:?} buffer.read: {}", vm.id, alias, decision);
+                }
             }
         }
         if verifier.is_none() {
@@ -603,6 +637,7 @@ fn run() -> Result<()> {
                 process: vm,
                 module,
                 arguments: argv,
+                driver,
             });
         }
     }
@@ -625,11 +660,7 @@ fn run() -> Result<()> {
         // Exclude every competing manager before reclaim can signal a prior
         // tree or resume can consume its approval. Keep the full reviewed set
         // reserved even when only a subset has an automatic cold-start grant.
-        let identities = wros_deployer::ownership::claim(
-            parent,
-            &plan.id,
-            &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
-        )?;
+        let identities = supervisor::reserve(parent, &plan.id, &launches)?;
         if let Some(j) = &mut journal {
             if j.existing() {
                 let ids = launches

@@ -1,11 +1,11 @@
 //! Bounded local VM supervisor. It receives fully admitted images and reviewed
 //! argument vectors. Enrollment, namespace creation, identity drop and immutable
 //! descriptor inheritance complete before the first VM instruction executes.
-//! Native provider launch, recovery Wasm and live control are separate capabilities;
-//! this entry point refuses manifests requiring those unfinished capabilities.
+//! Attached native providers share the deployment shutdown boundary while using
+//! a separate cgroup, host identity and filesystem.
 use crate::{
     audit::Events,
-    cgroup::Hierarchy,
+    cgroup::{Hierarchy, Workload},
     manifest::{Process, Result},
     recovery::Instance,
     verification::FrozenFile,
@@ -24,6 +24,7 @@ static SIGNALS: AtomicBool = AtomicBool::new(false);
 const STOP_GRACE: Duration = Duration::from_secs(2);
 const STOP_SETTLE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+const DRIVER_CLOSE_GRACE: Duration = Duration::from_millis(250);
 /// A private read-only copy of the sealed image. VM's normal no-follow loader
 /// accepts this regular path without weakening its symlink rejection policy.
 pub const IMAGE_PATH: &str = "/tmp/wros-admitted.wasm";
@@ -82,6 +83,13 @@ pub struct Launch {
     pub process: Process,
     pub module: FrozenFile,
     pub arguments: Vec<String>,
+    pub driver: Option<crate::driver::Launch>,
+}
+struct RunningDriver {
+    child: Option<Child>,
+    pidfd: Option<File>,
+    ended: Option<Instant>,
+    output: DiagnosticBudget,
 }
 struct Running {
     child: Option<Child>,
@@ -93,6 +101,7 @@ struct Running {
     failed: bool,
     output: DiagnosticBudget,
     started: bool,
+    driver: Option<RunningDriver>,
 }
 struct Session<'a> {
     hierarchy: Hierarchy,
@@ -100,6 +109,7 @@ struct Session<'a> {
     slots: Vec<Running>,
     events: &'a Events,
     journal: Option<&'a mut crate::state::Journal>,
+    driver_groups: Vec<Option<usize>>,
 }
 impl Drop for Session<'_> {
     fn drop(&mut self) {
@@ -108,6 +118,9 @@ impl Drop for Session<'_> {
         if self.hierarchy.kill().is_err() {
             for slot in &self.slots {
                 if let Some(fd) = &slot.pidfd {
+                    signal(fd, libc::SIGKILL);
+                }
+                if let Some(fd) = slot.driver.as_ref().and_then(|driver| driver.pidfd.as_ref()) {
                     signal(fd, libc::SIGKILL);
                 }
             }
@@ -133,6 +146,34 @@ fn nonblocking(fd: i32) -> Result<()> {
     }
     Ok(())
 }
+
+fn finish_driver(
+    driver: &mut RunningDriver,
+    id: &str,
+    generation: u64,
+    events: &Events,
+) -> Result<()> {
+    let deadline = Instant::now() + DRIVER_CLOSE_GRACE;
+    while let Some(child) = &mut driver.child {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            output(child, "Driver", id, generation, &mut driver.output, events);
+            driver.child = None;
+            driver.pidfd = None;
+            events.send(format!("INFO Driver {id:?} exit {status}"));
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("native driver {id:?} failed: {status}"))
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stopping() || events.failed() {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+    }
+    Ok(())
+}
 /// Retain an object above the standard I/O descriptors even when the caller starts
 /// with stdin/stdout/stderr closed. Command's redirection must not replace it.
 pub fn retained(file: File) -> Result<File> {
@@ -142,7 +183,7 @@ pub fn retained(file: File) -> Result<File> {
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
-fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, File)> {
+fn spawn(runtime: &File, launch: &Launch, enrollment: File, extra: &[String], inherited: &[i32]) -> Result<(Child, File)> {
     let enrollment = retained(enrollment)?;
     let join = enrollment.as_raw_fd();
     let module = launch.module.0.as_raw_fd();
@@ -155,8 +196,17 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
         .as_ref()
         .map(crate::placement::Set::affinity);
     let mut command = Command::new(format!("/proc/self/fd/{exe}"));
+    if extra.is_empty() {
+        command.args(&launch.arguments);
+    } else {
+        if launch.arguments.len() < 2 || launch.arguments[launch.arguments.len() - 2] != "--run" {
+            return Err("attachment requires a final VM run argument".into());
+        }
+        let (setup, run) = launch.arguments.split_at(launch.arguments.len() - 2);
+        command.args(setup).args(extra).args(run);
+    }
+    let inherited = inherited.to_vec();
     command
-        .args(&launch.arguments)
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
@@ -276,70 +326,84 @@ fn spawn(runtime: &File, launch: &Launch, enrollment: File) -> Result<(Child, Fi
             {
                 return Err(fail());
             }
-            if libc::setsid() < 0 {
-                return Err(fail());
-            }
-            let core = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            let files = libc::rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            };
-            if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0
-                || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
-            {
-                return Err(fail());
-            }
-            libc::umask(0o077);
-            // Libraries that reopen an inherited pipe through /proc/self/fd must
-            // see the final guest owner. Both pipe ends remain pinned by descriptors.
-            for fd in [1, 2] {
-                if libc::fchown(fd, uid, gid) != 0 {
+            finish_child((uid, gid), parent)?;
+            for fd in inherited.iter().copied().chain(std::iter::once(exe)) {
+                if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                     return Err(fail());
                 }
-            }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                || libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0
-            {
-                return Err(fail());
-            }
-            if libc::setgroups(0, std::ptr::null()) != 0
-                || libc::setresgid(gid, gid, gid) != 0
-                || libc::setresuid(uid, uid, uid) != 0
-            {
-                return Err(fail());
-            }
-            // Credential changes clear PDEATHSIG, so arm it afterwards and close the
-            // race by checking the original parent. A dead supervisor cannot authorize exec.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
-                || libc::getppid() != parent
-            {
-                return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
-            }
-            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
-                return Err(fail());
-            }
-            crate::containment::pin_namespaces()?;
-            if libc::syscall(
-                libc::SYS_close_range,
-                3u32,
-                u32::MAX,
-                libc::CLOSE_RANGE_CLOEXEC,
-            ) != 0
-            {
-                return Err(fail());
-            }
-            if libc::fcntl(exe, libc::F_SETFD, 0) != 0 {
-                return Err(fail());
             }
             Ok(())
         });
     }
+    spawn_pinned(command, "VM")
+}
+
+/// Common allocation-free restrictions installed in the child before exec.
+/// The child has already enrolled in its cgroup and entered its namespaces.
+pub(crate) unsafe fn finish_child((uid, gid): (u32, u32), parent: libc::pid_t) -> std::io::Result<()> {
+    let fail = std::io::Error::last_os_error;
+    if libc::setsid() < 0 {
+        return Err(fail());
+    }
+    let core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let files = libc::rlimit {
+        rlim_cur: 256,
+        rlim_max: 256,
+    };
+    if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0
+        || libc::setrlimit(libc::RLIMIT_NOFILE, &files) != 0
+    {
+        return Err(fail());
+    }
+    libc::umask(0o077);
+    // Libraries that reopen an inherited pipe through /proc/self/fd must
+    // see the final guest owner. Both pipe ends remain pinned by descriptors.
+    for fd in [1, 2] {
+        if libc::fchown(fd, uid, gid) != 0 {
+            return Err(fail());
+        }
+    }
+    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+        || libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0
+    {
+        return Err(fail());
+    }
+    if libc::setgroups(0, std::ptr::null()) != 0
+        || libc::setresgid(gid, gid, gid) != 0
+        || libc::setresuid(uid, uid, uid) != 0
+    {
+        return Err(fail());
+    }
+    // Credential changes clear PDEATHSIG, so arm it afterwards and close the
+    // race by checking the original parent. A dead supervisor cannot authorize exec.
+    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+        || libc::getppid() != parent
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+    }
+    if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+        return Err(fail());
+    }
+    crate::containment::pin_namespaces()?;
+    if libc::syscall(
+        libc::SYS_close_range,
+        3u32,
+        u32::MAX,
+        libc::CLOSE_RANGE_CLOEXEC,
+    ) != 0
+    {
+        return Err(fail());
+    }
+    Ok(())
+}
+
+pub(crate) fn spawn_pinned(mut command: Command, role: &str) -> Result<(Child, File)> {
     let mut child = command
         .spawn()
-        .map_err(|e| format!("VM admission before exec failed: {e}"))?;
+        .map_err(|e| format!("{role} admission before exec failed: {e}"))?;
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
     if pidfd < 0 {
         let e = std::io::Error::last_os_error().to_string();
@@ -378,7 +442,7 @@ impl DiagnosticBudget {
     }
 }
 
-fn output(child: &mut Child, id: &str, generation: u64, budget: &mut DiagnosticBudget, events: &Events) {
+fn output(child: &mut Child, role: &str, id: &str, generation: u64, budget: &mut DiagnosticBudget, events: &Events) {
     let mut buffer = [0u8; 4096];
     // Bound work per stream even while the other stream or another VM is busy.
     for (stream, pipe) in [
@@ -393,13 +457,13 @@ fn output(child: &mut Child, id: &str, generation: u64, budget: &mut DiagnosticB
                     let (keep, first_loss) = budget.admit(n);
                     if keep > 0 {
                         events.send(format!(
-                            "INFO VM {id:?} diagnostic generation {generation} {stream} {:?}",
+                            "INFO {role} {id:?} diagnostic generation {generation} {stream} {:?}",
                             String::from_utf8_lossy(&buffer[..keep])
                         ));
                     }
                     if first_loss {
                         events.send(format!(
-                            "WARNING VM {id:?} generation {generation} diagnostic byte limit reached on {stream}; subsequent output omitted"
+                            "WARNING {role} {id:?} generation {generation} diagnostic byte limit reached on {stream}; subsequent output omitted"
                         ));
                     }
                 }
@@ -444,11 +508,31 @@ impl Session<'_> {
         self.hierarchy.children[index].verify_placement(&self.launches[index].process)?;
         let enrollment = self.hierarchy.children[index].enrollment()?;
         self.check_start()?;
-        let (child, pidfd) = spawn(
-            runtime,
-            &self.launches[index],
-            enrollment,
-        )?;
+        let launch = &self.launches[index];
+        let (child, pidfd) = if let Some(driver) = &launch.driver {
+            let group = &self.hierarchy.children[self.driver_groups[index].unwrap()];
+            let ((provider, provider_pidfd), bootstrap) =
+                crate::driver::start(driver, group.enrollment()?)?;
+            self.events.send(format!(
+                "INFO Driver {:?} passed launch signature policy {:?}; PID {} in its dedicated cgroup",
+                driver.artifact.id, driver.admission.verdict(), provider.id(),
+            ));
+            self.slots[index].driver = Some(RunningDriver {
+                child: Some(provider), pidfd: Some(provider_pidfd), ended: None,
+                output: DiagnosticBudget::default(),
+            });
+            let (arguments, inherited) = bootstrap.vm_arguments(driver, &launch.process.id);
+            self.events.send(format!("INFO VM {:?} extra driver CLI {:?}", launch.process.id, arguments));
+            self.check_start()?;
+            let (child, pidfd) = spawn(runtime, launch, enrollment, &arguments, &inherited)?;
+            self.slots[index].child = Some(child);
+            self.slots[index].pidfd = Some(pidfd);
+            bootstrap.deliver(self.slots[index].child.as_ref().unwrap(), launch.process.identity.unwrap())?;
+            self.events.send(format!("INFO Driver {:?} bootstrap delivered for authenticated TLS", driver.artifact.id));
+            (self.slots[index].child.take().unwrap(), self.slots[index].pidfd.take().unwrap())
+        } else {
+            spawn(runtime, launch, enrollment, &[], &[])?
+        };
         self.events.send(format!(
             "INFO VM {:?} generation {} started with PID {}, no motion authority",
             self.launches[index].process.id,
@@ -468,10 +552,25 @@ impl Session<'_> {
     fn reap_exited(&mut self, diagnostics: bool) -> Result<bool> {
         let mut all_reaped = true;
         for (i, slot) in self.slots.iter_mut().enumerate() {
+            if let Some(driver) = &mut slot.driver {
+                if let Some(child) = &mut driver.child {
+                    if diagnostics {
+                        output(child, "Driver", &self.launches[i].driver.as_ref().unwrap().artifact.id,
+                               slot.generation, &mut driver.output, self.events);
+                    }
+                    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                        driver.child = None;
+                        driver.pidfd = None;
+                    } else {
+                        all_reaped = false;
+                    }
+                }
+            }
             if let Some(child) = &mut slot.child {
                 if diagnostics {
                     output(
                         child,
+                        "VM",
                         &self.launches[i].process.id,
                         slot.generation,
                         &mut slot.output,
@@ -510,6 +609,9 @@ impl Session<'_> {
             if let Some(fd) = &slot.pidfd {
                 signal(fd, libc::SIGTERM);
             }
+            if let Some(fd) = slot.driver.as_ref().and_then(|driver| driver.pidfd.as_ref()) {
+                signal(fd, libc::SIGTERM);
+            }
         }
         let graceful = self.wait_for_shutdown(grace, false);
         let settle = Instant::now() + STOP_SETTLE;
@@ -532,12 +634,23 @@ pub fn run_with_state(
     launches: &[Launch],
     journal: Option<&mut crate::state::Journal>,
 ) -> Result<()> {
-    let identities = crate::ownership::claim(
-        cgroup,
-        deployment,
-        &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
-    )?;
+    let identities = reserve(cgroup, deployment, launches)?;
     run_reserved(runtime, cgroup, deployment, launches, journal, &identities)
+}
+
+fn identities(launches: &[Launch]) -> Result<Vec<(u32, u32)>> {
+    let mut ids = Vec::with_capacity(launches.len() * 2);
+    for launch in launches {
+        ids.push(launch.process.identity.ok_or("missing VM identity")?);
+        if let Some(driver) = &launch.driver {
+            ids.push(driver.artifact.attachment.as_ref().ok_or("missing driver attachment")?.identity);
+        }
+    }
+    Ok(ids)
+}
+
+pub fn reserve(cgroup: &Path, deployment: &str, launches: &[Launch]) -> Result<crate::ownership::Reservations> {
+    crate::ownership::claim_ids(cgroup, deployment, &identities(launches)?, &[])
 }
 /// The CLI acquires identities before reclaiming old groups or consuming a
 /// durable start authorization. Retain that same proof through final shutdown;
@@ -550,11 +663,12 @@ pub fn run_reserved(
     mut journal: Option<&mut crate::state::Journal>,
     identities: &crate::ownership::Reservations,
 ) -> Result<()> {
-    identities.check(
-        cgroup,
-        deployment,
-        &launches.iter().map(|l| &l.process).collect::<Vec<_>>(),
-    )?;
+    identities.check_ids(cgroup, deployment, self::identities(launches)?)?;
+    if launches.iter().any(|l| l.driver.is_some())
+        && (journal.is_some() || launches.iter().any(|l| l.process.boot_start || l.process.crash_restart))
+    {
+        return Err("native driver launch requires explicit supervision without automatic restart".into());
+    }
     let _signals = Signals::install()?;
     let events = Events::new()?;
     events.send(format!("INFO Host UID/GID reservations held in {} for deployment {:?}; no cross-deployment takeover after manager exit", crate::ownership::DIRECTORY, deployment));
@@ -585,8 +699,17 @@ fn supervise(
     journal: Option<&mut crate::state::Journal>,
 ) -> Result<()> {
     let runtime = retained(File::open(runtime).map_err(|e| e.to_string())?)?;
-    let processes = launches.iter().map(|l| &l.process).collect::<Vec<_>>();
-    let hierarchy = Hierarchy::create(cgroup, deployment, &processes)?;
+    let mut workloads = launches.iter().map(|l| Workload::from(&l.process)).collect::<Vec<_>>();
+    let mut driver_groups = Vec::with_capacity(launches.len());
+    for launch in launches {
+        if let Some(driver) = &launch.driver {
+            driver_groups.push(Some(workloads.len()));
+            workloads.push(Workload::driver(&driver.artifact)?);
+        } else {
+            driver_groups.push(None);
+        }
+    }
+    let hierarchy = Hierarchy::create_workloads(cgroup, deployment, &workloads)?;
     let slots = launches
         .iter()
         .map(|l| {
@@ -605,6 +728,7 @@ fn supervise(
                 failed: false,
                 output: DiagnosticBudget::default(),
                 started: false,
+                driver: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -614,6 +738,7 @@ fn supervise(
         slots,
         events,
         journal,
+        driver_groups,
     };
     for i in 0..launches.len() {
         session.start(i, &runtime)?;
@@ -635,13 +760,29 @@ fn supervise(
         }
         for (i, launch) in launches.iter().enumerate() {
             let slot = &mut session.slots[i];
+            if let Some(driver) = &mut slot.driver {
+                if let Some(child) = &mut driver.child {
+                    let id = &launch.driver.as_ref().unwrap().artifact.id;
+                    output(child, "Driver", id, slot.generation, &mut driver.output, events);
+                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                        output(child, "Driver", id, slot.generation, &mut driver.output, events);
+                        driver.child = None;
+                        driver.pidfd = None;
+                        events.send(format!("INFO Driver {id:?} exit {status}"));
+                        if !status.success() {
+                            return Err(format!("native driver {id:?} failed: {status}"));
+                        }
+                        driver.ended = Some(Instant::now());
+                    }
+                }
+            }
             if let Some(child) = &mut slot.child {
-                output(child, &launch.process.id, slot.generation, &mut slot.output, events);
+                output(child, "VM", &launch.process.id, slot.generation, &mut slot.output, events);
                 if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                     if let Some(journal) = &mut session.journal {
                         journal.exited(&launch.process.id, status.success())?;
                     }
-                    output(child, &launch.process.id, slot.generation, &mut slot.output, events);
+                    output(child, "VM", &launch.process.id, slot.generation, &mut slot.output, events);
                     events.send(format!(
                         "INFO VM {:?} generation {} exit {status}",
                         launch.process.id, slot.generation
@@ -654,6 +795,21 @@ fn supervise(
                     slot.child = None;
                     slot.pidfd = None;
                     session.hierarchy.children[i].drain(Duration::from_secs(2))?;
+                    if let Some(group) = session.driver_groups[i] {
+                        let driver = slot.driver.as_mut().unwrap();
+                        let id = &launch.driver.as_ref().unwrap().artifact.id;
+                        if status.success() {
+                            // The VM can return immediately after sending RELEASE.
+                            // Give the provider a bounded window to close and flush diagnostics.
+                            finish_driver(driver, id, slot.generation, events)?;
+                        }
+                        session.hierarchy.children[group].drain(Duration::from_secs(2))?;
+                        if let Some(provider) = &mut driver.child {
+                            let _ = provider.wait().map_err(|e| e.to_string())?;
+                            output(provider, "Driver", id, slot.generation, &mut driver.output, events);
+                        }
+                        slot.driver = None;
+                    }
                     if status.success() {
                         slot.state.operator_stop();
                     } else {
@@ -677,6 +833,13 @@ fn supervise(
                         }
                     }
                 }
+            }
+            // An adapter can finish its RELEASE just before the VM returns.
+            // A VM that stays live after loss of its provider cannot keep running.
+            if slot.child.is_some() && slot.driver.as_ref().and_then(|d| d.ended)
+                .is_some_and(|end| end.elapsed() >= DRIVER_CLOSE_GRACE)
+            {
+                return Err("driver exited while its VM remained active".into());
             }
             if session.slots[i]
                 .next

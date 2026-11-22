@@ -2,11 +2,11 @@
 
 The Rust `attachment` module provisions a dedicated channel for one admitted
 VM/provider session. It generates identities, pins already-running process
-incarnations and delivers immutable bootstrap objects. It does not launch a
-driver, grant hardware access or permit motion. Production native-provider
-execution remains disabled in the deployer CLI until resource grants, device
-ownership and lifecycle recovery are integrated. The executable under
-`tests/support/attachment_provisioner.rs` is a test harness only.
+incarnations and delivers immutable bootstrap objects. The production `run`
+path provisions one read-only native provider per configured VM. The provider
+receives its ID as argv[0], then the courier FD, manager PID, manager UID,
+manager GID and the literal `read-only`. The separate executable under
+`tests/support/attachment_provisioner.rs` exercises handoff edge cases.
 
 ## Admission and delivery
 

@@ -74,6 +74,6 @@ HelloWorld 源码，并使用同一套官方原生 SDK、IDL 和 DDS 库构建 G
 中启动进程。测试同时验证修改后的清单被拒绝，以及两种消息都可经来宾回环传输。
 [Unitree SDK 源码](https://github.com/unitreerobotics/unitree_sdk2/tree/811bc77cdcffb4691d4b40172f9a57857bf6cffb)
 
-VM 基础规则已进入实际监管路径。`run`/`resume` 仍拒绝 native 驱动声明：资源 XML
-审核、具体适配器、物理身份、安全停机和完整 native 生命周期还需联动。本组件与
-[加密交付](attachment-provisioning.md)不代表任意厂商驱动已可用或已经工业安全认证。
+显式 `run` 可以启动单 VM 的独立只读 ELF 适配器，适配器和 VM 使用独立 cgroup
+与宿主身份。驱动子组拒绝实际设备和设备节点创建。物理设备身份、安全停机和
+自动恢复仍需联动。参见[原生适配器和加密交付](attachment-provisioning.md)。

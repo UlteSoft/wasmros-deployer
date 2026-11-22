@@ -46,7 +46,7 @@ container's private `/run`. The platform must reserve these OS identities for
 WROS: this coordination cannot stop an unmanaged process or a privileged
 administrator from using the same credentials. It is not a device-access filter,
 physical hardware lease, cross-host ownership service or motion authorization.
-Native driver provisioning remains disabled pending those separate controls.
+Explicit read-only native launches use the same UID and GID reservations.
 
 The same registry now supports an additional 128 exact device keys in the
 combined admission API. See [device ownership and enforcement](device-isolation.md)

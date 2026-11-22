@@ -2,7 +2,7 @@
 //! enrollment descriptor, closed by exec; they never receive directory handles.
 //! The operator must supply an empty, bounded, root-owned delegated subtree with
 //! cpu, memory and pids already enabled. This module never changes its ancestors.
-use crate::manifest::{Process, Result};
+use crate::manifest::{DriverArtifact, Process, Result};
 use crate::placement::Set;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -109,9 +109,13 @@ impl Group {
     /// intersect with the parent's allocation. Runtime hotplug may still change
     /// the effective set; hardware safety must not depend on placement alone.
     pub fn verify_placement(&self, process: &Process) -> Result<()> {
+        self.verify_sets(process.cpus.as_ref(), process.memory_nodes.as_ref())
+    }
+
+    fn verify_sets(&self, cpus: Option<&Set>, memory_nodes: Option<&Set>) -> Result<()> {
         for (name, requested) in [
-            ("cpuset.cpus.effective", &process.cpus),
-            ("cpuset.mems.effective", &process.memory_nodes),
+            ("cpuset.cpus.effective", cpus),
+            ("cpuset.mems.effective", memory_nodes),
         ] {
             if let Some(requested) = requested {
                 if &Set::parse(read(&self.directory, name)?.trim())? != requested {
@@ -233,6 +237,43 @@ pub struct Hierarchy {
     pub children: Vec<Group>,
     root: Group,
 }
+
+pub(crate) struct Workload<'a> {
+    name: String,
+    identity: Option<(u32, u32)>,
+    memory_bytes: u64,
+    pids: u32,
+    cpu_micros: u32,
+    cpus: Option<&'a Set>,
+    memory_nodes: Option<&'a Set>,
+}
+impl<'a> From<&'a Process> for Workload<'a> {
+    fn from(process: &'a Process) -> Self {
+        Self {
+            name: format!("vm-{}", process.id),
+            identity: process.identity,
+            memory_bytes: process.memory_bytes,
+            pids: process.pids,
+            cpu_micros: process.cpu_micros,
+            cpus: process.cpus.as_ref(),
+            memory_nodes: process.memory_nodes.as_ref(),
+        }
+    }
+}
+impl Workload<'_> {
+    pub(crate) fn driver(driver: &DriverArtifact) -> Result<Self> {
+        let attachment = driver.attachment.as_ref().ok_or("missing driver attachment")?;
+        Ok(Self {
+            name: format!("driver-{}", driver.id),
+            identity: Some(attachment.identity),
+            memory_bytes: attachment.memory_bytes,
+            pids: attachment.pids,
+            cpu_micros: attachment.cpu_micros,
+            cpus: None,
+            memory_nodes: None,
+        })
+    }
+}
 impl Hierarchy {
     /// Stop the exclusive deployment tree in one kernel operation. A failed
     /// root operation is reported even if the leaf-level fallback succeeds.
@@ -329,6 +370,11 @@ impl Hierarchy {
         Ok(())
     }
     pub fn create(path: &Path, deployment: &str, processes: &[&Process]) -> Result<Self> {
+        let workloads = processes.iter().map(|&p| Workload::from(p)).collect::<Vec<_>>();
+        Self::create_workloads(path, deployment, &workloads)
+    }
+
+    pub(crate) fn create_workloads(path: &Path, deployment: &str, processes: &[Workload<'_>]) -> Result<Self> {
         let parent = delegated_parent(path)?;
         let controllers = read(&parent, "cgroup.subtree_control")?;
         for required in ["cpu", "memory", "pids"] {
@@ -354,8 +400,8 @@ impl Hierarchy {
                         .is_some_and(|set| !nodes.contains(set))
                 {
                     return Err(format!(
-                        "VM {:?} placement exceeds delegated effective CPU/NUMA sets",
-                        p.id
+                        "Workload {:?} placement exceeds delegated effective CPU/NUMA sets",
+                        p.name
                     ));
                 }
             }
@@ -371,7 +417,7 @@ impl Hierarchy {
         let mut pids = 0u64;
         for p in processes {
             if p.identity.is_none() {
-                return Err("run needs an explicit guest uid and gid for every VM".into());
+                return Err("run needs an explicit UID and GID for every workload".into());
             }
             memory = memory
                 .checked_add(p.memory_bytes)
@@ -381,7 +427,7 @@ impl Hierarchy {
                 .ok_or("aggregate task overflow")?;
         }
         if memory == 0 || memory > parent_memory {
-            return Err("VM memory reservations exceed delegated budget".into());
+            return Err("workload memory reservations exceed delegated budget".into());
         }
         let root = Group::create(&parent, &format!("wros-{deployment}"))?;
         // Require the whole-tree control before starting any VM.
@@ -403,7 +449,7 @@ impl Hierarchy {
             root,
         };
         for p in processes {
-            let child = Group::create(&hierarchy.root.directory, &format!("vm-{}", p.id))?;
+            let child = Group::create(&hierarchy.root.directory, &p.name)?;
             write(&child.directory, "memory.max", &p.memory_bytes.to_string())?;
             write(&child.directory, "memory.swap.max", "0")?;
             write(&child.directory, "memory.oom.group", "1")?;
@@ -413,13 +459,13 @@ impl Hierarchy {
                 "cpu.max",
                 &format!("{} 100000", p.cpu_micros),
             )?;
-            if let Some(nodes) = &p.memory_nodes {
+            if let Some(nodes) = p.memory_nodes {
                 write(&child.directory, "cpuset.mems", &nodes.to_string())?;
             }
-            if let Some(cpus) = &p.cpus {
+            if let Some(cpus) = p.cpus {
                 write(&child.directory, "cpuset.cpus", &cpus.to_string())?;
             }
-            child.verify_placement(p)?;
+            child.verify_sets(p.cpus, p.memory_nodes)?;
             // The attachment remains effective even when this local handle or
             // the supervisor dies. It ends only with the drained cgroup itself.
             let _device_policy = crate::devices::Policy::vm().attach_empty(&child.directory)?;

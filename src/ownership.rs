@@ -59,19 +59,32 @@ impl Reservations {
     }
     /// A held reservation can cover the subset selected for an approved cold
     /// start, but never another owner, process incarnation or extra identity.
+    #[cfg(test)]
     pub(crate) fn check(
         &self,
         parent: &Path,
         deployment: &str,
         processes: &[&Process],
     ) -> Result<()> {
+        self.check_ids(
+            parent,
+            deployment,
+            processes.iter().map(|p| p.identity.ok_or("missing guest identity"))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        )
+    }
+
+    pub(crate) fn check_ids(
+        &self,
+        parent: &Path,
+        deployment: &str,
+        identities: impl IntoIterator<Item = (u32, u32)>,
+    ) -> Result<()> {
         if self.process != unsafe { libc::getpid() }
             || self.owner != owner(parent, deployment)?
-            || processes.iter().any(|p| {
-                p.identity.is_none_or(|(uid, gid)| {
+            || identities.into_iter().any(|(uid, gid)| {
                     !self.identities.contains(&format!("uid-{uid}"))
                         || !self.identities.contains(&format!("gid-{gid}"))
-                })
             })
         {
             return Err("held identity reservations do not cover this deployment".into());
@@ -253,6 +266,18 @@ pub fn claim_with_devices(
     processes: &[&Process],
     devices: &[&Device],
 ) -> Result<Reservations> {
+    let identities = processes.iter()
+        .map(|p| p.identity.ok_or("missing guest identity"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    claim_ids(parent, deployment, &identities, devices)
+}
+
+pub(crate) fn claim_ids(
+    parent: &Path,
+    deployment: &str,
+    identities: &[(u32, u32)],
+    devices: &[&Device],
+) -> Result<Reservations> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("identity reservation requires the privileged deployment supervisor".into());
     }
@@ -283,18 +308,15 @@ pub fn claim_with_devices(
     }
     let directory = open_at(&run, "wros-ownership", libc::O_RDONLY | libc::O_DIRECTORY)
         .map_err(|e| e.to_string())?;
-    if processes.len() > 128 || devices.len() > crate::devices::MAX_RULES {
+    if identities.len() > 128 || devices.len() > crate::devices::MAX_RULES {
         return Err("identity/device reservation budget exceeded".into());
     }
     for device in devices {
         device.revalidate()?;
     }
-    let mut identities = processes
+    let mut identities = identities
         .iter()
-        .map(|p| p.identity.ok_or("missing guest identity"))
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .flat_map(|(uid, gid)| [format!("uid-{uid}"), format!("gid-{gid}")])
+        .flat_map(|&(uid, gid)| [format!("uid-{uid}"), format!("gid-{gid}")])
         .collect::<Vec<_>>();
     identities.extend(devices.iter().map(|d| d.key().claim_name()));
     reserve(directory, owner, &identities)

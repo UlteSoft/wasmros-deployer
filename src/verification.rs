@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -148,9 +149,17 @@ pub fn verify(
 pub struct FrozenFile(pub File);
 impl FrozenFile {
     pub fn copy(mut source: File, limit: u64, expected: Option<&str>) -> Result<Self> {
+        Self::copy_with(&mut source, limit, expected, false)
+    }
+
+    fn copy_with(mut source: impl Read, limit: u64, expected: Option<&str>, elf: bool) -> Result<Self> {
         let name = std::ffi::CString::new("wros-admitted").unwrap();
+        let mut flags = libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC;
+        if elf {
+            flags |= libc::MFD_EXEC;
+        }
         let fd = unsafe {
-            libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC)
+            libc::memfd_create(name.as_ptr(), flags)
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().to_string());
@@ -176,10 +185,20 @@ impl FrozenFile {
         if expected.is_some_and(|e| e != format!("{:x}", hash.finalize())) {
             return Err("immutable snapshot digest mismatch".into());
         }
-        let seals =
+        let mut seals =
             libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if elf {
+            if unsafe { libc::fchmod(fd, 0o555) } != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            seals |= libc::F_SEAL_EXEC;
+        }
         if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
+        }
+        if elf {
+            target = File::open(format!("/proc/self/fd/{fd}")).map_err(|e| e.to_string())?;
+            target = crate::supervisor::retained(target)?;
         }
         Ok(Self(target))
     }
@@ -249,11 +268,90 @@ pub fn verify_driver(
         .arg(&driver.kind)
         .arg(&snapshot.0)
         .arg(signer);
-    verify_with(cmd, |status, reason| match (status.code(), reason) {
+    verify_with(cmd, elf_outcome, true)
+}
+
+fn elf_outcome(status: ExitStatus, reason: &[u8]) -> Option<Signature> {
+    match (status.code(), reason) {
         (Some(2), b"ELF verification: driver has no Linux appended module signature\n") => Some(Signature::Unsigned),
         (Some(3), b"ELF verification: driver signature invalid or signer is not the host-pinned certificate\n") => Some(Signature::Invalid),
         _ => None,
-    })
+    }
+}
+
+/// Exact launch bytes and the trusted verifier selected during initial admission.
+pub struct NativeAdmission {
+    pub(crate) image: FrozenFile,
+    verifier: File,
+    signer: PathBuf,
+    signer_digest: String,
+    bundle: PathBuf,
+    verdict: Signature,
+}
+
+impl NativeAdmission {
+    pub fn prepare(
+        verifier: &Path,
+        bundle: &Path,
+        directory: &File,
+        policies: &Path,
+        driver: &DriverArtifact,
+        exception: Option<Signature>,
+    ) -> Result<Self> {
+        if driver.kind != "executable" {
+            return Err("native launch requires an ELF executable".into());
+        }
+        let path = protected(verifier, bundle, false)?;
+        let verifier = crate::supervisor::retained(File::open(path).map_err(|e| e.to_string())?)?;
+        let signer = policy(policies, driver.elf_signer.as_ref().ok_or("missing ELF signer policy")?, bundle)?;
+        let signer_digest = crate::manifest::sha256(crate::manifest::open_regular(&signer, crate::manifest::MAX_XML)?)?;
+        let image = FrozenFile::copy_with(local_file(directory, &driver.file)?, MAX_MODULE, Some(&driver.digest), true)?;
+        let mut admitted = Self { image, verifier, signer, signer_digest, bundle: bundle.into(), verdict: Signature::Verified };
+        let verdict = admitted.verify(true)?;
+        if verdict != Signature::Verified && exception != Some(verdict) {
+            return Err(format!("{verdict:?} ELF signature rejected for {:?}", driver.id));
+        }
+        admitted.verdict = verdict;
+        Ok(admitted)
+    }
+
+    pub fn verdict(&self) -> Signature {
+        self.verdict
+    }
+
+    pub(crate) fn reverify(&self) -> Result<()> {
+        if self.verify(false)? != self.verdict {
+            return Err("ELF verification outcome changed after review".into());
+        }
+        Ok(())
+    }
+
+    fn verify(&self, audit: bool) -> Result<Signature> {
+        let signer = protected(&self.signer, &self.bundle, false)?;
+        let signer = FrozenFile::copy(
+            crate::manifest::open_regular(&signer, crate::manifest::MAX_XML)?,
+            crate::manifest::MAX_XML,
+            Some(&self.signer_digest),
+        )?;
+        let signer = FrozenFile(crate::supervisor::retained(signer.0)?);
+        let verifier = self.verifier.as_raw_fd();
+        let image = self.image.0.as_raw_fd();
+        let certificate = signer.0.as_raw_fd();
+        let mut cmd = Command::new(format!("/proc/self/fd/{verifier}"));
+        cmd.arg("--verify-elf-driver").arg("executable").arg(self.image.path()).arg(signer.path());
+        // The verifier opens the sealed image and PEM through inherited handles.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in [image, certificate] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        verify_with(cmd, elf_outcome, audit)
+    }
 }
 
 fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path) -> Result<Signature> {
@@ -268,22 +366,23 @@ fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path) -> Result<Sig
         } else {
             None
         }
-    })
+    }, true)
 }
 
 fn verify_with(
     mut cmd: Command,
     classify: impl Fn(ExitStatus, &[u8]) -> Option<Signature>,
+    audit: bool,
 ) -> Result<Signature> {
     cmd.env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    println!(
+    if audit { println!(
         "INFO Executing verifier {:?} {:?}",
         cmd.get_program(),
         cmd.get_args().collect::<Vec<_>>()
-    );
+    ); }
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let end = Instant::now() + VERIFY_TIMEOUT;
     loop {
@@ -307,9 +406,11 @@ fn verify_with(
                 if reason.len() > 4096 {
                     return Err("verifier diagnostic exceeds limit".into());
                 }
-                eprintln!("Verifier rejection: {:?}", String::from_utf8_lossy(&reason));
+                if audit {
+                    eprintln!("Verifier rejection: {:?}", String::from_utf8_lossy(&reason));
+                }
                 return classify(status, &reason)
-                    .ok_or_else(|| "unclassified verification, trust or policy failure".into());
+                    .ok_or_else(|| format!("unclassified verification, trust or policy failure: {:?}", String::from_utf8_lossy(&reason)));
             }
             Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
             other => {
@@ -324,6 +425,18 @@ fn verify_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_image_descriptor_is_read_only_with_sealed_executable_mode() {
+        let image = FrozenFile::copy_with(&b"fixture"[..], 64, None, true).unwrap();
+        let fd = image.0.as_raw_fd();
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        assert!(seals >= 0 && seals & libc::F_SEAL_EXEC != 0 && seals & libc::F_SEAL_WRITE != 0);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_eq!(image.0.metadata().unwrap().mode() & 0o777, 0o555);
+        assert_ne!(unsafe { libc::fchmod(fd, 0o544) }, 0);
+        assert_eq!(image.0.metadata().unwrap().mode() & 0o777, 0o555);
+    }
+
     #[test]
     fn admitted_memory_cannot_be_mutated_or_resized() {
         let source = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();

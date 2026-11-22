@@ -59,6 +59,19 @@ pub struct DriverArtifact {
     pub kind: String,
     pub hardware_id: String,
     pub elf_signer: Option<PathBuf>,
+    pub attachment: Option<DriverAttachment>,
+}
+#[derive(Debug)]
+pub struct DriverAttachment {
+    pub vm: String,
+    pub alias: String,
+    pub socket_contract: [u8; 32],
+    pub sandbox: PathBuf,
+    pub identity: (u32, u32),
+    pub memory_bytes: u64,
+    pub pids: u32,
+    pub cpu_micros: u32,
+    pub request_millis: u32,
 }
 #[derive(Debug)]
 pub struct Deployment {
@@ -174,6 +187,7 @@ pub enum Permission<'a> {
     ClockGrant(&'a str),
     LocalOperation { kind: &'a str, alias: &'a str, operation: &'a str },
     SelfReport(&'a str),
+    DriverRead(&'a str),
     Metadata { kind: &'a str, alias: &'a str, target: &'a str, operation: &'a str },
 }
 impl<'a> Permission<'a> {
@@ -213,6 +227,10 @@ impl<'a> Permission<'a> {
     }
 
     pub fn from_key(key: &'a str) -> Option<Self> {
+        if let Some(alias) = key.strip_prefix("driver/").and_then(|rest| rest.strip_suffix("/buffer.read")) {
+            return (id(alias) && !alias.starts_with('-') && key.len() <= 128)
+                .then_some(Self::DriverRead(alias));
+        }
         if let Some(selector) = key.strip_prefix("report/") {
             let (family, function) = selector.split_once('.').map_or((selector, None), |(f, n)| (f, Some(n)));
             if !matches!(family, "wasip1" | "ros1v1" | "ros2v1" | "rosv2" | "preloaddl" | "preloadwasm") ||
@@ -298,6 +316,57 @@ fn path(s: &str) -> Result<PathBuf> {
     }
     Ok(p.into())
 }
+
+fn driver_attachment(node: Node) -> Result<DriverAttachment> {
+    attributes(node, "attachment", &[
+        "vm", "alias", "contract-sha256", "sandbox", "uid", "gid", "memory-bytes", "pids", "cpu-micros", "request-millis",
+    ])?;
+    let vm = attr(node, "vm")?;
+    let alias = attr(node, "alias")?;
+    if node.children().any(|n| n.is_element())
+        || !id(vm) || vm.starts_with('-')
+        || !matches!(Permission::from_key(&format!("driver/{alias}/buffer.read")), Some(Permission::DriverRead(_)))
+    {
+        return Err("invalid driver attachment endpoints".into());
+    }
+    let number = |name| -> Result<u32> {
+        attr(node, name)?.parse().map_err(|_| format!("invalid driver {name}"))
+    };
+    let identity = (number("uid")?, number("gid")?);
+    let pids = number("pids")?;
+    let cpu_micros = number("cpu-micros")?;
+    let request_millis = if node.attribute("request-millis").is_some() {
+        number("request-millis")?
+    } else {
+        2000
+    };
+    let memory_bytes = attr(node, "memory-bytes")?.parse()
+        .map_err(|_| "invalid driver memory budget")?;
+    if [identity.0, identity.1].iter().any(|n| *n == 0 || *n == u32::MAX)
+        || !(1..=65536).contains(&pids)
+        || !(1000..=100_000_000).contains(&cpu_micros)
+        || !(1..=180_000).contains(&request_millis)
+        || memory_bytes == 0
+    {
+        return Err("driver requires a non-root identity and bounded resources".into());
+    }
+    let digest = attr(node, "contract-sha256")?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("invalid driver contract digest".into());
+    }
+    let mut socket_contract = [0; 32];
+    for (index, value) in socket_contract.iter_mut().enumerate() {
+        *value = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid driver contract digest")?;
+    }
+    if socket_contract == [0; 32] {
+        return Err("driver contract digest cannot be zero".into());
+    }
+    Ok(DriverAttachment {
+        vm: vm.into(), alias: alias.into(), socket_contract, sandbox: path(attr(node, "sandbox")?)?,
+        identity, memory_bytes, pids, cpu_micros, request_millis,
+    })
+}
 pub fn deployment(s: &str) -> Result<Deployment> {
     let d = document(s)?;
     let root = d.root_element();
@@ -382,9 +451,13 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 || version.len() > 128
                 || !version.bytes().all(|b| b.is_ascii_graphic())
-                || node.children().any(|n| n.is_element())
             {
                 return Err("invalid driver or conflicting hardware owner".into());
+            }
+            let mut children = node.children().filter(Node::is_element);
+            let attachment = children.next().map(driver_attachment).transpose()?;
+            if children.next().is_some() || (attachment.is_some() && kind != "executable") {
+                return Err("an executable driver may define one attachment".into());
             }
             drivers.push(DriverArtifact {
                 id: name.into(),
@@ -394,6 +467,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 kind: kind.into(),
                 vendor_version: version.into(),
                 elf_signer: node.attribute("elf-signer").map(path).transpose()?,
+                attachment,
             });
             continue;
         }
@@ -520,6 +594,17 @@ pub fn deployment(s: &str) -> Result<Deployment> {
     if processes.is_empty() {
         return Err("empty deployment".into());
     }
+    let mut attached_vms = BTreeSet::new();
+    let mut uids = processes.iter().filter_map(|p| p.identity.map(|(uid, _)| uid)).collect::<BTreeSet<_>>();
+    let mut gids = processes.iter().filter_map(|p| p.identity.map(|(_, gid)| gid)).collect::<BTreeSet<_>>();
+    for attachment in drivers.iter().filter_map(|driver| driver.attachment.as_ref()) {
+        if !processes.iter().any(|p| p.id == attachment.vm)
+            || !attached_vms.insert(&attachment.vm)
+            || !uids.insert(attachment.identity.0) || !gids.insert(attachment.identity.1)
+        {
+            return Err("driver attachment requires an existing dedicated VM and distinct host identities".into());
+        }
+    }
     Ok(Deployment {
         id: name.into(),
         processes,
@@ -554,6 +639,12 @@ pub fn recommendations(s: &str) -> Result<BTreeMap<String, bool>> {
                 attributes(n, "self-report", &["selector", "access"])?;
                 let key = format!("report/{}", attr(n, "selector")?);
                 Permission::from_key(&key).ok_or("invalid permission-report selector")?;
+                (key, attr(n, "access")?)
+            }
+            "driver-resource" => {
+                attributes(n, "driver-resource", &["alias", "operation", "access"])?;
+                let key = format!("driver/{}/{}", attr(n, "alias")?, attr(n, "operation")?);
+                Permission::from_key(&key).ok_or("invalid driver resource or operation")?;
                 (key, attr(n, "access")?)
             }
             "metadata" => {
