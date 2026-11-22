@@ -8,7 +8,7 @@ for role in admission int-success aot-success int-wrong-key; do
     busybox mkdir -m 700 "/run/$role"
     /bin/cosign wasm secure policy-init --output "/trust/$role.policy" --state-dir "/run/$role" \
         --trust-root /trust/wasm-root.pem --certificate /trust/wasm-signer.pem \
-        --module-id main --algorithms Ed25519 --capabilities 32
+        --module-id main --algorithms ES384 --capabilities 32
     if test "$role" != admission; then
         busybox chmod 644 "/trust/$role.policy"
         busybox chown -R 24001:24001 "/run/$role"
@@ -17,9 +17,11 @@ done
 
 verify() {
     /bin/wros-deployer verify "$1" --policy-root /trust \
-        --cosign /bin/cosign --scratch-directory /run/scratch
+        --cosign /bin/cosign --elf-verifier /bin/uwvm2-ros --scratch-directory /run/scratch
 }
-verify /bundle/deployment.xml
+verify /bundle/deployment.xml > /run/admission.log
+busybox cat /run/admission.log
+busybox grep -F 'ELF CMS signature verified for driver "unitree"' /run/admission.log
 echo 'CASE unitree-wsea-admission PASS'
 if verify /bundle/changed.xml >/run/changed.log 2>&1; then
     exit 1

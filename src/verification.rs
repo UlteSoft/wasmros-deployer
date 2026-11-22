@@ -1,5 +1,5 @@
 //! First-stage offline WSEA admission on the exact reviewed Wasm bytes.
-use crate::manifest::Result;
+use crate::manifest::{local_file, DriverArtifact, Result};
 use crate::verdict::Signature;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -92,12 +92,12 @@ impl Drop for Snapshot {
     }
 }
 
-fn create_snapshot(scratch: &Path, mut input: File, digest: &str) -> Result<Snapshot> {
+fn create_snapshot(scratch: &Path, mut input: File, digest: &str, suffix: &str) -> Result<Snapshot> {
     let mut random = [0u8; 16];
     File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut random))
         .map_err(|e| e.to_string())?;
-    let path = scratch.join(format!("module-{:032x}.wasm", u128::from_le_bytes(random)));
+    let path = scratch.join(format!("image-{:032x}.{suffix}", u128::from_le_bytes(random)));
     let mut copy = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -202,14 +202,8 @@ pub fn admit(
 ) -> Result<Admission> {
     let verifier = protected(verifier, bundle, false)?;
     let trust = protected(trust, bundle, false)?;
-    let scratch = protected(scratch, bundle, true)?;
-    let info = fs::metadata(&scratch).map_err(|e| e.to_string())?;
-    if info.mode() & 0o777 != 0o700 || info.uid() != unsafe { libc::geteuid() } {
-        return Err(
-            "verification scratch must be a private directory owned by the operator".into(),
-        );
-    }
-    let snapshot = create_snapshot(&scratch, module, digest)?;
+    let scratch = private_scratch(scratch, bundle)?;
+    let snapshot = create_snapshot(&scratch, module, digest, "wasm")?;
     let signature = check_signature(&verifier, &snapshot.0, &trust)?;
     let module = FrozenFile::copy(
         File::open(&snapshot.0).map_err(|e| e.to_string())?,
@@ -219,13 +213,69 @@ pub fn admit(
     Ok(Admission { module, signature })
 }
 
+fn private_scratch(scratch: &Path, bundle: &Path) -> Result<PathBuf> {
+    let scratch = protected(scratch, bundle, true)?;
+    let info = fs::metadata(&scratch).map_err(|e| e.to_string())?;
+    if info.mode() & 0o777 != 0o700 || info.uid() != unsafe { libc::geteuid() } {
+        return Err(
+            "verification scratch must be a private directory owned by the operator".into(),
+        );
+    }
+    Ok(scratch)
+}
+
+/// Check the same appended CMS envelope used by the VM's native verifier,
+/// using its offline command. This path does not load or execute the ELF.
+pub fn verify_driver(
+    verifier: &Path,
+    scratch: &Path,
+    bundle: &Path,
+    directory: &File,
+    policies: &Path,
+    driver: &DriverArtifact,
+) -> Result<Signature> {
+    let verifier = protected(verifier, bundle, false)?;
+    let signer = driver.elf_signer.as_ref().ok_or("missing ELF signer policy")?;
+    let signer = policy(policies, signer, bundle)?;
+    let scratch = private_scratch(scratch, bundle)?;
+    let snapshot = create_snapshot(
+        &scratch,
+        local_file(directory, &driver.file)?,
+        &driver.digest,
+        "elf",
+    )?;
+    let mut cmd = Command::new(verifier);
+    cmd.arg("--verify-elf-driver")
+        .arg(&driver.kind)
+        .arg(&snapshot.0)
+        .arg(signer);
+    verify_with(cmd, |status, reason| match (status.code(), reason) {
+        (Some(2), b"ELF verification: driver has no Linux appended module signature\n") => Some(Signature::Unsigned),
+        (Some(3), b"ELF verification: driver signature invalid or signer is not the host-pinned certificate\n") => Some(Signature::Invalid),
+        _ => None,
+    })
+}
+
 fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path) -> Result<Signature> {
     let mut cmd = Command::new(verifier);
     cmd.args(["wasm", "secure", "verify"])
         .arg(snapshot)
         .arg("--policy")
-        .arg(trust)
-        .env_clear()
+        .arg(trust);
+    verify_with(cmd, |status, reason| {
+        if status.code() == Some(1) {
+            Signature::rejected(reason)
+        } else {
+            None
+        }
+    })
+}
+
+fn verify_with(
+    mut cmd: Command,
+    classify: impl Fn(ExitStatus, &[u8]) -> Option<Signature>,
+) -> Result<Signature> {
+    cmd.env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -240,9 +290,6 @@ fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path) -> Result<Sig
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(Signature::Verified),
             Ok(Some(status)) => {
-                if status.code() != Some(1) {
-                    return Err(format!("verifier failed ({status})"));
-                }
                 // The trusted verifier has exited. Bound the diagnostic and refuse
                 // incomplete output if a descendant still holds the writing end.
                 let pipe = child.stderr.take().ok_or("missing verifier diagnostic")?;
@@ -261,7 +308,7 @@ fn check_signature(verifier: &Path, snapshot: &Path, trust: &Path) -> Result<Sig
                     return Err("verifier diagnostic exceeds limit".into());
                 }
                 eprintln!("Verifier rejection: {:?}", String::from_utf8_lossy(&reason));
-                return Signature::rejected(&reason)
+                return classify(status, &reason)
                     .ok_or_else(|| "unclassified verification, trust or policy failure".into());
             }
             Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),

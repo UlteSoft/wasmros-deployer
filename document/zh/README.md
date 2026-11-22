@@ -39,6 +39,19 @@ wros-deployer verify deployment.xml --policy-root /protected/policies \
 
 CLI 会逐项显示每个 ROSv2 接口的审核结果（允许或拒绝），并明确提示权限列表为空的情形。开放接口与授予指定资源的操作权限分别管理。
 
+### 校验原生 ELF 驱动
+
+清单包含 `<driver>` 时，给 `verify` 加上 `--elf-verifier /opt/wros/bin/uwvm2-ros`。`elf-signer` 指定管理员 `--policy-root` 下的 PEM X.509 证书。部署器核对整个签名 ELF 的 SHA-256，再对私有快照执行 `uwvm2-ros --verify-elf-driver KIND ELF SIGNER.pem`。该命令检查 Linux 追加式 CMS、固定签名者、证书有效期、摘要强度和 ELF 的宿主 ABI，预检阶段不会加载驱动。
+
+厂商可用同一把 P-384 私钥和证书发布两种制品。Wasm 使用 `cosign wasm secure sign --algorithm ES384`，同时提供其 WSEA 策略和 CRL。ELF 签名后，将整个签名文件的摘要填入部署 XML。
+
+```sh
+scripts/sign-file sha384 publisher.key publisher.pem driver.so driver.signed.so
+sha256sum driver.signed.so
+```
+
+默认拒绝无签名和签名错误的 ELF。仅在预检时，可分别用 `--allow-unsigned-elf DRIVER=SHA256` 和 `--allow-invalid-elf-signature DRIVER=SHA256` 放行匹配驱动 ID、完整摘要和拒绝原因的制品，并显示警告。损坏的封装、信任错误和未知验签失败仍会拒绝。Wasm 放行参数只作用于 Wasm。管理员须从固定的 ELF 信任库移除已吊销或失陷的证书。
+
 ## 运行已审核的 VM
 
 `run` 要求部署监管进程具有 root 身份，并使用外部服务管理器预先交付的 cgroup v2 子树。各 VM 使用互不相同的非 root 用户和组。操作员须为 WROS 预留专用系统身份；部署器另外通过[宿主身份所有权登记](host-identities.md)拒绝共享登记目录的管理进程之间发生身份冲突。它不自动分配系统账号，也不能约束非托管特权软件。验签器和 VM 可执行文件必须位于提交包之外的受保护路径。当前 `run` 遇到原生驱动声明会在启动任何进程之前拒绝。

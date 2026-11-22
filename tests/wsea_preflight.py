@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 
@@ -19,11 +20,15 @@ def main():
     parser.add_argument("--sdk-source", type=Path, help="Trusted SDK checkout for the core Wasm import reader.")
     parser.add_argument("--sdk-interface-probe", type=Path, help="Completed strict all-interface fixture for this test authority")
     parser.add_argument("--local-scheduling", action="store_true", help="Sign the per-alias scheduling probe for a QEMU run")
+    parser.add_argument("--vendor-elf", type=Path, help="Also exercise the VM's appended-CMS ELF verifier.")
+    parser.add_argument("--sign-file", type=Path, help="Linux scripts/sign-file for the ELF test.")
     args = parser.parse_args()
     if args.sdk_interface_probe and not args.sdk_module:
         parser.error("--sdk-interface-probe requires --sdk-module and --sdk-source")
     if bool(args.sdk_module) != bool(args.sdk_source):
         parser.error("--sdk-module and --sdk-source must be supplied together")
+    if bool(args.vendor_elf) != bool(args.sign_file) or (args.vendor_elf and (args.sdk_module or args.local_scheduling)):
+        parser.error("the ELF replay requires --vendor-elf and --sign-file and uses its own signing profile")
     os.umask(0o077)
     args.output = args.output.resolve()
     args.output.mkdir(mode=0o700, exist_ok=False)
@@ -49,11 +54,12 @@ def main():
     fixture_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture_module)
     fixture = fixture_module.Fixtures(out / "test-authority")
-    ca = fixture.pki("test", family="ED25519")
+    ca = fixture.pki("test", family="EC", curve="secp384r1") if args.vendor_elf else fixture.pki("test", family="ED25519")
+    algorithm = "ES384" if args.vendor_elf else "Ed25519"
     policy = policies / "body.policy"
     check("operator-bootstrap", [args.cosign, "wasm", "secure", "policy-init", "--output", policy,
                                  "--state-dir", state, "--trust-root", ca["root"], "--certificate",
-                                 ca["certificate"], "--module-id", "body", "--algorithms", "Ed25519"], True)
+                                 ca["certificate"], "--module-id", "body", "--algorithms", algorithm], True)
 
     unsigned = bundle / "unsigned.wasm"
     unsigned.write_bytes(bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b0005046e6f7465"))
@@ -65,7 +71,7 @@ def main():
         local_scheduling.create(args.vm_source.resolve(), out, args.cosign, ca, check, stamp)
     check("sign", [args.cosign, "wasm", "secure", "sign", unsigned, "--policy", policy, "--key", ca["key"],
                    "--certificate", ca["certificate"], "--crl", ca["crl"], "--module-id", "body",
-                   "--module-version", "1", "--algorithm", "Ed25519", "--not-before", stamp(-60),
+                   "--module-version", "1", "--algorithm", algorithm, "--not-before", stamp(-60),
                    "--not-after", stamp(3600), "--output", signed], True)
     if args.sdk_module is not None:
         reader_path = args.sdk_source.resolve() / "install/imports.py"
@@ -118,11 +124,13 @@ def main():
         (out / "sdk-input.json").write_text(json.dumps(sdk_input, indent=2))
     deployment = bundle / "deployment.xml"
 
-    def configure(file, digest=None):
+    def configure(file, digest=None, driver=None):
         root = ET.Element("deployment", id="cell")
         ET.SubElement(root, "vm", id="body", module=file.name, policy=policy.name,
                       sha256=digest or hashlib.sha256(file.read_bytes()).hexdigest(),
                       **{"memory-bytes": "268435456", "pids": "8"})
+        if driver is not None:
+            ET.SubElement(root, "driver", driver)
         ET.ElementTree(root).write(deployment)
 
     verify = [args.deployer, "verify", deployment, "--policy-root", policies,
@@ -143,6 +151,49 @@ def main():
             check(label + "-actual-vm", [args.vm, *argv], True)
 
     check("deployer-accepts-signed", verify, True)
+    if args.vendor_elf:
+        elf = bundle / "provider"
+        signer = policies / "vendor.pem"
+        shutil.copyfile(ca["certificate"], signer)
+        check("sign-elf-with-wasm-key", [args.sign_file, "sha384", ca["key"], ca["certificate"],
+                                       args.vendor_elf.resolve(), elf], True)
+        signed_elf = elf.read_bytes()
+        assert signed_elf.endswith(b"~Module signature appended~\n")
+        trace = [*verify, "--elf-verifier", args.vm.resolve()]
+        attrs = {"id": "vendor", "file": elf.name, "kind": "executable",
+                 "hardware-id": "offline-device", "vendor-version": "test",
+                 "elf-signer": signer.name, "sha256": hashlib.sha256(signed_elf).hexdigest()}
+        configure(signed, driver=attrs)
+        assert 'ELF CMS signature verified for driver "vendor"' in check("deployer-same-key-elf-wasm", trace, True)
+        check("separate-elf-verifier-required", verify, False)
+        check("real-vm-verifies-elf-without-loading", [args.vm, "--verify-elf-driver", "executable", elf, signer], True)
+        unsigned_elf = args.vendor_elf.read_bytes()
+        tampered_elf = bytearray(signed_elf)
+        tampered_elf[len(unsigned_elf) - 1] ^= 1
+        elf.write_bytes(tampered_elf)
+        check("deployer-rejects-changed-elf-digest", trace, False)
+        attrs["sha256"] = hashlib.sha256(tampered_elf).hexdigest()
+        configure(signed, driver=attrs)
+        check("deployer-rejects-invalid-elf-with-updated-digest", trace, False)
+        binding = "vendor=" + attrs["sha256"]
+        check("unsigned-elf-exception-does-not-admit-invalid", [*trace, "--allow-unsigned-elf", binding], False)
+        check("verified-development-invalid-elf-exception", [*trace, "--allow-invalid-elf-signature", binding], True)
+        assert "WARNING: Invalid ELF" in results[-1]["stderr"]
+        elf.write_bytes(unsigned_elf)
+        attrs["sha256"] = hashlib.sha256(unsigned_elf).hexdigest()
+        configure(signed, driver=attrs)
+        check("deployer-rejects-unsigned-elf", trace, False)
+        check("stale-elf-exception-refused", [*trace, "--allow-unsigned-elf", binding], False)
+        binding = "vendor=" + attrs["sha256"]
+        check("invalid-elf-exception-does-not-admit-unsigned", [*trace, "--allow-invalid-elf-signature", binding], False)
+        check("verified-development-unsigned-elf-exception", [*trace, "--allow-unsigned-elf", binding], True)
+        assert "WARNING: Unsigned ELF" in results[-1]["stderr"]
+        check("wasm-exception-cannot-select-elf", [*trace, "--allow-unsigned", binding], False)
+        elf.write_bytes(signed_elf)
+        attrs["sha256"] = hashlib.sha256(signed_elf).hexdigest()
+        configure(signed, driver={**attrs, "elf-signer": "missing.pem"})
+        check("missing-elf-trust-cannot-be-waived", [*trace, "--allow-invalid-elf-signature", "vendor=" + attrs["sha256"]], False)
+        configure(signed)
     checked_preview("valid-keeps-secondary", signed, "--allow-invalid-signature", True, True)
     run_vm(signed, True)
     configure(unsigned)

@@ -18,7 +18,8 @@ Use `wros-deployer plan deployment.xml --policy-root /protected/policies` to che
       policy="body.policy" recommendations="body-permissions.xml"
       memory-bytes="268435456" pids="8" start-on-boot="false" restart-on-crash="false"/>
   <driver id="joints" file="vendor/driver.so" vendor-version="1.2"
-      sha256="REPLACE_WITH_64_LOWERCASE_HEX" hardware-id="cell-arm" kind="shared-library"/>
+      sha256="REPLACE_WITH_64_LOWERCASE_HEX" hardware-id="cell-arm" kind="shared-library"
+      elf-signer="vendor-publisher.pem"/>
 </deployment>
 ```
 
@@ -46,6 +47,19 @@ The deployer copies at most 256 MiB per submitted module, hashes the bytes it co
 For a specific local development image, `verify` accepts `--allow-unsigned ID=SHA256` or `--allow-invalid-signature ID=SHA256`. Each option applies to one VM and the complete uploaded file digest. A recognized rejection of the matching kind emits a warning and the preview omits secondary verification for that image. A valid signature retains both checks. Unknown verifier failures, missing trust, policy or revocation errors, and a changed upload digest still fail verification.
 
 The CLI prints one INFO line for each reviewed ROSv2 interface and its allow or deny decision. An empty review is shown explicitly. Interface exposure and permission to use a particular resource are separate decisions.
+
+### Verify signed ELF drivers
+
+For a submission listing native drivers, add `--elf-verifier /opt/wros/bin/uwvm2-ros` to `verify`. The driver's `elf-signer` identifies a PEM X.509 certificate under the administrator's `--policy-root`. The deployer hashes the entire shipped ELF and invokes `uwvm2-ros --verify-elf-driver KIND ELF SIGNER.pem` on the private snapshot. The verifier checks the Linux appended CMS envelope, pinned signer, certificate validity, digest strength and host ELF ABI, then exits.
+
+The publisher can use one P-384 private key and certificate for both kinds of release. Sign the Wasm with `cosign wasm secure sign` and `--algorithm ES384`, using its WSEA policy and CRL. Sign the final ELF and record the complete signed file digest.
+
+```sh
+scripts/sign-file sha384 publisher.key publisher.pem driver.so driver.signed.so
+sha256sum driver.signed.so
+```
+
+Unsigned and invalidly signed ELFs fail by default. The preflight-only options `--allow-unsigned-elf DRIVER=SHA256` and `--allow-invalid-elf-signature DRIVER=SHA256` are separate, digest-bound exceptions and emit warnings. Malformed envelopes, missing trust and unknown verifier errors fail even with an exception. The Wasm exceptions apply only to Wasm. Administrators must remove revoked or compromised certificates from the pinned ELF trust store.
 
 ## Run reviewed VM processes
 

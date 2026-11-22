@@ -198,15 +198,15 @@ def sign(root, output):
     return {path.name: digest(path) for path in trust.iterdir()}
 
 
-def sign_wasm(args, root, wasm):
-    """@brief Issue a fixture certificate and sign the guest without staging private keys."""
+def sign_attachment(args, root, wasm):
+    """@brief Sign the Wasm and ELF with one disposable P-384 key."""
     fixtures = args.vm_source / "test/0073.ros-tests/support/source/security_wsea/algorithm_matrix.py"
     spec = importlib.util.spec_from_file_location("fixture_signer", fixtures)
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
     with tempfile.TemporaryDirectory(dir=args.signing_scratch) as directory:
         scratch = Path(directory)
-        authority = fixture.Fixtures(scratch / "authority").pki("unitree", family="ED25519")
+        authority = fixture.Fixtures(scratch / "authority").pki("unitree", curve="secp384r1")
         policy = scratch / "sign.policy"
         state = scratch / "state"
         state.mkdir(mode=0o700)
@@ -215,14 +215,14 @@ def sign_wasm(args, root, wasm):
         prefix = [args.cosign, "wasm", "secure"]
         run([*prefix, "policy-init", "--output", policy, "--state-dir", state,
              "--trust-root", authority["root"], "--certificate", authority["certificate"],
-             "--module-id", "main", "--algorithms", "Ed25519", "--capabilities", "32"])
+             "--module-id", "main", "--algorithms", "ES384", "--capabilities", "32"])
         now = datetime.now(timezone.utc)
         before = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         after = (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         signed = scratch / "signed.wasm"
         run([*prefix, "sign", unsigned, "--policy", policy, "--key", authority["key"],
              "--certificate", authority["certificate"], "--crl", authority["crl"],
-             "--module-id", "main", "--module-version", "1", "--algorithm", "Ed25519",
+             "--module-id", "main", "--module-version", "1", "--algorithm", "ES384",
              "--capabilities", "32", "--not-before", before, "--not-after", after,
              "--output", signed])
         for source, target in ((authority["root"], "trust/wasm-root.pem"),
@@ -230,6 +230,10 @@ def sign_wasm(args, root, wasm):
                                (signed, "bundle/controller.wasm")):
             shutil.copyfile(source, root / target)
             (root / target).chmod(0o644)
+        signed_elf = scratch / "unitree-provider"
+        run([args.sign_file, "sha384", authority["key"], authority["certificate"],
+             root / "bundle/unitree-provider", signed_elf])
+        shutil.copyfile(signed_elf, root / "bundle/unitree-provider")
 
 
 def build_attachment(args, root):
@@ -269,7 +273,7 @@ def build_attachment(args, root):
     for operation in ("capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"):
         build_wasm.extend(("--ros-operation", operation))
     run(build_wasm)
-    sign_wasm(args, root, wasm)
+    sign_attachment(args, root, wasm)
     controller = bundle / "controller.wasm"
     data = controller.read_bytes()
     if data.count(b"go2-state") != 1:
@@ -281,13 +285,14 @@ def build_attachment(args, root):
         ET.SubElement(manifest, "vm", id="main", module=module.name, policy="admission.policy",
                       sha256=digest(module), **{"memory-bytes": "536870912", "pids": "16"})
         ET.SubElement(manifest, "driver", id="unitree", file="unitree-provider", kind="executable",
-                      sha256=digest(binary), **{"vendor-version": "2.0.2", "hardware-id": "offline-go2"})
+                      sha256=digest(bundle / "unitree-provider"),
+                      **{"vendor-version": "2.0.2", "hardware-id": "offline-go2", "elf-signer": "wasm-signer.pem"})
         ET.ElementTree(manifest).write(bundle / filename)
 
     guest = tests / "vendor_unitree_attachment_guest.sh"
     shutil.copyfile(guest, root / "run/attachment-test.sh")
     inputs = [*source, wat, support / "unitree_low_state_contract.txt", guest, *ssl_inputs,
-              args.vm, args.cosign, args.deployer, args.provisioner, assembler]
+              args.vm, args.cosign, args.deployer, args.provisioner, args.sign_file, assembler]
     return {
         "inputs": {str(path): digest(path) for path in inputs},
         "compile_provider": list(map(str, compile_provider)),
@@ -295,6 +300,7 @@ def build_attachment(args, root):
         "guest_build_receipt": json.loads(wasm.with_suffix(".wasm.wros-wat.json").read_text()),
         "signed_wasm_sha256": digest(controller),
         "native_provider_sha256": digest(binary),
+        "signed_native_provider_sha256": digest(bundle / "unitree-provider"),
     }
 
 
@@ -307,7 +313,7 @@ def main():
     cli.add_argument("--qemu", type=lambda path: Path(path).absolute(), required=True)
     cli.add_argument("--accelerator", choices=("tcg", "kvm"), default="tcg")
     attachment_options = ("vm", "vm-source", "openssl-root", "deployer", "provisioner",
-                          "wrwat", "cosign", "signing-scratch")
+                          "wrwat", "cosign", "sign-file", "signing-scratch")
     for option in attachment_options:
         cli.add_argument("--" + option, type=lambda path: Path(path).resolve(strict=True))
     args = cli.parse_args()

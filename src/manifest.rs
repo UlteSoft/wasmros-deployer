@@ -58,6 +58,7 @@ pub struct DriverArtifact {
     pub vendor_version: String,
     pub kind: String,
     pub hardware_id: String,
+    pub elf_signer: Option<PathBuf>,
 }
 #[derive(Debug)]
 pub struct Deployment {
@@ -361,6 +362,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                     "vendor-version",
                     "kind",
                     "hardware-id",
+                    "elf-signer",
                 ],
             )?;
             let name = attr(node, "id")?;
@@ -391,6 +393,7 @@ pub fn deployment(s: &str) -> Result<Deployment> {
                 hardware_id: key.into(),
                 kind: kind.into(),
                 vendor_version: version.into(),
+                elf_signer: node.attribute("elf-signer").map(path).transpose()?,
             });
             continue;
         }

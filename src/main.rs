@@ -128,7 +128,7 @@ fn approve(mut rights: BTreeMap<String, bool>) -> Result<BTreeMap<String, bool>>
     Ok(rights)
 }
 fn run() -> Result<()> {
-    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
+    let usage = "usage: wros-deployer inspect-recovery MODULE.wasm\n       wros-deployer status --state-directory DIRECTORY\n       wros-deployer plan|review|verify|authorize|service|run|resume DEPLOYMENT.xml --policy-root DIRECTORY [--accept-recommendations for review/authorize/run] [--cosign EXECUTABLE --scratch-directory DIRECTORY for verify/authorize/service/run/resume] [--allow-unsigned ID=SHA256 | --allow-invalid-signature ID=SHA256 for verify/authorize/run] [--elf-verifier EXECUTABLE for verify with drivers] [--allow-unsigned-elf ID=SHA256 | --allow-invalid-elf-signature ID=SHA256 for verify] [--runtime EXECUTABLE (--cgroup-parent DIRECTORY | --supervisor-cgroup DIRECTORY) for authorize/service/run/resume] [--state-directory DIRECTORY required for authorize/service/resume and managed run]";
     let mut args = std::env::args().skip(1);
     let action = args.next().ok_or(usage)?;
     if action == "status" {
@@ -187,6 +187,7 @@ fn run() -> Result<()> {
     let mut options = BTreeMap::new();
     let mut accept = false;
     let mut exceptions = BTreeMap::new();
+    let mut elf_exceptions = BTreeMap::new();
     while let Some(key) = args.next() {
         if matches!(action.as_str(), "review" | "authorize" | "run")
             && key == "--accept-recommendations"
@@ -212,7 +213,24 @@ fn run() -> Result<()> {
             {
                 return Err("duplicate signature exception for one VM".into());
             }
+        } else if action == "verify"
+            && matches!(key.as_str(), "--allow-unsigned-elf" | "--allow-invalid-elf-signature")
+        {
+            let value = args.next().ok_or(usage)?;
+            let (id, digest) = value.split_once('=').ok_or(usage)?;
+            let kind = if key == "--allow-unsigned-elf" {
+                Signature::Unsigned
+            } else {
+                Signature::Invalid
+            };
+            if elf_exceptions
+                .insert(id.to_owned(), (digest.to_owned(), kind))
+                .is_some()
+            {
+                return Err("duplicate signature exception for one ELF driver".into());
+            }
         } else if key == "--policy-root"
+            || action == "verify" && key == "--elf-verifier"
             || matches!(
                 action.as_str(),
                 "verify" | "authorize" | "service" | "run" | "resume"
@@ -358,9 +376,38 @@ fn run() -> Result<()> {
         )
     }
     println!("deployment {:?}", plan.id);
+    for (id, (digest, _)) in &elf_exceptions {
+        if !plan
+            .drivers
+            .iter()
+            .any(|driver| &driver.id == id && &driver.digest == digest)
+        {
+            return Err(format!(
+                "ELF signature exception does not match a driver and digest: {id:?}"
+            ));
+        }
+    }
     for driver in &plan.drivers {
-        let path = local_file(&bundle, &driver.file)?;
-        if sha256(path)? != driver.digest {
+        if let Some((_, scratch)) = verifier {
+            let elf = options
+                .get("--elf-verifier")
+                .ok_or("verify requires --elf-verifier for native drivers")?;
+            let verdict = verification::verify_driver(elf, scratch, root, &bundle, policies, driver)
+                .map_err(|error| format!("ELF driver {:?}: {error}", driver.id))?;
+            if verdict == Signature::Verified {
+                println!("INFO ELF CMS signature verified for driver {:?}", driver.id);
+            } else if elf_exceptions
+                .get(&driver.id)
+                .is_some_and(|(_, kind)| *kind == verdict)
+            {
+                eprintln!("WARNING: {:?} ELF admitted for preflight by explicit exception for {:?} at SHA256 {}", verdict, driver.id, driver.digest);
+            } else {
+                return Err(format!(
+                    "{:?} ELF signature rejected for {:?}",
+                    verdict, driver.id
+                ));
+            }
+        } else if sha256(local_file(&bundle, &driver.file)?)? != driver.digest {
             return Err(format!("driver digest mismatch for {}", driver.id));
         }
         println!("INFO Local driver {:?}, vendor version {:?}, format {:?}, file {:?}, SHA256 {}, exclusive device {:?}, encrypted local attachment required.",

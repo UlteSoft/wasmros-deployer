@@ -165,9 +165,10 @@ executables and libraries with a disposable Ed25519 key. The guest verifies the
 manifest and rejects a modified copy before starting the native processes.
 
 The optional attachment inputs add a `wrwat` guest with WasmMTE enabled. The
-signer produces a WSEA-signed module using a disposable certificate. The
-deployer checks it first and the VM checks it again with independent rollback
-state. The Rust test provisioner passes fresh TLS credentials and sealed
+signer uses one disposable P-384 key to produce both the WSEA module signature
+and the Linux CMS signature on the native provider. Supply Linux's `scripts/sign-file`
+through `--sign-file`. The deployer verifies both artifacts and the VM checks the
+Wasm again with independent rollback state. The Rust test provisioner passes fresh TLS credentials and sealed
 bootstrap descriptors to separate non-root processes. The Go2 adapter reads a
 single joint sample from the official SDK and exposes only that bounded read.
 The VM, adapter, and loopback-only DDS writer have distinct cgroups. The
