@@ -15,6 +15,7 @@ import tarfile
 import xml.etree.ElementTree as ET
 
 from qemu_supervisor import digest, pack
+import unitree_sdk_application
 from vendor_qualification import cgroup
 from vendor_unitree_qemu import ARCHIVE_SHA256, REVISION, compile_attachment, sign_attachment
 
@@ -61,7 +62,7 @@ def stage_fixture(archive, root):
                 stream.seek(size + (-size) % 4, os.SEEK_CUR)
 
 
-def prepare_deployment(args, root, original):
+def prepare_deployment(args, root, original, sdk_review=None):
     """@brief Generate signatures, matching review documents, and controlled negative inputs."""
     bundle = root / "bundle"
     driver = bundle / "unitree-provider"
@@ -87,14 +88,20 @@ def prepare_deployment(args, root, original):
     compile_attachment(args, sdk, binary, ["-DWROS_UNITREE_RECORDED_SAMPLE"])
     shutil.copyfile(binary, driver)
     payload = driver.read_bytes()
-    sign_attachment(args, root, args.module)
+    sign_attachment(args, root, args.module, expected_sha256=sdk_review["artifact_sha256"] if sdk_review else None)
     (bundle / "unsigned").write_bytes(payload)
     modified = bytearray(driver.read_bytes())
     modified[len(payload) - 1] ^= 1
     (bundle / "invalid").write_bytes(modified)
     rights = ET.Element("recommendations")
-    for name in ("capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"):
+    interfaces = ([row["name"] for row in sdk_review["imports"]]
+                  if sdk_review else unitree_sdk_application.DRIVER_INTERFACES)
+    for name in interfaces:
         ET.SubElement(rights, "interface", name=name, expose="allow")
+    if sdk_review:
+        (bundle / "sdk-imports.txt").write_text("".join(name + "\n" for name in interfaces))
+        for name in unitree_sdk_application.CLOCK_INTERFACES:
+            ET.SubElement(rights, "local-resource", type="clock.steady", alias="steady", operation=name, access="allow")
     ET.ElementTree(rights).write(bundle / "denied.xml")
     ET.SubElement(rights, "driver-resource", alias="go2-state", operation="buffer.read", access="allow")
     ET.ElementTree(rights).write(bundle / "rights.xml")
@@ -102,11 +109,13 @@ def prepare_deployment(args, root, original):
     for label, provider in (("signed", driver), ("signed-int", driver), ("unsigned", bundle / "unsigned"),
                             ("invalid", bundle / "invalid"), ("permission-denied", driver)):
         deployment = ET.Element("deployment", id="unitree")
+        vm_policy = ("sdk-" + label + ".policy" if sdk_review and label in ("signed", "signed-int")
+                     else "vm.policy")
         ET.SubElement(deployment, "vm", id="main", module="controller.wasm", policy="admission.policy",
                       engine="interpreter" if label == "signed-int" else "aot",
                       uid="24101", gid="24101", sha256=digest(bundle / "controller.wasm"), pids="16",
                       recommendations="denied.xml" if label == "permission-denied" else "rights.xml",
-                      **{"vm-policy": "vm.policy", "memory-bytes": "536870912"})
+                      **{"vm-policy": vm_policy, "memory-bytes": "536870912"})
         node = ET.SubElement(deployment, "driver", id="unitree", file=provider.name, kind="executable",
                              sha256=digest(provider), **{"vendor-version": "2.0.2",
                              "hardware-id": "go2-low-state", "elf-signer": "wasm-signer.pem"})
@@ -147,15 +156,28 @@ def prepare_edge_cases(root):
     return helper
 
 
-def main():
+def main(argv=None, *, sdk_application=False):
     """@brief Verify source lineage, boot the kernel, and retain exact test outcomes."""
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("output", "base", "base-receipt", "module", "vm", "vm-source",
+    for name in ("output", "base", "base-receipt", "vm", "vm-source",
                  "deployer", "cosign", "sign-file", "signing-scratch", "sdk-archive", "openssl-root", "kernel", "bios",
                  "firmware-directory"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(), required=True)
+    if sdk_application:
+        parser.add_argument("--sdk", required=True, type=lambda p: Path(p).resolve(),
+                            help="trusted installed Unitree C SDK selection")
+        parser.add_argument("--sdk-application", required=True, type=lambda p: Path(p).resolve(),
+                            help="external Go2 C reader and adjacent .wros-build.json from wrc")
+        parser.add_argument("--approved-build-receipt-sha256", required=True,
+                            help="operator-approved digest of that compiler receipt")
+    else:
+        parser.add_argument("--module", type=lambda p: Path(p).resolve(), required=True)
     parser.add_argument("--qemu", type=lambda value: Path(value).absolute(), required=True)
-    args = parser.parse_args()
+    parser.add_argument("--accelerator", choices=("kvm", "tcg"), default="kvm")
+    parser.add_argument("--guest-timeout-seconds", type=int, default=110)
+    args = parser.parse_args(argv)
+    if not 30 <= args.guest_timeout_seconds <= 1800:
+        parser.error("guest timeout must be between 30 and 1800 seconds")
     group = cgroup()
     if any(".tmp" not in path.parts for path in (args.output, args.base, args.signing_scratch)):
         parser.error("fixtures and output must be under repository .tmp")
@@ -166,6 +188,10 @@ def main():
     args.output.mkdir(mode=0o700)
     for key in ("TMPDIR", "TMP", "TEMP"):
         os.environ[key] = str(args.output)
+    sdk_review = None
+    if sdk_application:
+        args.module, sdk_review = unitree_sdk_application.stage_approved(
+            args.sdk, args.sdk_application, args.approved_build_receipt_sha256, args.output / "sdk-application")
     root = args.output / "root"
     for name in ("bin", "etc", "dev", "proc", "sys", "run", "tmp", "trust", "bundle", "sandboxes/go2"):
         (root / name).mkdir(parents=True, exist_ok=True)
@@ -186,14 +212,15 @@ def main():
     for folder in ("lib", "lib64", "usr", "opt", "etc"):
         if (root / folder).is_dir():
             shutil.copytree(root / folder, sandbox / folder, copy_function=os.link)
-    contract = prepare_deployment(args, root, original)
+    contract = prepare_deployment(args, root, original, sdk_review)
     helper = prepare_edge_cases(root)
     entry = Path(__file__).with_name("qemu_native_launch_guest.sh")
     shutil.copyfile(entry, root / "init")
     (root / "init").chmod(0o755)
     initrd = args.output / "initramfs.cpio.gz"
     pack(root, initrd)
-    argv = [args.qemu, "-nodefaults", "-machine", "q35", "-accel", "kvm", "-cpu", "host",
+    cpu = ["-accel", "kvm", "-cpu", "host"] if args.accelerator == "kvm" else ["-accel", "tcg,thread=multi", "-cpu", "max"]
+    argv = [args.qemu, "-nodefaults", "-machine", "q35", *cpu,
             "-smp", "2", "-m", "2048", "-display", "none", "-serial", "stdio", "-monitor", "none",
             "-nic", "none", "-no-reboot", "-bios", args.bios, "-L", args.firmware_directory,
             "-kernel", args.kernel, "-initrd", initrd,
@@ -205,9 +232,17 @@ def main():
     receipt = {"inputs": {str(path): digest(path) for path in inputs},
                "deployment_binary_sha256": digest(root / "bin/wros-deployer"),
                "initramfs_sha256": digest(initrd), "cgroup": str(group), "argv": list(map(str, argv))}
+    if sdk_review:
+        receipt["sdk_application"] = sdk_review
+        receipt["signed_wasm_sha256"] = digest(root / "bundle/controller.wasm")
+        receipt["inputs"][str(args.sdk_application)] = sdk_review["artifact_sha256"]
+        receipt["inputs"][str(args.sdk_application) + ".wros-build.json"] = sdk_review["build_receipt_sha256"]
+    receipt["complete"] = False
+    result_path = args.output / "results.json"
+    result_path.write_text(json.dumps(receipt, indent=2) + "\n")
     serial = args.output / "serial.log"
     with serial.open("wb") as log:
-        result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=110)
+        result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=args.guest_timeout_seconds)
     transcript = serial.read_text(errors="replace")
     receipt["cases"] = re.findall(r"^CASE ([-a-z]+) PASS$", transcript, re.MULTILINE)
     expected = {"original-sdk-recorded-sample", "rejects-unsigned-by-default", "rejects-invalid-by-default",
@@ -217,10 +252,12 @@ def main():
                 "cancelled-review-does-not-start", "production-signed",
                 "production-signed-int", "production-unsigned", "production-invalid",
                 "production-sealed-replacement"}
+    if sdk_review:
+        expected.update(("unitree-sdk-signed", "unitree-sdk-signed-int"))
     receipt["complete"] = (result.returncode == 0 and "WROS_NATIVE_LAUNCH_PASS" in transcript
                            and set(receipt["cases"]) == expected and len(receipt["cases"]) == len(expected))
     receipt["serial_sha256"] = digest(serial)
-    (args.output / "results.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    result_path.write_text(json.dumps(receipt, indent=2) + "\n")
     if not receipt["complete"]:
         raise SystemExit(transcript[-5000:])
     print("Production native ELF launch verified.")

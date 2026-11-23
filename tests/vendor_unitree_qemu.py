@@ -198,7 +198,7 @@ def sign(root, output):
     return {path.name: digest(path) for path in trust.iterdir()}
 
 
-def sign_attachment(args, root, wasm):
+def sign_attachment(args, root, wasm, *, expected_sha256=None):
     """@brief Sign the Wasm and ELF with one disposable P-384 key."""
     fixtures = args.vm_source / "test/0073.ros-tests/support/source/security_wsea/algorithm_matrix.py"
     spec = importlib.util.spec_from_file_location("fixture_signer", fixtures)
@@ -212,6 +212,8 @@ def sign_attachment(args, root, wasm):
         state.mkdir(mode=0o700)
         unsigned = scratch / "unsigned.wasm"
         shutil.copyfile(wasm, unsigned)
+        if expected_sha256 is not None and digest(unsigned) != expected_sha256:
+            raise ValueError("Wasm signing input differs from the reviewed compiler artifact")
         prefix = [args.cosign, "wasm", "secure"]
         run([*prefix, "policy-init", "--output", policy, "--state-dir", state,
              "--trust-root", authority["root"], "--certificate", authority["certificate"],

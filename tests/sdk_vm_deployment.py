@@ -16,7 +16,14 @@ def digest(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    if sys.argv[1:2] == ["unitree-build"]:
+        from unitree_sdk_application import main as build
+        return build(sys.argv[2:])
+    if sys.argv[1:2] == ["unitree"]:
+        from qemu_native_launch import main as deploy
+        return deploy(sys.argv[2:], sdk_application=True)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        "Use unitree-build --help for an external Go2 C project, or unitree --help for its signed DDS replay."))
     for name in ('sdk', 'vm', 'vm-source', 'deployer', 'cosign', 'kernel', 'bios',
                  'firmware-directory', 'output', 'authority-directory'):
         parser.add_argument('--' + name, required=True, type=lambda value: Path(value).resolve())

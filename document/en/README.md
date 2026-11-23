@@ -247,6 +247,33 @@ The full signed installation test accepts `--accelerator tcg` (default) or `--ac
 
 For D BetterC, the fixture checks the operator-approved receipt digest and runs the installed `wrd verify` against the selected VM before signing the application. A public Unitree D installation built the Xmake application at SDK commit `5fa860a356f19ed29aea514142eb897c3231951f`. It passed all 42 interpreter deployment cases under QEMU TCG, including the independent deployer and VM signature checks. The application imported only `uwvm_ros_v2.abi`.
 
+### Sign and deploy an external Unitree Go2 reader
+
+Use an installed public Unitree C selection for `UNITREE_SDK`. The external reader uses the SDK’s driver, steady-clock and Go2 decoding APIs. It checks the tick and first joint position received from the driver. Build it from the deployer checkout. [External C project](../../examples/unitree/go2-state/main.c)
+
+```sh
+python3 -B tests/sdk_vm_deployment.py unitree-build --sdk "$UNITREE_SDK" \
+  --sdk-project examples/unitree/go2-state --output "$PWD/.tmp/go2-build"
+```
+
+Review `go2-build/review.json` under `.tmp`, the original C source and the adjacent `controller.wasm.wros-build.json`. Set `APPROVED_RECEIPT_SHA256` to the independently approved SHA-256 of that compiler receipt. The report records the SDK revision, compiler, sysroot, binary digest and the seven ROSv2 function signatures read from the linked Wasm. The public compiler records `mode=instrumented` and `vm_qualified=false`.
+
+Run the following inside the qualification cgroup. `BASE` is the output of a completed signed `vendor_unitree_qemu.py` attachment run. `SIGNING_SCRATCH` is a private directory under the VM project’s `.tmp`. The other variables identify the same Unitree 2.0.2 source archive, native tools, kernel and firmware used for the native launch replay.
+
+```sh
+python3 -B tests/sdk_vm_deployment.py unitree --sdk "$UNITREE_SDK" \
+  --sdk-application "$PWD/.tmp/go2-build/controller.wasm" \
+  --approved-build-receipt-sha256 "$APPROVED_RECEIPT_SHA256" \
+  --base "$BASE/initramfs.cpio.gz" --base-receipt "$BASE/results.json" \
+  --sdk-archive "$UNITREE_ARCHIVE" --openssl-root "$OPENSSL_ROOT" \
+  --vm "$VM" --vm-source "$VM_SOURCE" --deployer "$DEPLOYER" --cosign "$COSIGN" \
+  --sign-file "$SIGN_FILE" --signing-scratch "$SIGNING_SCRATCH" \
+  --kernel "$KERNEL" --bios "$BIOS" --firmware-directory "$FIRMWARE" --qemu "$QEMU" \
+  --output "$PWD/.tmp/go2-deployment"
+```
+
+The signing step rechecks the approved receipt and the private copy of the module. In an isolated x86-64 Linux guest, an SDK publisher emits the fixture sample on loopback. An independent SDK subscriber records it for the managed read-only provider. The deployer reviews the seven actual imports and the two aliases `go2-state` and `steady`. Successful runs record `unitree-sdk-signed` for AOT and `unitree-sdk-signed-int` for the interpreter in `results.json`. Each case checks the deployer’s signature decision and the version recorded by that engine in a fresh rollback store. KVM is the default. TCG accepts a longer guest time limit, for example `--accelerator tcg --guest-timeout-seconds 900`.
+
 ### Local ROSv2 scheduling resources
 
 A VM can use guards, clocks, timers and wait sets through ROSv2. Put each resource decision in that VM's separate recommendation file. The following example lets a guest open the alias `signal`, create a guard and trigger it. A call to the exposed `guard.take` returns permission denied.
