@@ -1,5 +1,5 @@
 /** @file unitree_attachment.cpp
- *  @brief Serve one read-only Go2 telemetry snapshot over authenticated local IPC.
+ *  @brief Serve read-only Go2 telemetry over authenticated local IPC.
  */
 #include <uwvm2/imported/ros/scene/attachment_tls.h>
 #include <uwvm2/imported/ros/scene/provider_bootstrap_receiver.h>
@@ -20,6 +20,12 @@
 #include <optional>
 #include <string_view>
 #include <thread>
+#include <vector>
+
+#ifdef WROS_UNITREE_IN_PROCESS_SIMULATOR
+void unitree_simulator_prepare();
+bool unitree_simulator_next(std::uint64_t deadline, std::uint32_t& tick, float& position);
+#endif
 
 namespace
 {
@@ -44,6 +50,20 @@ namespace
         float position;
     };
 
+#ifdef WROS_UNITREE_IN_PROCESS_SIMULATOR
+    constexpr std::uint64_t required_reads = 2;
+    constexpr unsigned session_seconds = 90;
+
+    std::optional<Snapshot> sample_go2(std::uint64_t deadline)
+    {
+        Snapshot value{};
+        if (!unitree_simulator_next(deadline, value.tick, value.position))
+            return std::nullopt;
+        return value;
+    }
+#else
+    constexpr std::uint64_t required_reads = 1;
+    constexpr unsigned session_seconds = 10;
 #ifdef WROS_UNITREE_RECORDED_SAMPLE
     // The independent simulator records one actual SDK sample before deployment.
     // The admitted adapter reads that immutable fixture and only uses the TLS carrier.
@@ -121,6 +141,7 @@ namespace
     }
 
 #endif
+#endif
 
     bool allowed_read(scene::wire::bytes body)
     {
@@ -153,21 +174,22 @@ namespace
             bootstrap::receive_status::success)
             return 10;
         ::close(courier);
-        if (config.request_bytes != 32 || config.response_bytes != 32)
+        if (config.request_bytes < 24 || config.response_bytes < 24 ||
+            config.request_bytes > protocol::maximum_payload || config.response_bytes > protocol::maximum_payload)
             return 11;
         auto const& binding = config.bound;
         scene::attachment_tls::channel channel;
         if (channel.bind(descriptors.carrier(), {config.peer.pid, config.peer.uid, config.peer.gid},
                          descriptors.identity(), scene::attachment_tls::purpose::driver,
                          binding.deployment, binding.vm, binding.module, binding.driver, binding.session,
-                         binding.contract, protocol::header_bytes + 32, true, descriptors.clock()) != Error::success)
+                         binding.contract, protocol::header_bytes + std::max(config.request_bytes, config.response_bytes), true, descriptors.clock()) != Error::success)
             return 12;
         descriptors.reset();
 
-        auto const until = std::min(monotonic_ns() + UINT64_C(10000000000), config.session_until_ns);
-        std::array<std::uint8_t, protocol::header_bytes + 32> input{};
+        auto const until = std::min(monotonic_ns() + session_seconds * UINT64_C(1000000000), config.session_until_ns);
+        std::vector<std::uint8_t> input(protocol::header_bytes + config.request_bytes);
         bool greeted{};
-        bool dispatched{};
+        std::uint64_t dispatched{};
         while (monotonic_ns() < until)
         {
             std::size_t size{};
@@ -189,9 +211,19 @@ namespace
             if (!protocol::decode(std::span{input}.first(size), message, payload) || message.bound != binding)
                 return 14;
             if (message.type == protocol::kind::release)
-                return greeted && dispatched ? 0 : 15;
+            {
+                if (!greeted || dispatched != required_reads)
+                    return 15;
+#ifdef WROS_UNITREE_IN_PROCESS_SIMULATOR
+                std::puts("SENSOR_SESSION release reads=2");
+#endif
+                return 0;
+            }
             if (message.type == protocol::kind::hello && !greeted)
             {
+#ifdef WROS_UNITREE_IN_PROCESS_SIMULATOR
+                unitree_simulator_prepare();
+#endif
                 greeted = true;
                 message.type = protocol::kind::ready;
                 if (reply(channel, message, {}, until) != Error::success)
@@ -200,7 +232,7 @@ namespace
             }
 
             auto const now = monotonic_ns();
-            if (!greeted || dispatched || message.type != protocol::kind::request || message.sequence != 1 ||
+            if (!greeted || dispatched >= required_reads || message.type != protocol::kind::request || message.sequence != dispatched + 1 ||
                 message.deadline <= now || message.deadline > config.session_until_ns ||
                 message.deadline - now > config.request_ns || !allowed_read(payload))
                 return 17;
@@ -215,12 +247,22 @@ namespace
             wire.u64(std::bit_cast<std::uint32_t>(sample->position));
             message.type = protocol::kind::result;
             auto const sent = reply(channel, message, wire.written(), until);
+#ifdef WROS_UNITREE_IN_PROCESS_SIMULATOR
+            scene::wire::reader encoded{wire.written()};
+            std::uint64_t length{}, tick{}, bits{};
+            if (!encoded.u64(length) || !encoded.u64(tick) || !encoded.u64(bits) || !encoded.done() || length != 16)
+                return 19;
+#endif
             scene::erase_bytes(body);
             if (sent != Error::success)
                 return 19;
             std::printf("Go2 LowState over TLS tick=%u position=%.3f\n",
                         sample->tick, static_cast<double>(sample->position));
-            dispatched = true;
+#ifdef WROS_UNITREE_IN_PROCESS_SIMULATOR
+            std::printf("SENSOR_RESULT seq=%llu tick=%u position_bits=%08x\n",
+                        static_cast<unsigned long long>(message.sequence), static_cast<unsigned>(tick), static_cast<unsigned>(bits));
+#endif
+            ++dispatched;
         }
         return 20;
     }
@@ -228,7 +270,7 @@ namespace
 
 int receive_go2_attachment(char** argv)
 {
-    ::alarm(15);
+    ::alarm(session_seconds + 5);
     std::array<std::uint32_t, 4> fields{};
     for (std::size_t i{}; i < fields.size(); ++i)
     {

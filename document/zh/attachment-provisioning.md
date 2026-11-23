@@ -155,3 +155,56 @@ systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 \
 ```
 
 [Universal Robots Client Library 2.16.0](https://github.com/UniversalRobots/Universal_Robots_Client_Library/releases/tag/2.16.0)
+
+#### 生产部署器中的签名 Go2 仿真
+
+正式教程 `tests/support/unitree_low_state.wat` 在每次提交前读取单独授权的
+`clock.steady`，先用 40 字节接收结果，收到 `EMSGSIZE` 后按 VM 返回的容量
+重试同一序号。1040 字节工作区容纳 16 字节结果封装和最多 1024 字节应答。
+使用新组装的 Wasm，在原有 `tests/qemu_native_launch.py` 入口加
+`--payload-profiles` 可运行 24/24、24/128、128/1024 三组录制样本回放。
+原厂 DDS 的旧入口仍为 `tests/vendor_unitree_qemu.py`。
+
+`tests/unitree_live_build.py` 构建仿真 ELF 和应用。`tests/unitree_live_qemu.py`
+为每组负载启动独立的无网 x86-64 KVM 来宾，配置两颗虚拟 CPU、2 GiB 内存及
+`-nic none`。签名驱动从只读根目录加载原厂 Go2 场景，每收到一个经认证的
+`buffer.read` 才推进一步 MuJoCo。原厂 Go2Bridge 和 SDK 发布线程生成 LowState。
+两个本地传输头只观察发布结果，命令订阅端没有输入。ELF 与 Wasm 通过认证
+TLS 通道传输这两个样本。选择 `--client ros-angles` 时，严格模式 WrCC 会将
+原版 ROS Noetic `angles/angles.h` 编入业务 Wasm，来宾校验递增的 tick 以及
+两个关节样本的角度变换。
+
+复制 `tests/support/unitree_live_inputs.example.json` 到项目工作目录并填写本地路径，
+相对路径以 JSON 文件所在位置为基准。准备 SDK 2.0.2、提交
+`b7fec6020eb93d4c059a6edf19905e12a75a8d3d` 的 SDK 包装头、提交
+`1eb6642e3f3fdfb7fb13a9794fd6a2dd93ea0e7d` 的三个模拟器头及 `joystick/`、
+MuJoCo 3.4.0 库和头文件，以及原仿真测试使用的 Go2 XML、网格、`provenance.json`。
+WrCC 来自已验签的正式站点。`signing_scratch` 指向项目 `.tmp` 内当前用户所有的
+0700 目录，其父目录链须满足签名器的路径保护检查。以下命令从部署器仓库根目录运行，`SCOPE` 指向
+项目的 64 GiB、零交换空间启动器，本地输入清单位于 `.tmp/go2-inputs.json`。
+
+```sh
+"$SCOPE" /bin/bash -c 'set -eu
+  export PATH="/usr/bin:/bin:$PATH"
+  /usr/bin/python3 -B tests/unitree_live_build.py --inputs .tmp/go2-inputs.json \
+    --client ros-angles --output .tmp/go2-angles-build'
+"$SCOPE" /bin/bash -c 'set -eu
+  export PATH="/usr/bin:/bin:$PATH"
+  /usr/bin/python3 -B tests/unitree_live_qemu.py --inputs .tmp/go2-inputs.json \
+    --build .tmp/go2-angles-build --output .tmp/go2-angles-kvm'
+```
+
+`--client live-wat` 选择连续读取两次的 WAT 入口。验证另一个已经签名、遵循
+相同契约的正式 WrCC 产物时，选择 `--client signed-wrcc`，增加
+`unsigned_app`、`signed_app`、`wrcc_receipt`、`app_root`、`app_signer`
+路径。回执须绑定原始 Wasm 和实际 VM。模块标识或算法有别于 `main`、`ES384`
+时向运行器传入 `--module-id`、`--app-algorithm`。可重复指定 `--profile`，
+并用 `--engine interpreter` 或 `--engine aot` 选引擎，每次使用新的输出目录。
+加 `--prepare-only` 可仅签名、打包并写出 `prepared.json`，随后在独立调用中
+用 `--prepared PATH` 启动同一组已签名字节。
+
+`build.json` 分开记录 ELF 与应用的构建输入。`results.json` 将两份独立签名、
+审核 XML、隔离检查和两个样本的物理源/TLS 位模式绑定到本轮运行。应用和
+驱动各用不同的非 root 身份，来宾 PTY 确认逐项接口、时钟资源和驱动权限。
+签名私钥在打包来宾前从临时签名目录删除。原厂本地文件和生成的来宾镜像留在
+项目暂存盘，发布内容只包含源码和使用说明。

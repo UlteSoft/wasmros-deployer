@@ -22,6 +22,8 @@ from vendor_qualification import cgroup
 
 REVISION = "811bc77cdcffb4691d4b40172f9a57857bf6cffb"
 ARCHIVE_SHA256 = "5e0fe1936221ba37299cc037abe0fd9c8c878e623ddb900d4584a7cd9c865120"
+DRIVER_INTERFACES = ("capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect")
+CLOCK_INTERFACES = ("clock.create", "clock.read")
 GUEST_CASES = {
     "native-signature",
     "altered-manifest-denied",
@@ -132,9 +134,14 @@ def stage_binary(root, source, name, library_dir=None):
     executable = root / "bin" / name
     shutil.copyfile(source, executable)
     executable.chmod(0o755)
+    return stage_libraries(root, source, (library_dir,) if library_dir else ())
+
+
+def stage_libraries(root, source, library_dirs):
+    """@brief Copy the dynamic loader and libraries required by one locally built ELF."""
     env = {"PATH": "/usr/bin:/bin"}
-    if library_dir is not None:
-        env["LD_LIBRARY_PATH"] = str(library_dir)
+    if library_dirs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(map(str, library_dirs))
     probe = subprocess.run(["/usr/bin/ldd", source], env=env, capture_output=True,
                            text=True, timeout=120)
     output = probe.stdout + probe.stderr
@@ -142,13 +149,16 @@ def stage_binary(root, source, name, library_dir=None):
         raise ValueError(f"ldd failed for {source}: {output}")
     if "not found" in output:
         raise ValueError(f"missing runtime dependency for {source}")
+    staged = []
     for path in re.findall(r"(?:=>\s*)?(/[^\s]+)\s+\(", output):
         library = Path(path)
         destination = (Path("opt/unitree") / library.name
-                       if library.parent == library_dir else library.relative_to("/"))
+                       if library.parent in library_dirs else library.relative_to("/"))
         target = root / destination
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(library, target)
+        staged.append(target)
+    return staged
 
 
 def build_vendor(archive, output, root):
@@ -198,33 +208,43 @@ def sign(root, output):
     return {path.name: digest(path) for path in trust.iterdir()}
 
 
-def sign_attachment(args, root, wasm):
-    """@brief Sign the Wasm and ELF with one disposable P-384 key."""
-    fixtures = args.vm_source / "test/0073.ros-tests/support/source/security_wsea/algorithm_matrix.py"
+def certificate_authority(vm_source, directory, name):
+    """@brief Issue a disposable offline test root and signer in private scratch."""
+    fixtures = vm_source / "test/0073.ros-tests/support/source/security_wsea/algorithm_matrix.py"
     spec = importlib.util.spec_from_file_location("fixture_signer", fixtures)
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
+    return fixture.Fixtures(directory).pki(name, curve="secp384r1")
+
+
+def sign_controller(cosign, scratch, authority, wasm, target):
+    """@brief Sign the exact Wasm input under a short-lived ES384 module policy."""
+    policy = scratch / "sign.policy"
+    state = scratch / "state"
+    state.mkdir(mode=0o700)
+    unsigned = scratch / "unsigned.wasm"
+    shutil.copyfile(wasm, unsigned)
+    prefix = [cosign, "wasm", "secure"]
+    run([*prefix, "policy-init", "--output", policy, "--state-dir", state,
+         "--trust-root", authority["root"], "--certificate", authority["certificate"],
+         "--module-id", "main", "--algorithms", "ES384", "--capabilities", "32"])
+    now = datetime.now(timezone.utc)
+    before = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    after = (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    run([*prefix, "sign", unsigned, "--policy", policy, "--key", authority["key"],
+         "--certificate", authority["certificate"], "--crl", authority["crl"],
+         "--module-id", "main", "--module-version", "1", "--algorithm", "ES384",
+         "--capabilities", "32", "--not-before", before, "--not-after", after,
+         "--output", target])
+
+
+def sign_attachment(args, root, wasm):
+    """@brief Preserve the original replay's shared ES384 signer for Wasm and ELF."""
     with tempfile.TemporaryDirectory(dir=args.signing_scratch) as directory:
         scratch = Path(directory)
-        authority = fixture.Fixtures(scratch / "authority").pki("unitree", curve="secp384r1")
-        policy = scratch / "sign.policy"
-        state = scratch / "state"
-        state.mkdir(mode=0o700)
-        unsigned = scratch / "unsigned.wasm"
-        shutil.copyfile(wasm, unsigned)
-        prefix = [args.cosign, "wasm", "secure"]
-        run([*prefix, "policy-init", "--output", policy, "--state-dir", state,
-             "--trust-root", authority["root"], "--certificate", authority["certificate"],
-             "--module-id", "main", "--algorithms", "ES384", "--capabilities", "32"])
-        now = datetime.now(timezone.utc)
-        before = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        after = (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        authority = certificate_authority(args.vm_source, scratch / "authority", "unitree")
         signed = scratch / "signed.wasm"
-        run([*prefix, "sign", unsigned, "--policy", policy, "--key", authority["key"],
-             "--certificate", authority["certificate"], "--crl", authority["crl"],
-             "--module-id", "main", "--module-version", "1", "--algorithm", "ES384",
-             "--capabilities", "32", "--not-before", before, "--not-after", after,
-             "--output", signed])
+        sign_controller(args.cosign, scratch, authority, wasm, signed)
         for source, target in ((authority["root"], "trust/wasm-root.pem"),
                                (authority["certificate"], "trust/wasm-signer.pem"),
                                (signed, "bundle/controller.wasm")):
@@ -278,7 +298,7 @@ def build_attachment(args, root):
     wat = support / "unitree_low_state.wat"
     assembler = args.wrwat
     build_wasm = [assembler, wat, "-g", "--build-receipt", "-o", wasm]
-    for operation in ("capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"):
+    for operation in (*DRIVER_INTERFACES, *CLOCK_INTERFACES):
         build_wasm.extend(("--ros-operation", operation))
     run(build_wasm)
     sign_attachment(args, root, wasm)

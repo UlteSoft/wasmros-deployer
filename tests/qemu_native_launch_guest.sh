@@ -1,4 +1,6 @@
 #!/bin/sh
+# @file qemu_native_launch_guest.sh
+# @brief Review and exercise signed production driver launches with a recorded Go2 fixture.
 set -eu
 set -o pipefail
 exec </dev/console >/dev/console 2>&1
@@ -179,6 +181,20 @@ exercise signed
 exercise signed-int --risk-report none
 exercise unsigned --allow-unsigned-elf "unitree=$($b cat /bundle/unsigned.sha)"
 exercise invalid --allow-invalid-elf-signature "unitree=$($b cat /bundle/invalid.sha)"
+if test -f /bundle/payload-default.xml; then
+    for label in payload-default payload-reply payload-large; do
+        case "$label" in
+            payload-default) request=24; response=24 ;;
+            payload-reply) request=24; response=128 ;;
+            payload-large) request=128; response=1024 ;;
+        esac
+        exercise "$label"
+        "$b" grep -Fq "request $request bytes, response $response bytes, request deadline 2000 ms." "/run/$label.log"
+        for op in clock.create clock.read; do
+            "$b" grep -Fq "local clock.steady resource \"steady\" operation $op: allow" "/run/$label.log"
+        done
+    done
+fi
 elf_check=/bin/test-elf-verifier
 echo test > /run/replace-image
 exercise sealed-replacement

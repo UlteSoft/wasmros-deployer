@@ -1,0 +1,6 @@
+unitree/go2/mujoco-low-state/v1
+source: one new MuJoCo step on the official Go2 scene per authenticated request
+observation: Unitree Go2Bridge publishes rt/lowstate locally using unitree_go::msg::dds_::LowState_
+schema: buffer.read
+request: three little-endian u64 words equal to 1, 0, and 16
+result: a 16-byte blob containing tick and the first joint's binary32 position bits as two little-endian u64 words

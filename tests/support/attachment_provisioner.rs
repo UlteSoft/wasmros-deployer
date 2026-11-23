@@ -285,7 +285,12 @@ fn main() {
         "8",
     ]);
     if unitree {
+        for operation in ["clock.create", "clock.read"] {
+            command.args(["--ros-scene-interface", "robot", operation, "allow"]);
+        }
         command.args([
+            "--ros-scene-grant", "robot", "steady", "clock.steady", "steady", "local",
+            "clock.create,clock.read",
             "--runtime-compile-threads", "0",
             "--runtime-llvm-jit-cache-path", "disable",
             "--runtime-memtag-mode", "sync",

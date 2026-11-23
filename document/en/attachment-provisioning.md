@@ -223,3 +223,69 @@ systemd-run --user --scope -p MemoryMax=64G -p MemorySwapMax=0 \
 ```
 
 [Universal Robots Client Library 2.16.0](https://github.com/UniversalRobots/Universal_Robots_Client_Library/releases/tag/2.16.0)
+
+#### Signed Go2 simulation in the production deployer
+
+The tutorial in `tests/support/unitree_low_state.wat` reads the approved local
+`clock.steady` before each request. It starts with a 40-byte destination for the
+result and retries the same sequence with the capacity reported by the VM on
+`EMSGSIZE`. Its 1040-byte workspace covers the 16-byte result envelope and up
+to 1024 reviewed response bytes. Add `--payload-profiles` to the original
+`tests/qemu_native_launch.py` replay with this freshly assembled module to run
+24/24, 24/128 and 128/1024 byte profiles. The original DDS/QEMU entry remains
+`tests/vendor_unitree_qemu.py`. The production replay reads a recorded sample.
+
+`tests/unitree_live_build.py` builds the in-process simulator and application.
+`tests/unitree_live_qemu.py` runs each selected profile in a fresh x86-64 KVM
+guest with two vCPUs, 2 GiB of RAM and `-nic none`. The authenticated native
+driver loads the pinned scene in its protected root. Each approved
+`buffer.read` advances one MuJoCo step. The original Go2Bridge and SDK
+publication thread populate and publish LowState. Two local channel headers
+observe the publication and leave its command subscriber disconnected. Only
+the authenticated TLS attachment transports data between the ELF and Wasm.
+The application checks the two increasing ticks. With `--client ros-angles`,
+strict WrCC compiles the original Noetic `angles/angles.h` into the Wasm
+business logic and the guest checks its angle conversion on both joint samples.
+
+Copy `tests/support/unitree_live_inputs.example.json` to the work directory
+and fill in local paths relative to the JSON file. Supply SDK 2.0.2, SDK wrapper
+headers at `b7fec6020eb93d4c059a6edf19905e12a75a8d3d`, and
+`unitree_sdk2_bridge.h`, `param.h`, `physics_joystick.h` and `joystick/` from
+`1eb6642e3f3fdfb7fb13a9794fd6a2dd93ea0e7d`. The MuJoCo 3.4.0 package supplies
+`include/` and `libmujoco.so.3.4.0`. The model directory contains the pinned
+Go2 XML, meshes and `provenance.json` used by the original MuJoCo fixture.
+The SDK installation supplies its own signed strict site. Set `signing_scratch`
+to a private 0700 directory under project `.tmp` whose ancestors satisfy the
+signer’s protected-path checks. Run the following
+from the deployer checkout with `SCOPE` set to the 64 GiB, zero-swap project
+scratch launcher and the completed inputs at `.tmp/go2-inputs.json`.
+
+```sh
+"$SCOPE" /bin/bash -c 'set -eu
+  export PATH="/usr/bin:/bin:$PATH"
+  /usr/bin/python3 -B tests/unitree_live_build.py --inputs .tmp/go2-inputs.json \
+    --client ros-angles --output .tmp/go2-angles-build'
+"$SCOPE" /bin/bash -c 'set -eu
+  export PATH="/usr/bin:/bin:$PATH"
+  /usr/bin/python3 -B tests/unitree_live_qemu.py --inputs .tmp/go2-inputs.json \
+    --build .tmp/go2-angles-build --output .tmp/go2-angles-kvm'
+```
+
+Choose `--client live-wat` for the two-read WAT entry. To exercise an existing
+signed strict WrCC client for this contract, choose `--client signed-wrcc` and
+add paths for `unsigned_app`, `signed_app`, `wrcc_receipt`, `app_root` and
+`app_signer`. The receipt must bind the exact unsigned bytes and runtime.
+Pass its `--module-id` and `--app-algorithm` to the runner when they differ
+from `main` and `ES384`. The runner accepts repeated `--profile` selections and
+`--engine interpreter` or `--engine aot`. Use a fresh output directory each time. Pass `--prepare-only` to sign and pack
+an image, then pass `--prepared PATH` in a second invocation to boot those
+exact signed bytes. The first invocation writes `prepared.json`.
+
+`build.json` records native and application inputs separately.
+`results.json` binds the independent ELF and Wasm signatures, reviewed XML,
+runtime, isolation checks and the two pairs of physics and TLS sample words.
+The application and driver have distinct non-root identities. The PTY fixture
+confirms the individual interface, clock and driver decisions inside the guest.
+The runner removes private signing files before packing the guest image.
+Keep locally supplied vendor files and generated guest images on the project
+scratch disk. The distributable fixture consists of source and instructions.

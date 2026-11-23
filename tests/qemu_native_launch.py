@@ -16,7 +16,8 @@ import xml.etree.ElementTree as ET
 
 from qemu_supervisor import digest, pack
 from vendor_qualification import cgroup
-from vendor_unitree_qemu import ARCHIVE_SHA256, REVISION, compile_attachment, sign_attachment
+from vendor_unitree_qemu import (ARCHIVE_SHA256, CLOCK_INTERFACES, DRIVER_INTERFACES,
+                                REVISION, compile_attachment, sign_attachment)
 
 
 def stage_fixture(archive, root):
@@ -93,8 +94,10 @@ def prepare_deployment(args, root, original):
     modified[len(payload) - 1] ^= 1
     (bundle / "invalid").write_bytes(modified)
     rights = ET.Element("recommendations")
-    for name in ("capability.open", "driver.connect", "driver.submit", "driver.result", "driver.disconnect"):
+    for name in (*DRIVER_INTERFACES, *CLOCK_INTERFACES):
         ET.SubElement(rights, "interface", name=name, expose="allow")
+    for name in CLOCK_INTERFACES:
+        ET.SubElement(rights, "local-resource", type="clock.steady", alias="steady", operation=name, access="allow")
     ET.ElementTree(rights).write(bundle / "denied.xml")
     ET.SubElement(rights, "driver-resource", alias="go2-state", operation="buffer.read", access="allow")
     ET.ElementTree(rights).write(bundle / "rights.xml")
@@ -115,6 +118,15 @@ def prepare_deployment(args, root, original):
                       "memory-bytes": "268435456", "cpu-micros": "100000", "request-millis": "180000"})
         ET.ElementTree(deployment).write(bundle / (label + ".xml"))
         (bundle / (label + ".sha")).write_text(digest(provider) + "\n")
+    if args.payload_profiles:
+        # Preserve the historical default run when no expanded profiles are requested.
+        for label, request, response in (("payload-default", 24, 24), ("payload-reply", 24, 128),
+                                         ("payload-large", 128, 1024)):
+            case = ET.parse(bundle / "signed.xml")
+            attachment = case.getroot().find("driver/attachment")
+            attachment.attrib.update({"request-bytes": str(request), "response-bytes": str(response),
+                                      "request-millis": "2000"})
+            case.write(bundle / (label + ".xml"))
     return contract
 
 
@@ -155,6 +167,8 @@ def main():
                  "firmware-directory"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(), required=True)
     parser.add_argument("--qemu", type=lambda value: Path(value).absolute(), required=True)
+    parser.add_argument("--payload-profiles", action="store_true",
+                        help="exercise the clock-aware tutorial on 24/24, 24/128 and 128/1024 byte limits")
     args = parser.parse_args()
     group = cgroup()
     if any(".tmp" not in path.parts for path in (args.output, args.base, args.signing_scratch)):
@@ -207,7 +221,7 @@ def main():
                "initramfs_sha256": digest(initrd), "cgroup": str(group), "argv": list(map(str, argv))}
     serial = args.output / "serial.log"
     with serial.open("wb") as log:
-        result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=110)
+        result = subprocess.run(list(map(str, argv)), stdout=log, stderr=subprocess.STDOUT, timeout=155 if args.payload_profiles else 110)
     transcript = serial.read_text(errors="replace")
     receipt["cases"] = re.findall(r"^CASE ([-a-z]+) PASS$", transcript, re.MULTILINE)
     expected = {"original-sdk-recorded-sample", "rejects-unsigned-by-default", "rejects-invalid-by-default",
@@ -217,6 +231,8 @@ def main():
                 "cancelled-review-does-not-start", "production-signed",
                 "production-signed-int", "production-unsigned", "production-invalid",
                 "production-sealed-replacement"}
+    if args.payload_profiles:
+        expected.update(("production-payload-default", "production-payload-reply", "production-payload-large"))
     receipt["complete"] = (result.returncode == 0 and "WROS_NATIVE_LAUNCH_PASS" in transcript
                            and set(receipt["cases"]) == expected and len(receipt["cases"]) == len(expected))
     receipt["serial_sha256"] = digest(serial)
