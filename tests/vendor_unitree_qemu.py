@@ -217,13 +217,15 @@ def certificate_authority(vm_source, directory, name):
     return fixture.Fixtures(directory).pki(name, curve="secp384r1")
 
 
-def sign_controller(cosign, scratch, authority, wasm, target):
+def sign_controller(cosign, scratch, authority, wasm, target, *, expected_sha256=None):
     """@brief Sign the exact Wasm input under a short-lived ES384 module policy."""
     policy = scratch / "sign.policy"
     state = scratch / "state"
     state.mkdir(mode=0o700)
     unsigned = scratch / "unsigned.wasm"
     shutil.copyfile(wasm, unsigned)
+    if expected_sha256 is not None and digest(unsigned) != expected_sha256:
+        raise ValueError("Wasm signing input differs from the reviewed compiler artifact")
     prefix = [cosign, "wasm", "secure"]
     run([*prefix, "policy-init", "--output", policy, "--state-dir", state,
          "--trust-root", authority["root"], "--certificate", authority["certificate"],
@@ -238,13 +240,13 @@ def sign_controller(cosign, scratch, authority, wasm, target):
          "--output", target])
 
 
-def sign_attachment(args, root, wasm):
+def sign_attachment(args, root, wasm, *, expected_sha256=None):
     """@brief Preserve the original replay's shared ES384 signer for Wasm and ELF."""
     with tempfile.TemporaryDirectory(dir=args.signing_scratch) as directory:
         scratch = Path(directory)
         authority = certificate_authority(args.vm_source, scratch / "authority", "unitree")
         signed = scratch / "signed.wasm"
-        sign_controller(args.cosign, scratch, authority, wasm, signed)
+        sign_controller(args.cosign, scratch, authority, wasm, signed, expected_sha256=expected_sha256)
         for source, target in ((authority["root"], "trust/wasm-root.pem"),
                                (authority["certificate"], "trust/wasm-signer.pem"),
                                (signed, "bundle/controller.wasm")):

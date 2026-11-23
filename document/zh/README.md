@@ -235,6 +235,33 @@ wasm64 目标使用 SDK 对应的 `wasip1.clock_time_get_wasm64`。读取分辨�
 
 D BetterC 使用所选安装中的 `wrd verify` 核对操作员批准的构建回执、Wasm 和 VM，随后才签署应用。公开 SDK 提交 `5fa860a356f19ed29aea514142eb897c3231951f` 的 Unitree D 安装包构建的 Xmake 示例，在 QEMU TCG 解释器部署中通过了全部 42 项用例，包含部署器和 VM 独立验签。该应用只导入 `uwvm_ros_v2.abi`。
 
+### 签署并部署外部 Unitree Go2 读取程序
+
+将 `UNITREE_SDK` 指向从指定提交安装的公开 Unitree C SDK。从部署器目录构建外部工程。程序使用 SDK 的驱动、单调时钟和 Go2 解码接口，从附件取得采样序号和第一个关节的位置。[外部 C 工程](../../examples/unitree/go2-state/main.c)
+
+```sh
+python3 -B tests/sdk_vm_deployment.py unitree-build --sdk "$UNITREE_SDK" \
+  --sdk-project examples/unitree/go2-state --output "$PWD/.tmp/go2-build"
+```
+
+审阅原始 C 代码、`.tmp/go2-build/review.json` 和同目录的编译器回执 `controller.wasm.wros-build.json`，将独立批准的回执 SHA-256 设为 `APPROVED_RECEIPT_SHA256`。报告记录 SDK 提交、编译器、sysroot、最终 Wasm 摘要，以及从模块读取的七个 ROSv2 函数签名。公开编译器在回执中标明 `mode=instrumented` 和 `vm_qualified=false`。
+
+在验证 cgroup 中运行下列命令。`BASE` 是已经完成签名附件验收的 `vendor_unitree_qemu.py` 输出目录。`SIGNING_SCRATCH` 是 VM 项目 `.tmp` 下的私有目录。归档使用 Unitree SDK 2.0.2，通过其余变量指定本机的原生工具、内核及固件。
+
+```sh
+python3 -B tests/sdk_vm_deployment.py unitree --sdk "$UNITREE_SDK" \
+  --sdk-application "$PWD/.tmp/go2-build/controller.wasm" \
+  --approved-build-receipt-sha256 "$APPROVED_RECEIPT_SHA256" \
+  --base "$BASE/initramfs.cpio.gz" --base-receipt "$BASE/results.json" \
+  --sdk-archive "$UNITREE_ARCHIVE" --openssl-root "$OPENSSL_ROOT" \
+  --vm "$VM" --vm-source "$VM_SOURCE" --deployer "$DEPLOYER" --cosign "$COSIGN" \
+  --sign-file "$SIGN_FILE" --signing-scratch "$SIGNING_SCRATCH" \
+  --kernel "$KERNEL" --bios "$BIOS" --firmware-directory "$FIRMWARE" --qemu "$QEMU" \
+  --output "$PWD/.tmp/go2-deployment"
+```
+
+签名前会重新核对批准的回执和 Wasm 私有副本。隔离的 x86-64 Linux 来宾在回环网络内使用 Unitree SDK 发布样本，独立的 SDK 订阅者记录它，供受管的只读驱动读取。部署器逐项审阅七个导入以及 `go2-state` 和 `steady` 两个别名。成功时，`results.json` 收录 AOT 的 `unitree-sdk-signed` 和解释器的 `unitree-sdk-signed-int`。两项都检查部署器的验签决定及对应 VM 在独立的新防回滚存储中写入的版本。默认使用 KVM，TCG 可配合较长的来宾时限，例如 `--accelerator tcg --guest-timeout-seconds 900`。
+
 ### ROSv2 本地调度资源
 
 在各 VM 独立的推荐权限 XML 中，为每个具名资源单独配置操作。下面的来宾可以打开 `signal`、创建并触发 guard。它调用已经暴露的 `guard.take` 时会收到拒绝。

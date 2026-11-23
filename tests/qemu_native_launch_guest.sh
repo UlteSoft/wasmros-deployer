@@ -28,13 +28,20 @@ echo 134217728 > "$g/sensor/memory.max"
 echo 0 > "$g/sensor/memory.swap.max"
 echo 32 > "$g/sensor/pids.max"
 
-for role in admission vm; do
+roles="admission vm"
+if test -f /bundle/sdk-imports.txt; then
+    roles="$roles sdk-signed sdk-signed-int"
+fi
+for role in $roles; do
+    $b mkdir -p -m 700 "/run/$role"
     /bin/cosign wasm secure policy-init --output "/trust/$role.policy" \
         --state-dir "/run/$role" --trust-root /trust/wasm-root.pem \
         --certificate /trust/wasm-signer.pem --module-id main --algorithms ES384 --capabilities 32
+    if test "$role" != admission; then
+        $b chmod 644 "/trust/$role.policy"
+        $b chown -R 24101:24101 "/run/$role"
+    fi
 done
-$b chmod 644 /trust/vm.policy
-$b chown -R 24101:24101 /run/vm
 
 elf_check=/bin/uwvm2-ros
 # The PTY relay exits just after the deployer. Reading the pipe through EOF
@@ -116,6 +123,13 @@ echo 'CASE original-sdk-recorded-sample PASS'
 exercise() {
     label=$1
     shift
+    sdk_state=
+    if test -f /bundle/sdk-imports.txt && { test "$label" = signed || test "$label" = signed-int; }; then
+        sdk_state="/run/sdk-$label/state"
+        test -f "$sdk_state"
+        if $b grep -Fq 'main|1|' "$sdk_state"; then exit 1; fi
+        admission_before=$($b sha256sum /run/admission/state)
+    fi
     run "$label" "$@" >"/run/$label.log" 2>&1 &
     manager=$!
     driver_group="$g/workloads/wros-unitree/driver-unitree"
@@ -167,6 +181,16 @@ exercise() {
     $b grep -F 'Go2 LowState over TLS tick=41347 position=0.125' "/run/$label.log"
     $b grep -F 'Review effective decisions for VM "main"' "/run/$label.log"
     $b grep -F 'adopting scored recommendations at or below 10/10' "/run/$label.log"
+    if test -n "$sdk_state"; then
+        $b grep -Fq 'WSEA policy and signature verified for VM "main"' "/run/$label.log"
+        $b grep -Fq 'main|1|' "$sdk_state"
+        test "$($b sha256sum /run/admission/state)" = "$admission_before"
+        while read -r name; do
+            $b grep -Fq "imports \"uwvm_ros_v2\" \"$name\"" "/run/$label.log"
+            $b grep -Fq "VM \"main\" ROSv2 interface $name: allow" "/run/$label.log"
+        done < /bundle/sdk-imports.txt
+        echo "CASE unitree-sdk-$label PASS"
+    fi
     if test "$label" = signed; then
         $b grep -F 'Risk report deployment configuration (threshold >=5/10)' "/run/$label.log"
         $b grep -F 'read-only sandbox "go2": 7/10 (high)' "/run/$label.log"
